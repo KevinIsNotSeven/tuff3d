@@ -147,6 +147,16 @@ int main(void)
     remove("test_out.obj");
     mesh_free(&m);
 
+    /* plane: grid of up-facing quads, open border, extrudable */
+    prim_defaults(&p, PRIM_PLANE);
+    p.psw = 3; p.psd = 2;
+    m = mesh_prim(&p);
+    CHECK(m.nv == 4 * 3 && m.nf == 6 && m.ne == 3 * 3 + 4 * 2);
+    for (int f = 0; f < m.nf; f++) CHECK(mesh_fnormal(&m, f).y > 0.99f);
+    m.fs[0] = 1;
+    CHECK(mesh_extrude_faces(&m) && m.nf == 6 + 4);
+    mesh_free(&m);
+
     printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
     return fails != 0;
 }

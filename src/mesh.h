@@ -40,13 +40,14 @@ typedef struct Mesh {
 } Mesh;
 
 enum { COMP_VERT = 1, COMP_EDGE = 2, COMP_FACE = 3 };
-enum { PRIM_NONE, PRIM_CUBE, PRIM_CYL, PRIM_SPHERE };
+enum { PRIM_NONE, PRIM_CUBE, PRIM_CYL, PRIM_SPHERE, PRIM_PLANE, PRIM_COUNT };
 
 typedef struct Prim {
     int type;
     float w, h, d; int sw, sh, sd;                          /* cube */
     float cr, ch; int csides, chseg, ccap, ctop, cbot;      /* cylinder (ccap: cap rings, 0 = n-gon) */
     float sr; int scols, srows;                             /* sphere */
+    float pw, pd; int psw, psd;                             /* plane (XZ, facing +Y) */
 } Prim;
 
 void prim_defaults(Prim *p, int type);

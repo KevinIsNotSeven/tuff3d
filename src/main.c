@@ -32,7 +32,7 @@ static Obj *ob;
 static int nob, cob;
 static int mode = M_OBJ, lastComp = M_VERT, tool = T_SELECT, wire;
 static unsigned stamp;
-static Prim defPrim[4];
+static Prim defPrim[PRIM_COUNT];
 static int normalFrame;
 static M4 nframe;
 static float manipSize = 1;
@@ -40,12 +40,12 @@ static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
 static char g_path[MAX_PATH];
 static char g_msg[200];
-static int lastCmd, lastHandle, hover;
+static int lastCmd, lastHandle, hover, modified;
 
-static HWND hMain, hView, hPanel, hStatus;
+static HWND hMain, hView, hPanel, hStatus, hBar;
 static HDC hdc;
 static HMENU hMenu, hThemeMenu;
-static HFONT hFont, hBold;
+static HFONT hFont, hBold, hSmall;
 static HBRUSH swatchBrush;
 static int vw = 1, vh = 1, panelOn = 1;
 static float ds = 1;
@@ -359,6 +359,7 @@ static void stack_push(Snap *st, int *n, Snap s)
 
 static void undo_push(void)
 {
+    modified = 1;
     stack_push(undo_s, &nundo, snap_take());
     while (nredo) snap_free(&redo_s[--nredo]);
 }
@@ -368,6 +369,7 @@ static void do_undo(void)
     if (!nundo) { msg("Nothing to undo"); return; }
     stack_push(redo_s, &nredo, snap_take());
     snap_restore(&undo_s[--nundo]);
+    modified = 1;
     msg("Undo");
 }
 
@@ -376,6 +378,7 @@ static void do_redo(void)
     if (!nredo) { msg("Nothing to redo"); return; }
     stack_push(undo_s, &nundo, snap_take());
     snap_restore(&redo_s[--nredo]);
+    modified = 1;
     msg("Redo");
 }
 
@@ -985,6 +988,7 @@ static void drag_move(int mx, int my)
                 if (fabsf((&delta.x)[c]) > 1e-6f) (&np.x)[c] = roundf((&np.x)[c]);
             delta = v3sub(np, dg.piv);
         }
+        snprintf(g_msg, sizeof g_msg, "Move %.3f, %.3f, %.3f", delta.x, delta.y, delta.z);
     } else if (tool == T_ROTATE) {
         if (dg.planeMode) {
             V3 hit;
@@ -1000,9 +1004,14 @@ static void drag_move(int mx, int my)
         float a = dg.ang;
         if (key('J')) a = roundf(a / (PI_F / 12)) * (PI_F / 12);   /* hold J: 15 degree steps */
         R = m4_axis_angle(dg.axis, a);
+        snprintf(g_msg, sizeof g_msg, "Rotate %.1f deg", a * 180 / PI_F);
     } else {
         float f = 1 + ((mx - dg.mx0) * dg.sdx + (my - dg.my0) * dg.sdy) / dg.Lpx;
-        if (fabsf(f) < 1e-3f) f = 1e-3f;
+        if (mode != M_OBJ) {
+            /* components stop at 0 like Maya, so dragging in past the pivot flattens them exactly */
+            if (f < 0.02f) f = 0;
+        } else if (fabsf(f) < 1e-3f) f = 1e-3f;
+        snprintf(g_msg, sizeof g_msg, f == 0 ? "Scale 0 (flattened)" : "Scale %.3f", f);
         if (h == H_C) sv = v3(f, f, f);
         else if (h >= H_X && h <= H_Z) (&sv.x)[h - H_X] = f;
         else { int i = h - H_YZ; (&sv.x)[(i + 1) % 3] = f; (&sv.x)[(i + 2) % 3] = f; }
@@ -1191,19 +1200,20 @@ static void paint_end(void)
 enum {
     CM_NEW = 100, CM_IMPORT, CM_EXPORT, CM_EXPORT_AS, CM_EXPORT_SEL, CM_EXIT,
     CM_UNDO, CM_REDO, CM_REPEAT, CM_DELETE, CM_DUP,
-    CM_CUBE, CM_CYL, CM_SPHERE,
+    CM_CUBE, CM_CYL, CM_SPHERE, CM_PLANE,
     CM_EXTRUDE, CM_MERGE,
     CM_APPLYCOL, CM_SETCOL,
     CM_WIRE, CM_SHADED, CM_FRAMESEL, CM_FRAMEALL, CM_PANEL,
     CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT,
     CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE,
+    CM_SELALL, CM_SELINV,
     CM_HELP,
     CM_THEME = 200               /* + theme index */
 };
 
 static void cmd_create(int type)
 {
-    static const char *names[] = { "", "pCube", "pCylinder", "pSphere" };
+    static const char *names[] = { "", "pCube", "pCylinder", "pSphere", "pPlane" };
     undo_push();
     set_mode(M_OBJ);
     clear_sel();
@@ -1214,6 +1224,22 @@ static void cmd_create(int type)
     o->sel = 1;
     o->order = ++stamp;
     msg("Created primitive");
+}
+
+static void cmd_select_all(int invert)
+{
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        if (mode == M_OBJ) {
+            o->sel = invert ? !o->sel : 1;
+            if (o->sel) o->order = ++stamp;
+        } else if (o->hil) {
+            int n;
+            unsigned char *f = comp_flags(o, &n);
+            for (int k = 0; k < n; k++) f[k] = invert ? !f[k] : 1;
+        }
+    }
+    normalFrame = 0;
 }
 
 static void cmd_extrude(void)
@@ -1360,12 +1386,24 @@ static void cmd_export(int ask, int selOnly)
         n++;
     }
     if (obj_save(path, n, ms, mats, names)) {
-        if (!selOnly) strcpy(g_path, path);
+        if (!selOnly) { strcpy(g_path, path); modified = 0; }
         snprintf(g_msg, sizeof g_msg, "Exported %d object(s) to %s", n, path);
     } else {
         MessageBoxA(hMain, "Could not write the file.", APP_NAME, MB_ICONERROR);
     }
     free(ms); free(mats); free(names);
+}
+
+/* ask before throwing away unexported work; 0 = cancel */
+static int confirm_discard(void)
+{
+    if (!modified || !nob) return 1;
+    char q[MAX_PATH + 64];
+    snprintf(q, sizeof q, "Export changes to %s?", g_path[0] ? g_path : "an OBJ file");
+    int r = MessageBoxA(hMain, q, APP_NAME, MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (r == IDCANCEL) return 0;
+    if (r == IDYES) { cmd_export(0, 0); return !modified; }
+    return 1;
 }
 
 static void cmd_import(void)
@@ -1414,13 +1452,15 @@ static const char *HELP_TEXT =
     "  Click / drag\tSelect (marquee)\n"
     "  Shift / Ctrl / Ctrl+Shift\tToggle / deselect / add\n"
     "  RMB\tComponent mode menu\n"
-    "  F8 / F9 / F10 / F11\tObject / vertex / edge / face\n\n"
+    "  F8 / F9 / F10 / F11\tObject / vertex / edge / face\n"
+    "  Ctrl+Shift+A / Ctrl+Shift+I\tSelect all / invert\n\n"
     "Tools\n"
     "  Q W E R\tSelect / move / rotate / scale\n"
     "  Manip handles\tAxis = 1 axis, square = 2 axes, center = all 3\n"
     "  Ctrl + drag axis\tMove/scale on the other 2 axes\n"
     "  MMB drag\tDrag the last used handle\n"
     "  hold X / hold J\tSnap move to grid / snap rotate 15 deg\n"
+    "  Scale past the pivot\tFlatten components (scale 0)\n"
     "  + / -\tManipulator size\n"
     "  B + LMB drag\tBrush radius (paint tool)\n\n"
     "Edit\n"
@@ -1445,11 +1485,13 @@ static void do_cmd(int id)
     }
     switch (id) {
     case CM_NEW:
+        if (!confirm_discard()) break;
         if (nob) undo_push();
         for (int i = 0; i < nob; i++) mesh_free(&ob[i].m);
         nob = 0;
         mode = M_OBJ;
         g_path[0] = 0;
+        modified = 0;
         msg("New scene");
         break;
     case CM_IMPORT: cmd_import(); break;
@@ -1470,6 +1512,9 @@ static void do_cmd(int id)
     case CM_CUBE: cmd_create(PRIM_CUBE); break;
     case CM_CYL: cmd_create(PRIM_CYL); break;
     case CM_SPHERE: cmd_create(PRIM_SPHERE); break;
+    case CM_PLANE: cmd_create(PRIM_PLANE); break;
+    case CM_SELALL: cmd_select_all(0); break;
+    case CM_SELINV: cmd_select_all(1); break;
     case CM_EXTRUDE: cmd_extrude(); break;
     case CM_MERGE: cmd_merge(); break;
     case CM_APPLYCOL: cmd_apply_color(); break;
@@ -1504,6 +1549,7 @@ enum {
     PF_CW, PF_CH, PF_CD, PF_CSW, PF_CSH, PF_CSD,
     PF_YR, PF_YH, PF_YSIDES, PF_YHSEG, PF_YCAP, PF_YTOP, PF_YBOT,
     PF_SR, PF_SCOLS, PF_SROWS,
+    PF_PW, PF_PD, PF_PSW, PF_PSD,
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY
 };
 enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON };
@@ -1530,6 +1576,8 @@ static float *fld_f(int id)
     case PF_YR: return &o->prim.cr;
     case PF_YH: return &o->prim.ch;
     case PF_SR: return &o->prim.sr;
+    case PF_PW: return &o->prim.pw;
+    case PF_PD: return &o->prim.pd;
     }
     return NULL;
 }
@@ -1549,6 +1597,8 @@ static int *fld_i(int id)
     case PF_YBOT: return &o->prim.cbot;
     case PF_SCOLS: return &o->prim.scols;
     case PF_SROWS: return &o->prim.srows;
+    case PF_PSW: return &o->prim.psw;
+    case PF_PSD: return &o->prim.psd;
     }
     return NULL;
 }
@@ -1621,6 +1671,12 @@ static void panel_build(void)
             add_row(RK_FLOAT, PF_SR, "Radius");
             add_row(RK_INT, PF_SCOLS, "Columns");
             add_row(RK_INT, PF_SROWS, "Rows");
+        } else if (o->prim.type == PRIM_PLANE) {
+            add_row(RK_HEAD, 0, "polyPlane");
+            add_row(RK_FLOAT, PF_PW, "Width");
+            add_row(RK_FLOAT, PF_PD, "Height");
+            add_row(RK_INT, PF_PSW, "Width Divs");
+            add_row(RK_INT, PF_PSD, "Height Divs");
         }
     } else {
         add_row(RK_HEAD, 0, "Nothing selected");
@@ -1823,6 +1879,148 @@ static void panel_create(HINSTANCE inst)
     SendMessage(hApply, WM_SETFONT, (WPARAM)hFont, 0);
 }
 
+/* ================================================================ toolbar (shelf) */
+
+/* Every button shows its hotkey under its name, so the toolbar doubles as a cheat sheet. */
+typedef struct { const char *label, *hotkey; int cmd; } Tool;
+static const Tool tbItems[] = {
+    { "Select", "Q", CM_TSEL }, { "Move", "W", CM_TMOVE }, { "Rotate", "E", CM_TROT }, { "Scale", "R", CM_TSCALE },
+    { "Paint", "", CM_TPAINT }, { 0 },
+    { "Object", "F8", CM_MOBJ }, { "Vertex", "F9", CM_MVERT }, { "Edge", "F10", CM_MEDGE }, { "Face", "F11", CM_MFACE }, { 0 },
+    { "Cube", "", CM_CUBE }, { "Cylinder", "", CM_CYL }, { "Sphere", "", CM_SPHERE }, { "Plane", "", CM_PLANE }, { 0 },
+    { "Extrude", "Ctrl+E", CM_EXTRUDE }, { "Merge", "", CM_MERGE }, { "Duplicate", "Ctrl+D", CM_DUP },
+    { "Delete", "Del", CM_DELETE }, { 0 },
+    { "Wire", "4", CM_WIRE }, { "Shaded", "5", CM_SHADED }, { "Frame", "F", CM_FRAMESEL }, { 0 },
+    { "Undo", "Z", CM_UNDO }, { "Redo", "Shift+Z", CM_REDO },
+};
+#define NTB ((int)(sizeof tbItems / sizeof *tbItems))
+static RECT tbRc[NTB];
+static int tbHover = -1, tbDown = -1;
+
+static int tb_on(int cmd)
+{
+    if (cmd >= CM_TSEL && cmd <= CM_TPAINT) return tool == cmd - CM_TSEL;
+    if (cmd >= CM_MOBJ && cmd <= CM_MFACE) return mode == cmd - CM_MOBJ;
+    if (cmd == CM_WIRE || cmd == CM_SHADED) return wire == (cmd == CM_WIRE);
+    return 0;
+}
+
+/* lays the buttons out in rows across width W and returns the bar height */
+static int tb_layout(int W)
+{
+    HDC dc = GetDC(hMain);
+    int pad = (int)(4 * ds), gap = (int)(10 * ds), bh = (int)(36 * ds), x = pad, y = pad;
+    for (int i = 0; i < NTB; i++) {
+        if (!tbItems[i].label) { x += gap; SetRectEmpty(&tbRc[i]); continue; }
+        SIZE a, b;
+        SelectObject(dc, hFont);
+        GetTextExtentPoint32A(dc, tbItems[i].label, (int)strlen(tbItems[i].label), &a);
+        SelectObject(dc, hSmall);
+        GetTextExtentPoint32A(dc, tbItems[i].hotkey, (int)strlen(tbItems[i].hotkey), &b);
+        int w = (a.cx > b.cx ? a.cx : b.cx) + (int)(16 * ds);
+        if (x + w > W - pad && x > pad) { x = pad; y += bh + pad; }
+        SetRect(&tbRc[i], x, y, x + w, y + bh);
+        x += w + 2;
+    }
+    ReleaseDC(hMain, dc);
+    return y + bh + pad + 1;
+}
+
+static int tb_hit(int x, int y)
+{
+    POINT pt = { x, y };
+    for (int i = 0; i < NTB; i++)
+        if (tbItems[i].label && PtInRect(&tbRc[i], pt)) return i;
+    return -1;
+}
+
+static void tb_paint(HWND h)
+{
+    PAINTSTRUCT ps_;
+    RECT rc;
+    HDC wdc = BeginPaint(h, &ps_);
+    GetClientRect(h, &rc);
+    HDC dc = CreateCompatibleDC(wdc);    /* draw off screen so the bar never flickers */
+    HBITMAP bm = CreateCompatibleBitmap(wdc, rc.right, rc.bottom), old = SelectObject(dc, bm);
+    FillRect(dc, &rc, brUi);
+    RECT ln = rc;
+    ln.top = ln.bottom - 1;
+    FillRect(dc, &ln, brLine);
+    COLORREF accent = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
+    HBRUSH brAcc = CreateSolidBrush(accent);
+    SetBkMode(dc, TRANSPARENT);
+    for (int i = 0; i < NTB; i++) {
+        const Tool *t = &tbItems[i];
+        if (!t->label) continue;
+        RECT r = tbRc[i];
+        int on = tb_on(t->cmd), down = i == tbDown && i == tbHover;
+        if (down) FillRect(dc, &r, brField);
+        else if (on || i == tbHover) FillRect(dc, &r, brHot);
+        if (on || i == tbHover || down) FrameRect(dc, &r, brLine);
+        if (on) {
+            RECT u = r;
+            InflateRect(&u, -1, 0);
+            u.top = u.bottom - (int)(3 * ds);
+            FillRect(dc, &u, brAcc);
+        }
+        int mid = r.top + (r.bottom - r.top) * 11 / 20;
+        RECT a = r, b = r;
+        a.bottom = mid;
+        b.top = mid;
+        b.bottom -= (int)(3 * ds);
+        SelectObject(dc, hFont);
+        SetTextColor(dc, th.text);
+        DrawTextA(dc, t->label, -1, &a, DT_CENTER | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, hSmall);
+        SetTextColor(dc, mix(th.text, mix(th.text, th.ui)));
+        DrawTextA(dc, t->hotkey, -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    DeleteObject(brAcc);
+    BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, old);
+    DeleteObject(bm);
+    DeleteDC(dc);
+    EndPaint(h, &ps_);
+}
+
+static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+    switch (m) {
+    case WM_PAINT: tb_paint(h); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_MOUSEMOVE: {
+        int i = tb_hit(x, y);
+        if (i != tbHover) {
+            tbHover = i;
+            InvalidateRect(h, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        tbHover = -1;
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN:
+        tbDown = tb_hit(x, y);
+        SetCapture(h);
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    case WM_LBUTTONUP: {
+        int i = tbDown;
+        tbDown = -1;
+        ReleaseCapture();
+        InvalidateRect(h, NULL, FALSE);
+        if (i >= 0 && i == tb_hit(x, y)) do_cmd(tbItems[i].cmd);
+        SetFocus(hView);
+        return 0;
+    }
+    }
+    return DefWindowProc(h, m, wp, lp);
+}
+
 /* ================================================================ status / refresh */
 
 static void status_update(void)
@@ -1842,11 +2040,17 @@ static void status_update(void)
              mn[mode], tn[tool], nob, nsel, mode == M_OBJ ? "selected" : "hilited", c, tv, tf,
              g_msg[0] ? "  |  " : "", g_msg);
     SetWindowTextA(hStatus, s);
+    const char *fn = g_path[0] ? g_path : "untitled";
+    for (const char *c = g_path; *c; c++)
+        if (*c == '\\' || *c == '/') fn = c + 1;
+    snprintf(s, sizeof s, "%s%s - " APP_NAME, fn, modified ? "*" : "");
+    SetWindowTextA(hMain, s);
     for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_TSEL + i, MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
     for (int i = 0; i < 4; i++) CheckMenuItem(hMenu, CM_MOBJ + i, MF_BYCOMMAND | (mode == i ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_PANEL, MF_BYCOMMAND | (panelOn ? MF_CHECKED : MF_UNCHECKED));
+    InvalidateRect(hBar, NULL, FALSE);
     CheckMenuRadioItem(hThemeMenu, CM_THEME, CM_THEME + NTHEME - 1, CM_THEME + themeIdx, MF_BYCOMMAND);
 }
 
@@ -2076,7 +2280,8 @@ static void handle_key(WPARAM wp)
     case 'E': id = ctrl ? CM_EXTRUDE : CM_TROT; break;
     case 'R': id = CM_TSCALE; break;
     case 'F': id = CM_FRAMESEL; break;
-    case 'A': id = ctrl ? CM_PANEL : CM_FRAMEALL; break;
+    case 'A': id = ctrl ? (shift ? CM_SELALL : CM_PANEL) : CM_FRAMEALL; break;
+    case 'I': if (ctrl && shift) id = CM_SELINV; break;
     case '4': id = CM_WIRE; break;
     case '5': id = CM_SHADED; break;
     case VK_F8: id = mode == M_OBJ ? CM_MOBJ + lastComp : CM_MOBJ; break;
@@ -2192,7 +2397,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         case D_PEND:
             if (abs(x - mx0) > 3 || abs(y - my0) > 3) dk = D_MARQ;
             break;
-        case D_MANIP: drag_move(x, y); panel_sync(); break;
+        case D_MANIP: drag_move(x, y); panel_sync(); status_update(); break;
         case D_PAINT: paint_dab(x, y); break;
         case D_BRUSH:
             paintRad = rad0 + (x - mx0) / ds;
@@ -2266,12 +2471,16 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_CUBE, "Polygon &Cube");
     AppendMenuA(m, MF_STRING, CM_CYL, "Polygon C&ylinder");
     AppendMenuA(m, MF_STRING, CM_SPHERE, "Polygon &Sphere");
+    AppendMenuA(m, MF_STRING, CM_PLANE, "Polygon &Plane");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Create");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_MOBJ, "&Object Mode\tF8");
     AppendMenuA(m, MF_STRING, CM_MVERT, "&Vertex\tF9");
     AppendMenuA(m, MF_STRING, CM_MEDGE, "&Edge\tF10");
     AppendMenuA(m, MF_STRING, CM_MFACE, "&Face\tF11");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_SELALL, "Select &All\tCtrl+Shift+A");
+    AppendMenuA(m, MF_STRING, CM_SELINV, "&Invert Selection\tCtrl+Shift+I");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Select");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_EXTRUDE, "&Extrude\tCtrl+E");
@@ -2309,11 +2518,13 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
     switch (m) {
     case WM_SIZE: {
+        if (wp == SIZE_MINIMIZED) return 0;
         int W = LOWORD(lp), H = HIWORD(lp);
-        int sh = (int)(20 * ds), pw = panelOn ? (int)(215 * ds) : 0;
+        int sh = (int)(20 * ds), pw = panelOn ? (int)(215 * ds) : 0, bh = tb_layout(W);
         if (pw > W / 2) pw = W / 2;
-        MoveWindow(hView, 0, 0, W - pw, H - sh, TRUE);
-        MoveWindow(hPanel, W - pw, 0, pw, H - sh, TRUE);
+        MoveWindow(hBar, 0, 0, W, bh, TRUE);
+        MoveWindow(hView, 0, bh, W - pw, H - sh - bh, TRUE);
+        MoveWindow(hPanel, W - pw, bh, pw, H - sh - bh, TRUE);
         ShowWindow(hPanel, panelOn ? SW_SHOW : SW_HIDE);
         MoveWindow(hStatus, 0, H - sh, W, sh, TRUE);
         return 0;
@@ -2350,6 +2561,9 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         if (!th.sys) menubar_line(h);
         return r;
     }
+    case WM_CLOSE:
+        if (!confirm_discard()) return 0;
+        break;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -2366,10 +2580,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ds = GetDeviceCaps(sdc, LOGPIXELSY) / 96.0f;
     ReleaseDC(NULL, sdc);
     if (ds < 1) ds = 1;
-    for (int t = 0; t < 4; t++) prim_defaults(&defPrim[t], t);
+    for (int t = 0; t < PRIM_COUNT; t++) prim_defaults(&defPrim[t], t);
     theme_load(theme_saved());
 
     hFont = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    hSmall = CreateFontA(-(int)(11 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     hBold = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
 
     WNDCLASSEXA wc;
@@ -2386,6 +2601,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpfnWndProc = PanelProc;
     wc.lpszClassName = "Tuff3DPanel";
     RegisterClassExA(&wc);
+    wc.lpfnWndProc = BarProc;
+    wc.lpszClassName = "Tuff3DBar";
+    RegisterClassExA(&wc);
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = ViewProc;
     wc.hbrBackground = NULL;
@@ -2395,6 +2613,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     hMenu = build_menu();
     hMain = CreateWindowA("Tuff3DMain", APP_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                           (int)(1280 * ds), (int)(800 * ds), NULL, hMenu, inst, NULL);
+    hBar = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hView = CreateWindowA("Tuff3DView", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hPanel = CreateWindowA("Tuff3DPanel", "", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hStatus = CreateWindowA("STATIC", "", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_CENTERIMAGE | SS_NOPREFIX,
@@ -2412,6 +2631,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     MSG msgq;
     while (GetMessage(&msgq, NULL, 0, 0) > 0) {
+        char cls[16] = "";
+        if ((msgq.message == WM_KEYDOWN || msgq.message == WM_KEYUP) && msgq.hwnd != hView &&
+            (msgq.hwnd == hMain || IsChild(hMain, msgq.hwnd)) &&
+            !(GetClassNameA(msgq.hwnd, cls, sizeof cls) && !lstrcmpiA(cls, "Edit")))
+            msgq.hwnd = hView;
         TranslateMessage(&msgq);
         DispatchMessage(&msgq);
     }

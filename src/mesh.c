@@ -572,6 +572,7 @@ void prim_defaults(Prim *p, int type)
     p->w = p->h = p->d = 1; p->sw = p->sh = p->sd = 1;
     p->cr = 1; p->ch = 2; p->csides = 20; p->chseg = 1; p->ccap = 0; p->ctop = p->cbot = 1;
     p->sr = 1; p->scols = 20; p->srows = 20;
+    p->pw = p->pd = 1; p->psw = p->psd = 10;
 }
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -586,6 +587,8 @@ void prim_clamp(Prim *p)
     p->ctop = p->ctop != 0; p->cbot = p->cbot != 0;
     p->sr = clampf(p->sr, 1e-4f, 1e6f);
     p->scols = clampi(p->scols, 3, 512); p->srows = clampi(p->srows, 2, 512);
+    p->pw = clampf(p->pw, 1e-4f, 1e6f); p->pd = clampf(p->pd, 1e-4f, 1e6f);
+    p->psw = clampi(p->psw, 1, 500); p->psd = clampi(p->psd, 1, 500);
 }
 
 static const V3 WHITE = { 1, 1, 1 };
@@ -723,6 +726,24 @@ static Mesh prim_sphere(const Prim *p)
     return mb_finish(&b);
 }
 
+static Mesh prim_plane(const Prim *p)
+{
+    MB b;
+    mb_init(&b);
+    int W = p->psw, D = p->psd;
+    int *g = xrealloc(NULL, (W + 1) * (D + 1) * sizeof(int));
+    for (int j = 0; j <= D; j++)
+        for (int i = 0; i <= W; i++)
+            g[j * (W + 1) + i] = mb_vert(&b, v3(p->pw * ((float)i / W - 0.5f), 0, p->pd * ((float)j / D - 0.5f)), WHITE);
+    for (int j = 0; j < D; j++)
+        for (int i = 0; i < W; i++) {
+            int q[4] = { g[j * (W + 1) + i], g[j * (W + 1) + i + 1], g[(j + 1) * (W + 1) + i + 1], g[(j + 1) * (W + 1) + i] };
+            mb_face_dir(&b, q, 4, v3(0, 1, 0));
+        }
+    free(g);
+    return mb_finish(&b);
+}
+
 Mesh mesh_prim(const Prim *pp)
 {
     Prim p = *pp;
@@ -730,6 +751,7 @@ Mesh mesh_prim(const Prim *pp)
     switch (p.type) {
     case PRIM_CYL: return prim_cylinder(&p);
     case PRIM_SPHERE: return prim_sphere(&p);
+    case PRIM_PLANE: return prim_plane(&p);
     default: return prim_cube(&p);
     }
 }
