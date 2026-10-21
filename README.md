@@ -98,6 +98,30 @@ Comfort
 Merge to Center and the Paint Vertex Color Tool are in the Mesh and Tools menus, as in Maya,
 where they have no default hotkey.
 
+## Maya LT scenes (.mlt)
+
+Maya LT is discontinued and nothing else reads its `.mlt` scenes. They are Maya's binary scene
+format with scrambled chunk sizes and names, and they store construction history (the steps that
+build a model) rather than the finished mesh, so only Maya can rebuild them. Full Maya 2023 or newer,
+including the free 30-day trial, can load them, and [`tools/mlt_convert.py`](tools/mlt_convert.py)
+converts a whole folder in one go. For every `.mlt` (subfolders included) it writes into a
+`converted` folder:
+
+- `name.obj`: every visible mesh in world space, with vertex colors as `v x y z r g b` (tuff3d reads
+  these; Maya's own OBJ exporter drops vertex colors)
+- `name.fbx`: UVs, materials and colors, for other 3D apps and game engines
+- `name.ma`: a Maya ASCII copy of the whole scene with its history, so the edit steps survive too
+
+The `.mlt` files are only read. A `convert_log.txt` lists what was converted. To run it:
+
+1. In Maya: Windows > General Editors > Script Editor, Python tab, File > Load Script... and pick
+   `mlt_convert.py`, then Execute (Ctrl+Enter). It asks for the folder.
+2. Or from a command prompt, without opening Maya's window:
+   `"C:\Program Files\Autodesk\Maya2025\bin\mayapy.exe" mlt_convert.py "D:\My MLT files"`
+   (options: `--no-fbx`, `--no-ma`, `--overwrite`)
+
+Files that were already converted are skipped, so it can be re-run after adding more.
+
 ## Building
 
 Plain C99 with MinGW-w64:

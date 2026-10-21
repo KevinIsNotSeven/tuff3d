@@ -1780,6 +1780,18 @@ static void load_file(const char *path, int replace)
     if (replace && !confirm_discard()) return;
     if (path) snprintf(p, sizeof p, "%s", path);
     else if (!file_dlg(0, p)) return;
+    const char *ext = strrchr(p, '.');
+    if (ext && (!lstrcmpiA(ext, ".mlt") || !lstrcmpiA(ext, ".mb") || !lstrcmpiA(ext, ".ma"))) {
+        /* Maya scenes keep construction history instead of the final mesh, so only Maya can rebuild them */
+        MessageBoxA(hMain,
+                    "tuff3d can't open Maya scene files (.mlt, .mb, .ma) directly: they store the steps that "
+                    "build each model, and only Maya can replay those.\n\n"
+                    "To convert them, run tools\\mlt_convert.py from the tuff3d repository in Maya 2023 or newer "
+                    "(the free trial works). It turns a whole folder of .mlt files into .obj files with their "
+                    "vertex colors, which tuff3d opens.",
+                    APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
     Mesh *ms;
     char (*names)[32];
     int n = obj_load(p, &ms, &names);
