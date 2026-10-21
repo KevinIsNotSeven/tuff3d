@@ -224,6 +224,34 @@ int main(void)
     }
     mesh_free(&m);
 
+    /* fill hole: delete a cube face, fill it back, closed again */
+    prim_defaults(&p, PRIM_CUBE);
+    m = mesh_prim(&p);
+    m.fs[2] = 1;
+    mesh_delete_faces(&m);
+    CHECK(m.nf == 5 && !closed_oriented(&m));
+    {
+        unsigned char touch[8] = { 0 };
+        CHECK(mesh_fill_holes(&m, touch) == 0 && m.nf == 5);   /* selection not on the hole */
+        int bv = -1;
+        for (int e = 0; e < m.ne; e++) if (m.ef[2 * e + 1] < 0) bv = m.ev[2 * e];
+        touch[bv] = 1;
+        CHECK(mesh_fill_holes(&m, touch) == 1);
+    }
+    CHECK(m.nf == 6 && closed_oriented(&m) && fabsf(volume(&m) - 1) < 1e-4f);
+    {
+        int sel = 0;
+        for (int f = 0; f < m.nf; f++) sel += m.fs[f];
+        CHECK(sel == 1);
+    }
+    mesh_free(&m);
+    /* a cylinder without caps has two holes */
+    prim_defaults(&p, PRIM_CYL);
+    p.ctop = p.cbot = 0;
+    m = mesh_prim(&p);
+    CHECK(mesh_fill_holes(&m, NULL) == 2 && closed_oriented(&m) && volume(&m) > 0);
+    mesh_free(&m);
+
     /* plane: grid of up-facing quads, open border, extrudable */
     prim_defaults(&p, PRIM_PLANE);
     p.psw = 3; p.psd = 2;

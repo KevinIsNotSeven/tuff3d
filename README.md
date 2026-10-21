@@ -22,6 +22,8 @@ Modeling
 - Snapping: hold X (grid), V (onto vertices, with a marker on the target) or J (15 degree rotation);
   Grid Snap and Point Snap are also toggle buttons
 - Extrude faces (kept together, then pull along the normal) and extrude edges; Merge to Center
+- Fill Hole: caps the open border your selected vertices, edges or faces touch (or every hole of the
+  selected objects in object mode); the new face is left selected, ready to extrude
 - Modify menu: Freeze Transformations, Center Pivot, Reset Transformations
 - Vertex paint brush (color, opacity, radius) and "Apply Color to Selection" (tint by opacity)
 - Duplicate, delete objects or faces, hide / show objects

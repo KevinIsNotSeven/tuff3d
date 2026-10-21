@@ -1513,7 +1513,7 @@ enum {
     CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE, CM_MMULTI,
     CM_SELALL, CM_SELINV,
     CM_OPEN, CM_GROW, CM_SHRINK, CM_LOOP, CM_TOVERT, CM_TOEDGE, CM_TOFACE,
-    CM_HIDE, CM_SHOWALL, CM_FREEZE, CM_CENTERPIV, CM_RESETXF,
+    CM_HIDE, CM_SHOWALL, CM_FREEZE, CM_CENTERPIV, CM_RESETXF, CM_FILLHOLE,
     CM_VFRONT, CM_VSIDE, CM_VTOP, CM_VHOME, CM_HUD, CM_SNAPGRID, CM_SNAPPOINT, CM_WIRETOG,
     CM_HELP,
     CM_RECENT = 300,             /* + recent file index */
@@ -1594,6 +1594,42 @@ static void cmd_extrude(void)
         lastHandle = H_Z;
     }
     msg("Extruded - drag the blue (Z) handle to pull along the normal");
+}
+
+/* Mesh > Fill Hole: caps the open borders that the selected vertices, edges or faces touch, or every
+   hole of the selected objects in object mode. The new faces end up selected, ready to extrude. */
+static void cmd_fill_hole(void)
+{
+    unsigned char **touch = calloc(nob + 1, sizeof *touch);
+    int any = 0, made = 0;
+    for (int i = 0; i < nob; i++) {
+        Mesh *m = &ob[i].m;
+        if (!active(&ob[i])) continue;
+        unsigned char *t = mode == M_OBJ ? NULL : malloc(m->nv + 1);
+        if (t && !mesh_vmask(m, mode, t)) { free(t); continue; }
+        for (int e = 0; e < m->ne && !any; e++)
+            any = m->ef[2 * e + 1] < 0 && (!t || t[m->ev[2 * e]] || t[m->ev[2 * e + 1]]);
+        touch[i] = t ? t : (unsigned char *)1;   /* 1: whole object */
+    }
+    if (any) {
+        undo_push("Fill Hole");
+        for (int i = 0; i < nob; i++) {
+            if (!touch[i]) continue;
+            int n = mesh_fill_holes(&ob[i].m, touch[i] == (unsigned char *)1 ? NULL : touch[i]);
+            if (n) { made += n; ob[i].prim.type = PRIM_NONE; }
+        }
+    }
+    for (int i = 0; i < nob; i++) if (touch[i] != (unsigned char *)1) free(touch[i]);
+    free(touch);
+    if (!made) {
+        msg(mode == M_OBJ ? "Fill Hole: this object has no holes"
+                          : "Fill Hole: select a vertex, edge or face on the edge of a hole");
+        return;
+    }
+    if (mode != M_OBJ && mode != M_MULTI) set_mode(M_FACE);
+    char b[64];
+    snprintf(b, sizeof b, made == 1 ? "Filled 1 hole" : "Filled %d holes", made);
+    msg(b);
 }
 
 static void cmd_merge(void)
@@ -2069,6 +2105,7 @@ static const char *HELP_TEXT =
     "  B + LMB drag\tBrush radius (paint tool)\n\n"
     "Edit\n"
     "  Ctrl+E\tExtrude faces / edges\n"
+    "  Mesh > Fill Hole\tCap the hole the selection touches (toolbar too)\n"
     "  Ctrl+D / Delete\tDuplicate / delete\n"
     "  Ctrl+H / Ctrl+Shift+H\tHide selected / show all\n"
     "  Z, Ctrl+Z / Shift+Z, Ctrl+Y\tUndo / redo\n"
@@ -2158,6 +2195,7 @@ static void do_cmd(int id)
     case CM_SELINV: cmd_select_all(1); break;
     case CM_EXTRUDE: cmd_extrude(); break;
     case CM_MERGE: cmd_merge(); break;
+    case CM_FILLHOLE: cmd_fill_hole(); break;
     case CM_APPLYCOL: cmd_apply_color(); break;
     case CM_SETCOL: cmd_set_color(); break;
     case CM_WIRE: wire = 1; break;
@@ -2181,7 +2219,7 @@ static void do_cmd(int id)
     case CM_HELP: MessageBoxA(hMain, HELP_TEXT, APP_NAME " hotkeys", MB_OK); break;
     }
     if ((id >= CM_DELETE && id <= CM_MERGE) || id == CM_APPLYCOL || id == CM_GROW || id == CM_SHRINK ||
-        (id >= CM_FREEZE && id <= CM_RESETXF))
+        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE)
         lastCmd = id;
     refresh_all();
 }
@@ -2646,11 +2684,12 @@ static const Tool tbItems[] = {
     { "Plane", "", CM_PLANE, "Create a polygon plane" }, { 0 },
     { "Extrude", "Ctrl+E", CM_EXTRUDE, "Extrude the selected faces or edges, then drag the blue handle" },
     { "Merge", "", CM_MERGE, "Merge the selected vertices to their center" },
+    { "Fill Hole", "", CM_FILLHOLE, "Cap the hole the selection is on (an object: all its holes)" },
     { "Duplicate", "Ctrl+D", CM_DUP, "Duplicate the selected objects" },
     { "Delete", "Del", CM_DELETE, "Delete the selected objects or faces" }, { 0 },
     { "Grid Snap", "X", CM_SNAPGRID, "Toggle snapping moves to the grid (or hold X while dragging)" },
     { "Point Snap", "V", CM_SNAPPOINT, "Toggle snapping moves onto vertices (or hold V while dragging)" }, { 0 },
-    { "Wireframe", "4 / 5", CM_WIRETOG, "Toggle wireframe (4) and shaded (5) display" },
+    { "Wire", "4 / 5", CM_WIRETOG, "Toggle wireframe (4) and shaded (5) display" },
     { "Frame", "F", CM_FRAMESEL, "Frame the selection (A frames everything, Home resets the view)" }, { 0 },
     { "Undo", "Z", CM_UNDO, "Undo the last change" },
     { "Redo", "Shift+Z", CM_REDO, "Redo" },
@@ -2682,7 +2721,7 @@ static int tb_layout(int W)
         GetTextExtentPoint32A(dc, tbItems[i].label, (int)strlen(tbItems[i].label), &a);
         SelectObject(dc, hSmall);
         GetTextExtentPoint32A(dc, tbItems[i].hotkey, (int)strlen(tbItems[i].hotkey), &b);
-        int w = (a.cx > b.cx ? a.cx : b.cx) + (int)(11 * ds);
+        int w = (a.cx > b.cx ? a.cx : b.cx) + (int)(9 * ds);
         if (x + w > W - pad && x > pad) { x = pad; y += bh + pad; }
         SetRect(&tbRc[i], x, y, x + w, y + bh);
         x += w + 2;
@@ -3662,6 +3701,7 @@ static HMENU build_menu(void)
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_EXTRUDE, "&Extrude\tCtrl+E");
     AppendMenuA(m, MF_STRING, CM_MERGE, "&Merge to Center");
+    AppendMenuA(m, MF_STRING, CM_FILLHOLE, "&Fill Hole");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Mesh");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_FREEZE, "&Freeze Transformations");

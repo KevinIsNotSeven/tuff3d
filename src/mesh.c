@@ -707,6 +707,52 @@ void mesh_convert(Mesh *m, int from, int to)
     free(vm);
 }
 
+int mesh_fill_holes(Mesh *m, const unsigned char *touch)
+{
+    /* each border edge a->b (as its one face winds it) becomes b->a in the cap */
+    int *from = xrealloc(NULL, (m->ne + 1) * sizeof(int)), *to = xrealloc(NULL, (m->ne + 1) * sizeof(int));
+    int nh = 0;
+    for (int e = 0; e < m->ne; e++) {
+        int f = m->ef[2 * e];
+        if (f < 0 || m->ef[2 * e + 1] >= 0) continue;
+        int a = m->ev[2 * e], b = m->ev[2 * e + 1], o = m->fo[f], n = m->fo[f + 1] - o;
+        for (int k = 0; k < n; k++)
+            if (m->fi[o + k] == b && m->fi[o + (k + 1) % n] == a) { int t = a; a = b; b = t; break; }
+        from[nh] = b;
+        to[nh] = a;
+        nh++;
+    }
+    /* trace the loops first; cap[] holds them back to back, cstart[i] where loop i begins */
+    unsigned char *used = xrealloc(NULL, nh + 1);
+    int *cap = xrealloc(NULL, (nh + 1) * sizeof(int)), *cstart = xrealloc(NULL, (nh + 2) * sizeof(int));
+    int made = 0;
+    memset(used, 0, nh + 1);
+    cstart[0] = 0;
+    for (int s = 0; s < nh; s++) {
+        if (used[s]) continue;
+        int n = 0, h = s, hit = !touch, closed = 0, *loop = cap + cstart[made];
+        while (h >= 0 && !used[h]) {
+            used[h] = 1;
+            loop[n++] = from[h];
+            hit |= touch && touch[from[h]];
+            if (to[h] == from[s]) { closed = 1; break; }
+            int nx = -1;
+            for (int k = 0; k < nh && nx < 0; k++)
+                if (!used[k] && from[k] == to[h]) nx = k;
+            h = nx;
+        }
+        if (closed && hit && n >= 3) { cstart[made + 1] = cstart[made] + n; made++; }   /* else reuse the space */
+    }
+    if (made) {
+        MB b = mb_from_verts(m);
+        for (int f = 0; f < m->nf; f++) mb_face(&b, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], 0);
+        for (int i = 0; i < made; i++) mb_face(&b, cap + cstart[i], cstart[i + 1] - cstart[i], 1);
+        mesh_replace(m, &b);
+    }
+    free(from); free(to); free(used); free(cap); free(cstart);
+    return made;
+}
+
 void mesh_flip(Mesh *m)
 {
     for (int f = 0; f < m->nf; f++)

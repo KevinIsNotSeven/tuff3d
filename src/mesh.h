@@ -71,6 +71,9 @@ int mesh_edge_loop(Mesh *m, int e);                 /* adds the loop through edg
 void mesh_grow(Mesh *m, int comp, int shrink);      /* grow/shrink by one ring of vertex neighbors */
 void mesh_convert(Mesh *m, int from, int to);       /* selection of kind 'from' becomes kind 'to' */
 void mesh_flip(Mesh *m);                            /* reverse every face's winding */
+/* cap open border loops with one face each: every loop touching a vertex in touch[] (all loops when
+   touch is NULL). The new faces are the only selected faces afterwards. Returns how many were made. */
+int mesh_fill_holes(Mesh *m, const unsigned char *touch);
 
 int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names);
 int obj_load(const char *path, Mesh **ms, char (**names)[32]);
