@@ -58,6 +58,7 @@ Mesh mesh_copy(const Mesh *m);
 void mesh_edges(Mesh *m);
 V3 mesh_fnormal(const Mesh *m, int f);
 V3 mesh_fcenter(const Mesh *m, int f);
+void mesh_cnormals(const Mesh *m, float angle, V3 *out);   /* out: one per face corner, fo[nf] */
 int mesh_vmask(const Mesh *m, int comp, unsigned char *mask);
 int mesh_extrude_faces(Mesh *m);
 int mesh_extrude_edges(Mesh *m);
@@ -65,7 +66,8 @@ int mesh_merge(Mesh *m, const unsigned char *mask);
 int mesh_delete_faces(Mesh *m);
 int mesh_raycast(const Mesh *m, V3 o, V3 d, float *t);
 
-int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names);
+/* angles: per mesh normal angle (writes vn + s), or NULL for positions only */
+int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles);
 int obj_load(const char *path, Mesh **ms, char (**names)[32]);
 
 #endif

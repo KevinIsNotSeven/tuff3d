@@ -366,6 +366,42 @@ V3 mesh_fnormal(const Mesh *m, int f)
     return v3norm(newell(m->p, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f]));
 }
 
+/* Per face-corner normals (out[fo[f] + k]). A corner averages the area weighted
+   normals of the faces around its vertex that are within 'angle' degrees of its
+   own face: 0 = hard (flat), 180 = fully smooth, in between = auto smooth. */
+void mesh_cnormals(const Mesh *m, float angle, V3 *out)
+{
+    int nc = m->fo[m->nf];
+    V3 *fn = xrealloc(NULL, (m->nf + 1) * sizeof(V3));
+    int *vo = xrealloc(NULL, (m->nv + 1) * sizeof(int)), *vc = xrealloc(NULL, (nc + 1) * sizeof(int));
+    int *cf = xrealloc(NULL, (nc + 1) * sizeof(int));
+    for (int f = 0; f < m->nf; f++) {
+        fn[f] = newell(m->p, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f]);
+        for (int c = m->fo[f]; c < m->fo[f + 1]; c++) cf[c] = f;
+    }
+    /* vertex -> corners */
+    memset(vo, 0, (m->nv + 1) * sizeof(int));
+    for (int c = 0; c < nc; c++) vo[m->fi[c] + 1]++;
+    for (int v = 0; v < m->nv; v++) vo[v + 1] += vo[v];
+    int *fill = xrealloc(NULL, (m->nv + 1) * sizeof(int));
+    memcpy(fill, vo, m->nv * sizeof(int));
+    for (int c = 0; c < nc; c++) vc[fill[m->fi[c]]++] = c;
+    free(fill);
+    float ct = angle >= 180 ? -2.0f : angle <= 0 ? 2.0f : cosf(angle * 3.14159265f / 180.0f) - 1e-5f;
+    for (int c = 0; c < nc; c++) {
+        V3 own = v3norm(fn[cf[c]]), sum = fn[cf[c]];
+        int v = m->fi[c];
+        for (int j = vo[v]; j < vo[v + 1]; j++) {
+            int g = cf[vc[j]];
+            if (g == cf[c]) continue;
+            if (v3dot(own, v3norm(fn[g])) >= ct) sum = v3add(sum, fn[g]);
+        }
+        sum = v3norm(sum);
+        out[c] = v3dot(sum, sum) > 0 ? sum : own;
+    }
+    free(fn); free(vo); free(vc); free(cf);
+}
+
 V3 mesh_fcenter(const Mesh *m, int f)
 {
     V3 c = v3(0, 0, 0);
@@ -736,7 +772,7 @@ Mesh mesh_prim(const Prim *pp)
 
 /* ---------------------------------------------------------------- OBJ io */
 
-int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names)
+int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles)
 {
     FILE *f = fopen(path, "w");
     if (!f) return 0;
@@ -747,7 +783,7 @@ int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, con
             if (c.x != 1 || c.y != 1 || c.z != 1) { colors = 1; break; }
         }
     fprintf(f, "# tuff3d\n");
-    int base = 1;
+    int base = 1, nbase = 1;
     for (int i = 0; i < n; i++) {
         const Mesh *m = ms[i];
         M4 M = mats[i];
@@ -761,12 +797,43 @@ int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, con
             else
                 fprintf(f, "v %.6g %.6g %.6g\n", p.x, p.y, p.z);
         }
+        /* corner normals in world space (inverse transpose), shared where equal */
+        int nc = m->fo[m->nf], *ni = NULL;
+        if (angles) {
+            V3 *cn = xrealloc(NULL, (nc + 1) * sizeof(V3));
+            int *vfirst = xrealloc(NULL, (m->nv + 1) * sizeof(int));
+            ni = xrealloc(NULL, (nc + 1) * sizeof(int));
+            mesh_cnormals(m, angles[i], cn);
+            M4 N = m4_inv(M);
+            for (int v = 0; v < m->nv; v++) vfirst[v] = -1;
+            for (int fc = 0; fc < m->nf; fc++)
+                for (int c = m->fo[fc]; c < m->fo[fc + 1]; c++) {
+                    int v = m->fi[c];
+                    cn[c] = v3norm(v3(N.m[0] * cn[c].x + N.m[1] * cn[c].y + N.m[2] * cn[c].z,
+                                      N.m[4] * cn[c].x + N.m[5] * cn[c].y + N.m[6] * cn[c].z,
+                                      N.m[8] * cn[c].x + N.m[9] * cn[c].y + N.m[10] * cn[c].z));
+                    if (vfirst[v] >= 0 && !memcmp(&cn[vfirst[v]], &cn[c], sizeof(V3))) ni[c] = ni[vfirst[v]];
+                    else if (c > m->fo[fc] && !memcmp(&cn[c - 1], &cn[c], sizeof(V3))) ni[c] = ni[c - 1];
+                    else {
+                        ni[c] = nbase++;
+                        fprintf(f, "vn %.5g %.5g %.5g\n", cn[c].x, cn[c].y, cn[c].z);
+                    }
+                    if (vfirst[v] < 0) vfirst[v] = c;
+                }
+            free(cn); free(vfirst);
+            fprintf(f, "s %s\n", angles[i] > 0 ? "1" : "off");
+        }
         for (int fc = 0; fc < m->nf; fc++) {
             int o = m->fo[fc], cnt = m->fo[fc + 1] - o;
             fputc('f', f);
-            for (int k = 0; k < cnt; k++) fprintf(f, " %d", base + m->fi[o + (flip ? cnt - 1 - k : k)]);
+            for (int k = 0; k < cnt; k++) {
+                int c = o + (flip ? cnt - 1 - k : k);
+                if (ni) fprintf(f, " %d//%d", base + m->fi[c], ni[c]);
+                else fprintf(f, " %d", base + m->fi[c]);
+            }
             fputc('\n', f);
         }
+        free(ni);
         base += m->nv;
     }
     int ok = !ferror(f);

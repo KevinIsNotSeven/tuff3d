@@ -18,7 +18,9 @@ It is one ~150 KB exe with no installer, and it only uses DLLs that ship with Wi
   - Cube: width/height/depth, subdivisions per axis
   - Cylinder: radius, height, sides, height divisions, cap divisions, top/bottom cap on/off
   - Sphere: radius, columns, rows
-- Export OBJ (world space, vertex colors written as `v x y z r g b`), plus OBJ import so you can reopen work
+- Export OBJ (world space, vertex colors written as `v x y z r g b`, shading written as `vn` normals), plus OBJ import so you can reopen work
+- Hard shade, Smooth shade and Auto Smooth per object (Display menu). Auto Smooth keeps edges
+  sharper than the Normal Angle (default 30°, editable in the side panel) hard and smooths the rest
 - Undo / redo, duplicate, delete objects or faces
 
 ## Controls (Maya defaults)
