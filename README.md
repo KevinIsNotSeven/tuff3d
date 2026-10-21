@@ -20,6 +20,8 @@ It is one ~150 KB exe with no installer, and it only uses DLLs that ship with Wi
   - Sphere: radius, columns, rows
 - Export OBJ (world space, vertex colors written as `v x y z r g b`), plus OBJ import so you can reopen work
 - Undo / redo, duplicate, delete objects or faces
+- Themes under Display > Theme: Classic, Light, Dark, Midnight, Tuff, Forest, Sunset. They color the
+  viewport, side panel, status bar, menu bar and (Windows 10/11) the title bar; the choice is remembered.
 
 ## Controls (Maya defaults)
 
@@ -54,8 +56,10 @@ where they have no default hotkey.
 
 Plain C99 with MinGW-w64:
 
-- Linux/macOS: `./build.sh` (needs `x86_64-w64-mingw32-gcc`)
-- Windows: `build.bat` (needs `gcc` from MSYS2 or w64devkit on PATH)
+- Linux/macOS: `./build.sh` (needs `x86_64-w64-mingw32-gcc` and `x86_64-w64-mingw32-windres`)
+- Windows: `build.bat` (needs `gcc` and `windres` from MSYS2 or w64devkit on PATH)
+
+The icon is `res/tuff3d.ico` (16 to 256 px), built from `res/tuff3d.png` with `python3 res/make_icon.py res/tuff3d.png res/tuff3d.ico` (needs Pillow).
 
 Geometry tests (any C compiler): `cc -Isrc tests/test_mesh.c src/mesh.c -lm && ./a.out`
 

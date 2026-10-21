@@ -44,7 +44,7 @@ static int lastCmd, lastHandle, hover;
 
 static HWND hMain, hView, hPanel, hStatus;
 static HDC hdc;
-static HMENU hMenu;
+static HMENU hMenu, hThemeMenu;
 static HFONT hFont, hBold;
 static HBRUSH swatchBrush;
 static int vw = 1, vh = 1, panelOn = 1;
@@ -56,6 +56,166 @@ static int key(int vk) { return GetKeyState(vk) < 0; }
 static void msg(const char *s) { snprintf(g_msg, sizeof g_msg, "%s", s); }
 
 static M4 obj_mat(const Obj *o) { return m4_trs(o->t, o->r, o->s); }
+
+/* ================================================================ themes */
+
+typedef struct {
+    const char *name;
+    int sys, dark;          /* sys: Windows colors and menu bar; dark: dark title bar and popup menus */
+    COLORREF ui, text, head, field, fieldText, line, hot;
+    float bgTop[3], bgBot[3], grid[3], gridMajor[3], gridAxis[3], wire[3], sel2[3];
+} Theme;
+
+static Theme themes[] = {
+    { "&Classic", 1, 0, 0, 0, 0, 0, 0, 0, 0,
+      { .36f, .36f, .36f }, { .36f, .36f, .36f }, { .44f, .44f, .44f }, { .5f, .5f, .5f }, { .12f, .12f, .12f }, { 0, .02f, .4f }, { 1, 1, 1 } },
+    { "&Light", 0, 0, RGB(243, 243, 243), RGB(30, 30, 30), RGB(0, 90, 180), RGB(255, 255, 255), RGB(20, 20, 20), RGB(200, 200, 200), RGB(214, 224, 238),
+      { .80f, .82f, .85f }, { .62f, .64f, .68f }, { .53f, .55f, .59f }, { .45f, .47f, .51f }, { .2f, .2f, .22f }, { 0, .05f, .45f }, { .1f, .1f, .1f } },
+    { "&Dark", 0, 1, RGB(37, 37, 38), RGB(220, 220, 220), RGB(255, 255, 255), RGB(28, 28, 28), RGB(230, 230, 230), RGB(70, 70, 72), RGB(62, 62, 64),
+      { .27f, .27f, .28f }, { .13f, .13f, .14f }, { .31f, .31f, .32f }, { .38f, .38f, .39f }, { .05f, .05f, .05f }, { .6f, .7f, .9f }, { 1, 1, 1 } },
+    { "&Midnight", 0, 1, RGB(20, 26, 42), RGB(200, 210, 230), RGB(110, 200, 255), RGB(12, 16, 28), RGB(220, 230, 250), RGB(45, 58, 88), RGB(40, 56, 92),
+      { .13f, .19f, .31f }, { .04f, .06f, .12f }, { .18f, .25f, .38f }, { .24f, .32f, .48f }, { .02f, .03f, .06f }, { .45f, .75f, 1 }, { 1, 1, 1 } },
+    { "&Tuff", 0, 1, RGB(58, 10, 34), RGB(240, 225, 235), RGB(165, 255, 20), RGB(36, 4, 20), RGB(255, 240, 250), RGB(110, 30, 70), RGB(150, 16, 205),
+      { .08f, .36f, .80f }, { .03f, .12f, .32f }, { .15f, .40f, .75f }, { .25f, .52f, .90f }, { .35f, 0, .16f }, { .65f, 1, .08f }, { 1, 1, 1 } },
+    { "&Forest", 0, 1, RGB(28, 38, 31), RGB(214, 228, 210), RGB(140, 210, 120), RGB(18, 26, 21), RGB(225, 238, 220), RGB(54, 74, 60), RGB(50, 78, 58),
+      { .24f, .31f, .26f }, { .10f, .14f, .11f }, { .28f, .36f, .30f }, { .34f, .44f, .36f }, { .04f, .06f, .04f }, { .75f, .95f, .6f }, { 1, 1, 1 } },
+    { "&Sunset", 0, 1, RGB(43, 29, 34), RGB(240, 222, 210), RGB(255, 154, 60), RGB(30, 20, 24), RGB(250, 235, 225), RGB(85, 55, 60), RGB(110, 58, 52),
+      { .42f, .24f, .30f }, { .12f, .07f, .12f }, { .46f, .30f, .34f }, { .54f, .36f, .38f }, { .08f, .03f, .05f }, { 1, .75f, .45f }, { 1, 1, 1 } },
+};
+#define NTHEME ((int)(sizeof themes / sizeof *themes))
+static Theme th;            /* active theme, with the Classic colors filled in from Windows */
+static int themeIdx;
+static HBRUSH brUi, brField, brLine, brHot;
+
+static COLORREF mix(COLORREF a, COLORREF b)
+{
+    return RGB((GetRValue(a) + GetRValue(b)) / 2, (GetGValue(a) + GetGValue(b)) / 2, (GetBValue(a) + GetBValue(b)) / 2);
+}
+
+static void theme_load(int i)
+{
+    themeIdx = i < 0 || i >= NTHEME ? 0 : i;
+    th = themes[themeIdx];
+    if (th.sys) {
+        th.ui = GetSysColor(COLOR_BTNFACE);
+        th.text = th.head = GetSysColor(COLOR_BTNTEXT);
+        th.field = GetSysColor(COLOR_WINDOW);
+        th.fieldText = GetSysColor(COLOR_WINDOWTEXT);
+        th.line = GetSysColor(COLOR_BTNSHADOW);
+        th.hot = GetSysColor(COLOR_BTNHIGHLIGHT);
+    }
+    HBRUSH *b[4] = { &brUi, &brField, &brLine, &brHot };
+    COLORREF c[4] = { th.ui, th.field, th.line, th.hot };
+    for (int k = 0; k < 4; k++) {
+        if (*b[k]) DeleteObject(*b[k]);
+        *b[k] = CreateSolidBrush(c[k]);
+    }
+}
+
+/* Title bar colors (DWM) and dark popup menus (uxtheme, Windows 10 1903+). Both are looked up at
+   run time so older Windows just keeps its default look. */
+static void theme_window(HWND h)
+{
+    typedef HRESULT (WINAPI *DwmSetAttr)(HWND, DWORD, LPCVOID, DWORD);
+    typedef int (WINAPI *SetAppMode)(int);
+    typedef BOOL (WINAPI *AllowDark)(HWND, BOOL);
+    typedef void (WINAPI *Flush)(void);
+    static HMODULE dwm, ux;
+    if (!dwm) dwm = LoadLibraryA("dwmapi.dll");
+    if (!ux) ux = LoadLibraryA("uxtheme.dll");
+    BOOL dark = th.dark;
+    if (ux) {
+        SetAppMode setMode = (SetAppMode)(void (*)(void))GetProcAddress(ux, MAKEINTRESOURCEA(135));
+        AllowDark allow = (AllowDark)(void (*)(void))GetProcAddress(ux, MAKEINTRESOURCEA(133));
+        Flush flush = (Flush)(void (*)(void))GetProcAddress(ux, MAKEINTRESOURCEA(136));
+        if (setMode) setMode(dark ? 2 : 0);    /* ForceDark / Default */
+        if (allow) allow(h, dark);
+        if (flush) flush();
+    }
+    if (dwm) {
+        DwmSetAttr set = (DwmSetAttr)(void (*)(void))GetProcAddress(dwm, "DwmSetWindowAttribute");
+        if (set) {
+            COLORREF cap = th.sys ? 0xFFFFFFFF : th.ui, txt = th.sys ? 0xFFFFFFFF : th.text;
+            set(h, 20, &dark, sizeof dark);   /* DWMWA_USE_IMMERSIVE_DARK_MODE */
+            set(h, 19, &dark, sizeof dark);   /* same, Windows 10 before 20H1 */
+            set(h, 35, &cap, sizeof cap);     /* DWMWA_CAPTION_COLOR (Windows 11) */
+            set(h, 36, &txt, sizeof txt);     /* DWMWA_TEXT_COLOR */
+        }
+    }
+}
+
+static int theme_saved(void)
+{
+    DWORD v = 0, sz = sizeof v;
+    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\" APP_NAME, "Theme", RRF_RT_REG_DWORD, NULL, &v, &sz)) return 0;
+    return (int)v;
+}
+
+static void theme_save(void)
+{
+    HKEY k;
+    DWORD v = (DWORD)themeIdx;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\" APP_NAME, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL)) return;
+    RegSetValueExA(k, "Theme", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+    RegCloseKey(k);
+}
+
+/* Undocumented messages uxtheme sends to let an app paint its own menu bar (as Notepad++ does). */
+#define WM_UAHDRAWMENU 0x0091
+#define WM_UAHDRAWMENUITEM 0x0092
+typedef struct { HMENU hmenu; HDC hdc; DWORD dwFlags; } UAHMENU;
+typedef struct {
+    int iPosition;
+    union { struct { DWORD cx, cy; } rgsizeBar[2], rgsizePopup[4]; } umim;
+    struct { DWORD rgcx[4]; DWORD fUpdateMaxWidths : 2; } umpm;
+} UAHMENUITEM;
+typedef struct { DRAWITEMSTRUCT dis; UAHMENU um; UAHMENUITEM umi; } UAHDRAWMENUITEM;
+
+static void menubar_paint(HWND h, LPARAM lp)
+{
+    UAHMENU *u = (UAHMENU *)lp;
+    MENUBARINFO mbi;
+    RECT wr;
+    memset(&mbi, 0, sizeof mbi);
+    mbi.cbSize = sizeof mbi;
+    if (!GetMenuBarInfo(h, OBJID_MENU, 0, &mbi)) return;
+    GetWindowRect(h, &wr);
+    OffsetRect(&mbi.rcBar, -wr.left, -wr.top);
+    FillRect(u->hdc, &mbi.rcBar, brUi);
+}
+
+static void menubar_item(LPARAM lp)
+{
+    UAHDRAWMENUITEM *d = (UAHDRAWMENUITEM *)lp;
+    char txt[64] = "";
+    MENUITEMINFOA mi;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    mi.fMask = MIIM_STRING;
+    mi.dwTypeData = txt;
+    mi.cch = sizeof txt - 1;
+    GetMenuItemInfoA(d->um.hmenu, d->umi.iPosition, TRUE, &mi);
+    UINT st = d->dis.itemState;
+    FillRect(d->um.hdc, &d->dis.rcItem, st & (ODS_HOTLIGHT | ODS_SELECTED) ? brHot : brUi);
+    SetBkMode(d->um.hdc, TRANSPARENT);
+    SetTextColor(d->um.hdc, st & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED) ? mix(th.text, th.ui) : th.text);
+    DrawTextA(d->um.hdc, txt, -1, &d->dis.rcItem, DT_CENTER | DT_SINGLELINE | DT_VCENTER | (st & ODS_NOACCEL ? DT_HIDEPREFIX : 0));
+}
+
+/* the 1px light line Windows leaves between the menu bar and the client area */
+static void menubar_line(HWND h)
+{
+    RECT rc, wr;
+    GetClientRect(h, &rc);
+    MapWindowPoints(h, NULL, (POINT *)&rc, 2);
+    GetWindowRect(h, &wr);
+    OffsetRect(&rc, -wr.left, -wr.top);
+    rc.bottom = rc.top;
+    rc.top--;
+    HDC dc = GetWindowDC(h);
+    FillRect(dc, &rc, brUi);
+    ReleaseDC(h, dc);
+}
 
 static int name_used(const char *n)
 {
@@ -1037,7 +1197,8 @@ enum {
     CM_WIRE, CM_SHADED, CM_FRAMESEL, CM_FRAMEALL, CM_PANEL,
     CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT,
     CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE,
-    CM_HELP
+    CM_HELP,
+    CM_THEME = 200               /* + theme index */
 };
 
 static void cmd_create(int type)
@@ -1275,6 +1436,13 @@ static const char *HELP_TEXT =
 static void do_cmd(int id)
 {
     g_msg[0] = 0;
+    if (id >= CM_THEME && id < CM_THEME + NTHEME) {
+        theme_load(id - CM_THEME);
+        theme_save();
+        theme_window(hMain);
+        DrawMenuBar(hMain);
+        RedrawWindow(hMain, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+    }
     switch (id) {
     case CM_NEW:
         if (nob) undo_push();
@@ -1472,13 +1640,13 @@ static void panel_build(void)
         int k = r < nrows ? rows[r].kind : 0;
         if (k == RK_HEAD && r) y += pad;
         if (k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR) {
-            SetWindowTextA(rLab[r], rows[r].label);
             SendMessage(rLab[r], WM_SETFONT, (WPARAM)(k == RK_HEAD ? hBold : hFont), FALSE);
+            SetWindowTextA(rLab[r], rows[r].label);
             MoveWindow(rLab[r], pad, y + (int)(3 * ds), k == RK_HEAD ? W - 2 * pad : lw - 4, rh - (int)(4 * ds), TRUE);
         }
         ShowWindow(rLab[r], k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR ? SW_SHOW : SW_HIDE);
         if (k == RK_FLOAT || k == RK_INT) {
-            MoveWindow(rEdit[r], pad + lw, y, ew, rh - 2, TRUE);
+            MoveWindow(rEdit[r], pad + lw + 1, y + (int)(2 * ds), ew - 2, rh - 3 - (int)(2 * ds), TRUE);
             row_text(r);
         }
         ShowWindow(rEdit[r], k == RK_FLOAT || k == RK_INT ? SW_SHOW : SW_HIDE);
@@ -1487,12 +1655,13 @@ static void panel_build(void)
             MoveWindow(rChk[r], pad + lw, y, ew, rh - 2, TRUE);
         }
         ShowWindow(rChk[r], k == RK_BOOL ? SW_SHOW : SW_HIDE);
-        if (k == RK_COLOR) { MoveWindow(hSwatch, pad + lw, y, ew, rh - 2, TRUE); swatchShown = hSwatch; }
+        if (k == RK_COLOR) { MoveWindow(hSwatch, pad + lw + 1, y + 1, ew - 2, rh - 4, TRUE); swatchShown = hSwatch; }
         if (k == RK_BUTTON) { MoveWindow(hApply, pad, y, W - 2 * pad, rh + 2, TRUE); applyShown = hApply; y += 4; }
         if (k) y += rh;
     }
     ShowWindow(hSwatch, swatchShown ? SW_SHOW : SW_HIDE);
     ShowWindow(hApply, applyShown ? SW_SHOW : SW_HIDE);
+    InvalidateRect(hPanel, NULL, TRUE);
     panel_sync();
     building = 0;
 }
@@ -1577,13 +1746,59 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         else if (id == 3001 && code == BN_CLICKED) { do_cmd(CM_APPLYCOL); SetFocus(hView); }
         return 0;
     }
-    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORSTATIC: {
         if ((HWND)lp == hSwatch) {
             if (swatchBrush) DeleteObject(swatchBrush);
             swatchBrush = CreateSolidBrush(RGB((int)(paintCol.x * 255 + .5f), (int)(paintCol.y * 255 + .5f), (int)(paintCol.z * 255 + .5f)));
             return (LRESULT)swatchBrush;
         }
-        break;
+        int head = 0;
+        for (int r = 0; r < nrows; r++)
+            if (rLab[r] == (HWND)lp) head = rows[r].kind == RK_HEAD;
+        SetTextColor((HDC)wp, head ? th.head : th.text);
+        SetBkColor((HDC)wp, th.ui);
+        return (LRESULT)brUi;
+    }
+    case WM_CTLCOLOREDIT:
+        SetTextColor((HDC)wp, th.fieldText);
+        SetBkColor((HDC)wp, th.field);
+        return (LRESULT)brField;
+    case WM_ERASEBKGND: {
+        RECT rc;
+        HDC dc = (HDC)wp;
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, brUi);
+        rc.right = 1;
+        FillRect(dc, &rc, brLine);
+        for (int r = 0; r <= nrows; r++) {
+            HWND c = r < nrows ? rEdit[r] : hSwatch;
+            if (!IsWindowVisible(c)) continue;
+            GetWindowRect(c, &rc);
+            MapWindowPoints(NULL, h, (POINT *)&rc, 2);
+            if (c != hSwatch) rc.top -= (int)(2 * ds) - 1;
+            InflateRect(&rc, 1, 1);
+            FillRect(dc, &rc, brField);
+            FrameRect(dc, &rc, brLine);
+        }
+        return 1;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT *)lp;
+        int down = d->itemState & ODS_SELECTED;
+        RECT rc = d->rcItem;
+        if (th.sys) DrawFrameControl(d->hDC, &rc, DFC_BUTTON, DFCS_BUTTONPUSH | (down ? DFCS_PUSHED : 0));
+        else {
+            FillRect(d->hDC, &rc, down ? brField : brHot);
+            FrameRect(d->hDC, &rc, brLine);
+        }
+        char b[64];
+        GetWindowTextA(d->hwndItem, b, sizeof b);
+        SetBkMode(d->hDC, TRANSPARENT);
+        SetTextColor(d->hDC, th.text);
+        if (down) OffsetRect(&rc, 1, 1);
+        DrawTextA(d->hDC, b, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return TRUE;
+    }
     case WM_SIZE:
         if (!building) panel_build();
         return 0;
@@ -1595,15 +1810,16 @@ static void panel_create(HINSTANCE inst)
 {
     for (int r = 0; r < NROW; r++) {
         rLab[r] = CreateWindowA("STATIC", "", WS_CHILD | SS_LEFTNOWORDWRAP | SS_NOPREFIX, 0, 0, 1, 1, hPanel, NULL, inst, NULL);
-        rEdit[r] = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(1000 + r), inst, NULL);
+        rEdit[r] = CreateWindowA("EDIT", "", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(1000 + r), inst, NULL);
         rChk[r] = CreateWindowA("BUTTON", "", WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(2000 + r), inst, NULL);
         SendMessage(rLab[r], WM_SETFONT, (WPARAM)hFont, 0);
         SendMessage(rEdit[r], WM_SETFONT, (WPARAM)hFont, 0);
         SendMessage(rChk[r], WM_SETFONT, (WPARAM)hFont, 0);
+        SendMessage(rEdit[r], EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM((int)(3 * ds), (int)(3 * ds)));
         editProc0 = (WNDPROC)SetWindowLongPtrA(rEdit[r], GWLP_WNDPROC, (LONG_PTR)EditProc);
     }
-    hSwatch = CreateWindowExA(WS_EX_CLIENTEDGE, "STATIC", "", WS_CHILD | SS_NOTIFY, 0, 0, 1, 1, hPanel, (HMENU)3000, inst, NULL);
-    hApply = CreateWindowA("BUTTON", "Apply Color to Selection", WS_CHILD | BS_PUSHBUTTON, 0, 0, 1, 1, hPanel, (HMENU)3001, inst, NULL);
+    hSwatch = CreateWindowA("STATIC", "", WS_CHILD | SS_NOTIFY, 0, 0, 1, 1, hPanel, (HMENU)3000, inst, NULL);
+    hApply = CreateWindowA("BUTTON", "Apply Color to Selection", WS_CHILD | BS_OWNERDRAW, 0, 0, 1, 1, hPanel, (HMENU)3001, inst, NULL);
     SendMessage(hApply, WM_SETFONT, (WPARAM)hFont, 0);
 }
 
@@ -1631,6 +1847,7 @@ static void status_update(void)
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_PANEL, MF_BYCOMMAND | (panelOn ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuRadioItem(hThemeMenu, CM_THEME, CM_THEME + NTHEME - 1, CM_THEME + themeIdx, MF_BYCOMMAND);
 }
 
 static void refresh_all(void)
@@ -1648,12 +1865,11 @@ static void draw_grid(void)
     glBegin(GL_LINES);
     for (int i = -12; i <= 12; i++) {
         if (!i) continue;
-        float g = i % 5 ? 0.44f : 0.5f;
-        glColor3f(g, g, g);
+        glColor3fv(i % 5 ? th.grid : th.gridMajor);
         glVertex3f((float)i, 0, -12); glVertex3f((float)i, 0, 12);
         glVertex3f(-12, 0, (float)i); glVertex3f(12, 0, (float)i);
     }
-    glColor3f(0.12f, 0.12f, 0.12f);
+    glColor3fv(th.gridAxis);
     glVertex3f(0, 0, -12); glVertex3f(0, 0, 12);
     glVertex3f(-12, 0, 0); glVertex3f(12, 0, 0);
     glEnd();
@@ -1695,8 +1911,16 @@ static void render(void)
 {
     cam_update();
     glViewport(0, 0, vw, vh);
-    glClearColor(0.36f, 0.36f, 0.36f, 1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glBegin(GL_QUADS);           /* background gradient */
+    glColor3fv(th.bgBot); glVertex2f(-1, -1); glVertex2f(1, -1);
+    glColor3fv(th.bgTop); glVertex2f(1, 1); glVertex2f(-1, 1);
+    glEnd();
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_DEPTH_TEST);
 
@@ -1760,10 +1984,10 @@ static void render(void)
         } else if (mode == M_OBJ && o->sel) {
             Obj *l = lead();
             if (l == o) glColor3f(0.26f, 1, 0.64f);
-            else glColor3f(1, 1, 1);
+            else glColor3fv(th.sel2);
             draw_edges(m, 0);
         } else if (wire) {
-            glColor3f(0.0f, 0.02f, 0.4f);
+            glColor3fv(th.wire);
             draw_edges(m, 0);
         }
         glPopMatrix();
@@ -1779,7 +2003,7 @@ static void render(void)
     glLoadIdentity();
     glDisable(GL_DEPTH_TEST);
     if (dk == D_MARQ) {
-        glColor3f(1, 1, 1);
+        glColor3fv(th.sel2);
         glEnable(GL_LINE_STIPPLE);
         glLineStipple(1, 0xF0F0);
         glBegin(GL_LINE_LOOP);
@@ -2071,6 +2295,9 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_FRAMESEL, "&Frame Selected\tF");
     AppendMenuA(m, MF_STRING, CM_FRAMEALL, "Frame &All\tA");
     AppendMenuA(m, MF_STRING, CM_PANEL, "Side &Panel\tCtrl+A");
+    hThemeMenu = CreatePopupMenu();
+    for (int i = 0; i < NTHEME; i++) AppendMenuA(hThemeMenu, MF_STRING, CM_THEME + i, themes[i].name);
+    AppendMenuA(m, MF_POPUP, (UINT_PTR)hThemeMenu, "&Theme");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Display");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_HELP, "&Hotkeys\tF1");
@@ -2100,6 +2327,29 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_KEYMENU && lp == 0) return 0;
         break;
+    case WM_CTLCOLORSTATIC:
+        SetTextColor((HDC)wp, th.text);
+        SetBkColor((HDC)wp, th.ui);
+        return (LRESULT)brUi;
+    case WM_ERASEBKGND: {
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect((HDC)wp, &rc, brUi);
+        return 1;
+    }
+    case WM_UAHDRAWMENU:
+        if (th.sys) break;
+        menubar_paint(h, lp);
+        return 1;
+    case WM_UAHDRAWMENUITEM:
+        if (th.sys) break;
+        menubar_item(lp);
+        return 1;
+    case WM_NCPAINT: case WM_NCACTIVATE: {
+        LRESULT r = DefWindowProc(h, m, wp, lp);
+        if (!th.sys) menubar_line(h);
+        return r;
+    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -2117,37 +2367,41 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ReleaseDC(NULL, sdc);
     if (ds < 1) ds = 1;
     for (int t = 0; t < 4; t++) prim_defaults(&defPrim[t], t);
+    theme_load(theme_saved());
 
     hFont = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     hBold = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
 
-    WNDCLASSA wc;
+    WNDCLASSEXA wc;
     memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+    wc.hIconSm = LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     wc.lpfnWndProc = MainProc;
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = "Tuff3DMain";
-    RegisterClassA(&wc);
+    RegisterClassExA(&wc);
     wc.lpfnWndProc = PanelProc;
     wc.lpszClassName = "Tuff3DPanel";
-    RegisterClassA(&wc);
+    RegisterClassExA(&wc);
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = ViewProc;
     wc.hbrBackground = NULL;
     wc.lpszClassName = "Tuff3DView";
-    RegisterClassA(&wc);
+    RegisterClassExA(&wc);
 
     hMenu = build_menu();
     hMain = CreateWindowA("Tuff3DMain", APP_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                           (int)(1280 * ds), (int)(800 * ds), NULL, hMenu, inst, NULL);
     hView = CreateWindowA("Tuff3DView", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hPanel = CreateWindowA("Tuff3DPanel", "", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 1, 1, hMain, NULL, inst, NULL);
-    hStatus = CreateWindowA("STATIC", "", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_CENTERIMAGE | SS_NOPREFIX | SS_SUNKEN,
+    hStatus = CreateWindowA("STATIC", "", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_CENTERIMAGE | SS_NOPREFIX,
                             0, 0, 1, 1, hMain, NULL, inst, NULL);
     SendMessage(hStatus, WM_SETFONT, (WPARAM)hFont, 0);
     panel_create(inst);
+    theme_window(hMain);
 
     ShowWindow(hMain, show);
     RECT rc;
