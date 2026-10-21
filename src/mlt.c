@@ -966,11 +966,21 @@ static int g_extrude_faces(G *g, const Comps *c, int *nfirst)
         }
     }
     *nfirst = nv0;
-    for (int k = 0; k < no; k++) {
-        int e = order[k];
-        if (vm[g->ea[e]] < 0) vm[g->ea[e]] = g_vert(g, g->p[g->ea[e]]);
-        if (vm[g->eb[e]] < 0) vm[g->eb[e]] = g_vert(g, g->p[g->eb[e]]);
+    /* copies: every edge of the selected faces in order (interior ones too), each edge's stored
+       start first, for the vertices on the region's boundary */
+    unsigned char *onb = xalloc(nv0 + 1);
+    for (int k = 0; k < no; k++) { onb[g->ea[order[k]]] = 1; onb[g->eb[order[k]]] = 1; }
+    for (int i = 0; i < c->n; i++) {
+        int f = c->idx[i];
+        if (f < 0 || f >= nf0 || (i && c->idx[i - 1] == f)) continue;
+        for (int j = g->fo[f]; j < g->fo[f + 1]; j++) {
+            int e = g->fe[j];
+            if (e < 0) continue;
+            int ends[2] = { g->ea[e], g->eb[e] };
+            for (int z = 0; z < 2; z++) if (onb[ends[z]] && vm[ends[z]] < 0) vm[ends[z]] = g_vert(g, g->p[ends[z]]);
+        }
     }
+    free(onb);
     int *up = xalloc((nv0 + 1) * sizeof(int));
     for (int v = 0; v < nv0; v++) up[v] = -1;
     for (int v = 0; v < nv0; v++) if (vm[v] >= 0) up[v] = -2;
@@ -1809,6 +1819,8 @@ static void move_extruded(const Node *nd, G *g, const Comps *c, int first)
             if (u < first || v < first) continue;
             fn = v3add(fn, v3cross(w[u - first], w[v - first]));
         }
+        float fl = v3len(fn);
+        if (fl > 1e-12f) fn = v3mul(fn, 1 / fl);   /* each face counts the same */
         for (int j = a; j < b; j++) if (g->fi[j] >= first) nrm[g->fi[j] - first] = v3add(nrm[g->fi[j] - first], fn);
     }
     V3 ctr = v3(0, 0, 0);
