@@ -106,22 +106,30 @@ where they have no default hotkey.
 
 Maya LT is discontinued and nothing else reads its `.mlt` scenes, so tuff3d opens them itself:
 File > Open, drag and drop, or `tuff3d.exe "apple c.mlt"`. They are Maya's binary scene format
-with scrambled chunk sizes and names, and they store construction history (the steps that build a
-model) rather than the finished mesh, so tuff3d replays that history to rebuild every visible mesh
-in world space, with its vertex colors. Save (Ctrl+S) then writes an `.obj` next to it; the `.mlt`
-itself is never written to.
+with scrambled chunk sizes and names. Objects saved without history store their mesh, which tuff3d
+reads as is. Everything else is stored as construction history (the steps that build a model), so
+tuff3d replays that history to rebuild every visible mesh in world space, with its vertex colors.
+Save (Ctrl+S) then writes an `.obj` next to it; the `.mlt` itself is never written to.
 
-Supported history steps: polyCube, polySphere, polyCylinder, polyPlane, Smooth, Extract (chip off),
-Separate, Extrude (faces and edges), tweaks (moved vertices), Delete faces, Combine (unite), Merge
-Vertices and Paint Vertex Color, plus object transforms. UV, normal and soft-edge steps are skipped
-since tuff3d doesn't use them. Limits:
+Supported history steps: cube, cylinder, plane, sphere and torus primitives, Smooth, Extract (chip
+off), Separate, Extrude faces (including thickness) and edges, Bridge, Split (Insert Edge Loop /
+Multi-Cut cuts), Bevel, Fill Hole (close border), Delete faces and edges, Delete Edge, Combine
+(unite), Merge Vertices, tweaks (moved vertices) and Paint Vertex Color, plus object transforms.
+UV, normal and soft-edge steps are skipped since tuff3d doesn't use them.
+
+Later steps pick vertices, edges and faces by number, so tuff3d numbers them the way Maya does.
+Those rules were worked out against the checks Maya leaves in the file (each extrusion records the
+bounding box of what it extruded, and vertex color steps list the faces around every vertex);
+`tests/mlt_dump.c` with `MLT_DEBUG=1` prints them. Limits:
 
 - Steps tuff3d doesn't know yet are skipped, and a warning names them, so the shape may be missing
   that edit.
-- Meshes saved without history (after Edit > Delete by Type > History) store their points
-  differently and aren't read yet.
-- Smoothing and extrusion number vertices a little differently from Maya, so later moved vertices
-  are matched by position and can land slightly off on complex models.
+- A few numbering cases are still guessed. When an extrusion's selection falls clearly outside the
+  box Maya recorded, tuff3d swaps in the matching faces or edges, but a later step can still land
+  on a slightly different face.
+- Bevel follows Maya exactly when every edge is bevelled; partial bevels are approximated.
+- Vertex colors are per vertex in tuff3d, so where Maya had a hard color edge the colors blend.
+- Holes inside faces (rare) are dropped from stored meshes.
 
 If a file doesn't open or looks wrong, send it in so support can be added.
 

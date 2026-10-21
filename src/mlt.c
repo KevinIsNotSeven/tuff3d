@@ -997,12 +997,16 @@ static int g_extrude_faces(G *g, const Comps *c, int *nfirst)
         if (vm[g->eb[e]] >= 0) g->eb[e] = vm[g->eb[e]];
     }
     /* side faces: a b b' a' along the selected face's direction */
-    for (int k = 0; k < no; k++) {
+    int *so = xalloc((no + 1) * sizeof(int));
+    for (int k = 0; k < no; k++) so[k] = k;
+    for (int kk = 0; kk < no; kk++) {
+        int k = so[kk];
         int e = order[k], f = side_f[k], j = side_j[k];
         int n = g_fn(g, f), a = g->fi[j], b = g->fi[g->fo[f] + (j - g->fo[f] + 1) % n];
         int q[4] = { a, b, vm[b], vm[a] }, qe[4] = { e, up[b], em[e], up[a] };
         g_face(g, q, qe, 4, g->fc[f]);
     }
+    free(so);
     for (int f = 0; f < nf0; f++) if (sel[f]) face_swap(g, f, vm, em);
     g_hash_reset(g);
     free(sel); free(ef); free(bnd); free(vm); free(em); free(order); free(side_f); free(side_j); free(met); free(up);
@@ -1113,6 +1117,18 @@ static void g_extrude_edges(G *g, const Comps *c, V3 col, int **vmap)
 
 static void g_delete_faces(G *g, const Comps *c)
 {
+    if (getenv("MLT_DEBUG") && atoi(getenv("MLT_DEBUG")) > 2)
+        for (int i = 0; i < c->n; i++) {
+            int f = c->idx[i];
+            if (f < 0 || f >= g->nf) continue;
+            V3 ctr = v3(0, 0, 0), n = v3(0, 0, 0);
+            for (int j = g->fo[f]; j < g->fo[f + 1]; j++) { ctr = v3add(ctr, g->p[g->fi[j]]); n = v3add(n, v3cross(g->p[g->fi[j]], g->p[g->fi[g->fo[f] + (j - g->fo[f] + 1) % g_fn(g, f)]])); }
+            ctr = v3mul(ctr, 1.0f / g_fn(g, f));
+            float l = v3len(n) + 1e-12f;
+            fprintf(stderr, "      delete f%d at %.2f %.2f %.2f normal %.2f %.2f %.2f:", f, ctr.x, ctr.y, ctr.z, n.x / l, n.y / l, n.z / l);
+            for (int j = g->fo[f]; j < g->fo[f + 1]; j++) fprintf(stderr, " %d", g->fi[j]);
+            fprintf(stderr, "\n");
+        }
     unsigned char *keep = xalloc(g->nf + 1);
     memset(keep, 1, g->nf);
     for (int i = 0; i < c->n; i++) if (c->idx[i] >= 0 && c->idx[i] < g->nf) keep[c->idx[i]] = 0;
@@ -1445,6 +1461,9 @@ static void g_split(G *g, const int *edges, const float *fr, int n)
         pv[k] = -1;
         if (e < 0 || e >= g->ne) continue;
         float t = fr[k];
+        int again = -1;   /* a closed cut ends on its first point */
+        for (int q = 0; q < k && again < 0; q++) if (edges[q] == e && fabsf(fr[q] - t) < 1e-6f) again = pv[q];
+        if (again >= 0) { pv[k] = again; continue; }
         if (t <= 1e-6f) { pv[k] = g->ea[e]; continue; }
         if (t >= 1 - 1e-6f) { pv[k] = g->eb[e]; continue; }
         /* new vertex splitting edge e: e keeps a..m, a new edge m..b */
@@ -1492,7 +1511,13 @@ static void g_split(G *g, const int *edges, const float *fr, int n)
             v1[n1] = w; e1[n1++] = ne;
             for (int j = iw; j != iu; j = (j + 1) % fn) { v2[n2] = g->fi[s + j]; e2[n2++] = g->fe[s + j]; }
             v2[n2] = u; e2[n2++] = ne;
-            /* face f keeps the first part (rewritten in place), the second part is a new face */
+            /* face f keeps the part from the second point round to the first (rewritten in place),
+               the part from the first point round to the second is a new face */
+            {
+                int *tv = v1, *te = e1, tn = n1;
+                v1 = v2; e1 = e2; n1 = n2;
+                v2 = tv; e2 = te; n2 = tn;
+            }
             int tot = g->fo[g->nf], d = n1 - fn;
             if (d > 0) {
                 g->fi = xgrow(g->fi, (tot + d + 1) * sizeof(int));
@@ -1510,6 +1535,93 @@ static void g_split(G *g, const int *edges, const float *fr, int n)
     }
     g_hash_reset(g);
     free(pv);
+}
+
+/* Bevel every edge (one segment), numbered as Maya does: going through the vertices in order,
+   each vertex gets a new vertex per face around it, starting with the face before its lowest
+   numbered face and turning the way the faces' incoming edges lead; the edges met on the way
+   become strips (faces first), then the old faces (shrunk), then a face per old vertex. */
+static int g_bevel_all(G *g, float frac)
+{
+    int nv = g->nv, nf = g->nf, ne = g->ne, *ef = g_edge_faces(g);
+    for (int e = 0; e < ne; e++) if (ef[2 * e] < 0 || ef[2 * e + 1] < 0) { free(ef); return 0; }   /* closed meshes only */
+    int nc = g->fo[nf];
+    int *cv = xalloc((nc + 1) * sizeof(int)), *ring = xalloc((nf + 1) * sizeof(int)), *done = xalloc((ne + 1) * sizeof(int));
+    int *strip_e = xalloc((ne + 1) * sizeof(int)), ns = 0;
+    float *minl = xalloc((nv + 1) * sizeof(float));
+    for (int v = 0; v < nv; v++) minl[v] = 1e30f;
+    for (int e = 0; e < ne; e++) {
+        float l = v3len(v3sub(g->p[g->ea[e]], g->p[g->eb[e]]));
+        if (l < minl[g->ea[e]]) minl[g->ea[e]] = l;
+        if (l < minl[g->eb[e]]) minl[g->eb[e]] = l;
+    }
+    G out = g_new(0, NULL);
+    int *rings = xalloc((nc + 1) * sizeof(int)), *rs = xalloc((nv + 2) * sizeof(int)), nr = 0;
+    for (int v = 0; v < nv; v++) {
+        rs[v] = nr;
+        int f0 = -1;
+        for (int f = 0; f < nf && f0 < 0; f++)
+            for (int j = g->fo[f]; j < g->fo[f + 1]; j++) if (g->fi[j] == v) { f0 = f; break; }
+        if (f0 < 0) continue;
+        /* faces around v: next = the other face on f's edge coming into v */
+        int n = 0, f = f0;
+        do {
+            ring[n++] = f;
+            int s = g->fo[f], k = g_fn(g, f), in = -1;
+            for (int j = 0; j < k; j++) if (g->fi[s + j] == v) in = g->fe[s + (j - 1 + k) % k];
+            if (in < 0) break;
+            f = ef[2 * in] == f ? ef[2 * in + 1] : ef[2 * in];
+        } while (f != f0 && f >= 0 && n < nf);
+        /* start one face before f0 */
+        for (int i = 0; i < n; i++) {
+            int fc = ring[(i + n - 1) % n], s = g->fo[fc], k = g_fn(g, fc);
+            for (int j = 0; j < k; j++)
+                if (g->fi[s + j] == v) {
+                    V3 p = g->p[v], a = g->p[g->fi[s + (j + 1) % k]], b = g->p[g->fi[s + (j - 1 + k) % k]];
+                    float d = frac * 0.5f * minl[v];
+                    V3 ua = v3sub(a, p), ub = v3sub(b, p);
+                    float la = v3len(ua), lb = v3len(ub);
+                    if (la > 1e-12f) p = v3add(p, v3mul(ua, d / la));
+                    if (lb > 1e-12f) p = v3add(p, v3mul(ub, d / lb));
+                    cv[s + j] = g_vert(&out, p);
+                    rings[nr++] = s + j;
+                }
+        }
+        /* strips for the edges between consecutive corners: last to first, then in order */
+        for (int i = 0; i < n; i++) {
+            int fa = ring[(i + n - 2) % n], fb = ring[(i + n - 1) % n];
+            for (int e = 0; e < ne; e++)
+                if (!done[e] && (g->ea[e] == v || g->eb[e] == v) &&
+                    ((ef[2 * e] == fa && ef[2 * e + 1] == fb) || (ef[2 * e] == fb && ef[2 * e + 1] == fa))) {
+                    done[e] = 1;
+                    strip_e[ns++] = e;
+                }
+        }
+    }
+    rs[nv] = nr;
+    /* strips: the corners of both faces along the edge */
+    for (int i = 0; i < ns; i++) {
+        int e = strip_e[i], fs[2] = { ef[2 * e], ef[2 * e + 1] }, q[4], m = 0;
+        for (int z = 0; z < 2; z++) {
+            int f = fs[z], s = g->fo[f], k = g_fn(g, f);
+            for (int j = 0; j < k; j++)
+                if (g->fe[s + j] == e) { q[m++] = cv[s + (j + 1) % k]; q[m++] = cv[s + j]; }
+        }
+        if (m == 4) g_face(&out, q, NULL, 4, g->fc[fs[0]]);
+    }
+    for (int f = 0; f < nf; f++) g_face(&out, cv + g->fo[f], NULL, g_fn(g, f), g->fc[f]);
+    for (int v = 0; v < nv; v++) {
+        int n = rs[v + 1] - rs[v];
+        if (n < 3) continue;
+        int *q = xalloc(n * sizeof(int));
+        for (int i = 0; i < n; i++) q[i] = cv[rings[rs[v] + n - 1 - i]];
+        g_face(&out, q, NULL, n, g->fc[g->nf ? 0 : 0]);
+        free(q);
+    }
+    g_free(g);
+    *g = out;
+    free(ef); free(cv); free(ring); free(done); free(strip_e); free(minl); free(rings); free(rs);
+    return 1;
 }
 
 /* Bevel (one segment): every listed edge becomes a strip; each end vertex of a bevelled edge
@@ -2233,7 +2345,8 @@ static int eval_op(Ctx *x, int node, const char *plug, G *out)
     } else if (!strcmp(op, "polyBevel")) {
         if ((ok = eval_in(x, node, "ip", out))) {
             Comps c = comps(nd, "ics", out->ne);
-            g_bevel(out, &c, (float)attr_d(nd, "f", 0.2) * 0.5f);
+            int all = c.n >= out->ne;
+            if (!all || !g_bevel_all(out, (float)attr_d(nd, "f", 0.5))) g_bevel(out, &c, (float)attr_d(nd, "f", 0.5) * 0.5f);
             free(c.idx);
         }
     } else if (!strcmp(op, "polySplit")) {
