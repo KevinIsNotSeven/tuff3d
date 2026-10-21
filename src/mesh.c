@@ -377,12 +377,14 @@ V3 mesh_fcenter(const Mesh *m, int f)
 int mesh_vmask(const Mesh *m, int comp, unsigned char *mask)
 {
     memset(mask, 0, m->nv);
-    if (comp == COMP_VERT) {
+    if (comp == COMP_VERT || comp == COMP_MULTI) {
         for (int i = 0; i < m->nv; i++) mask[i] = m->vs[i] != 0;
-    } else if (comp == COMP_EDGE) {
+    }
+    if (comp == COMP_EDGE || comp == COMP_MULTI) {
         for (int e = 0; e < m->ne; e++)
             if (m->es[e]) mask[m->ev[2 * e]] = mask[m->ev[2 * e + 1]] = 1;
-    } else if (comp == COMP_FACE) {
+    }
+    if (comp == COMP_FACE || comp == COMP_MULTI) {
         for (int f = 0; f < m->nf; f++)
             if (m->fs[f])
                 for (int k = m->fo[f]; k < m->fo[f + 1]; k++) mask[m->fi[k]] = 1;

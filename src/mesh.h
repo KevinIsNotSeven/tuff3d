@@ -39,7 +39,7 @@ typedef struct Mesh {
     int ne; int *ev; int *ef; unsigned char *es;   /* ev: 2 verts (lo,hi), ef: up to 2 faces (-1) */
 } Mesh;
 
-enum { COMP_VERT = 1, COMP_EDGE = 2, COMP_FACE = 3 };
+enum { COMP_VERT = 1, COMP_EDGE = 2, COMP_FACE = 3, COMP_MULTI = 4 };   /* MULTI: union of all three */
 enum { PRIM_NONE, PRIM_CUBE, PRIM_CYL, PRIM_SPHERE, PRIM_PLANE, PRIM_COUNT };
 
 typedef struct Prim {

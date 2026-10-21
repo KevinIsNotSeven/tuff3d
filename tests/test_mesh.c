@@ -147,6 +147,20 @@ int main(void)
     remove("test_out.obj");
     mesh_free(&m);
 
+    /* multi mask: union of selected verts, edges and faces */
+    prim_defaults(&p, PRIM_CUBE);
+    m = mesh_prim(&p);
+    {
+        unsigned char mask[8];
+        m.vs[0] = 1;
+        m.es[0] = 1;
+        CHECK(mesh_vmask(&m, COMP_MULTI, mask) == 1 + (m.ev[0] != 0) + (m.ev[1] != 0));   /* {0} + edge 0's ends */
+        m.fs[0] = 1;
+        CHECK(mesh_vmask(&m, COMP_MULTI, mask) >= 4);
+        CHECK(mesh_vmask(&m, COMP_FACE, mask) == 4);
+    }
+    mesh_free(&m);
+
     /* plane: grid of up-facing quads, open border, extrudable */
     prim_defaults(&p, PRIM_PLANE);
     p.psw = 3; p.psd = 2;

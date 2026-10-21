@@ -24,7 +24,7 @@ typedef struct {
     Prim prim;           /* construction history, PRIM_NONE once components are edited */
 } Obj;
 
-enum { M_OBJ, M_VERT, M_EDGE, M_FACE };        /* component modes match COMP_* */
+enum { M_OBJ, M_VERT, M_EDGE, M_FACE, M_MULTI };   /* component modes match COMP_* */
 enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT };
 enum { H_NONE, H_X, H_Y, H_Z, H_YZ, H_XZ, H_XY, H_C, H_VIEW };
 
@@ -41,6 +41,7 @@ static float paintOpa = 1, paintRad = 40;
 static char g_path[MAX_PATH];
 static char g_msg[200];
 static int lastCmd, lastHandle, hover, modified;
+static int hvObj = -1, hvKind, hvIdx, tracking;   /* preselection highlight (hvKind 0 = whole object) */
 
 static HWND hMain, hView, hPanel, hStatus, hBar;
 static HDC hdc;
@@ -85,7 +86,7 @@ static Theme themes[] = {
 #define NTHEME ((int)(sizeof themes / sizeof *themes))
 static Theme th;            /* active theme, with the Classic colors filled in from Windows */
 static int themeIdx;
-static HBRUSH brUi, brField, brLine, brHot;
+static HBRUSH brUi, brField, brLine, brHot, brAcc;
 
 static COLORREF mix(COLORREF a, COLORREF b)
 {
@@ -104,9 +105,9 @@ static void theme_load(int i)
         th.line = GetSysColor(COLOR_BTNSHADOW);
         th.hot = GetSysColor(COLOR_BTNHIGHLIGHT);
     }
-    HBRUSH *b[4] = { &brUi, &brField, &brLine, &brHot };
-    COLORREF c[4] = { th.ui, th.field, th.line, th.hot };
-    for (int k = 0; k < 4; k++) {
+    HBRUSH *b[5] = { &brUi, &brField, &brLine, &brHot, &brAcc };
+    COLORREF c[5] = { th.ui, th.field, th.line, th.hot, th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head };
+    for (int k = 0; k < 5; k++) {
         if (*b[k]) DeleteObject(*b[k]);
         *b[k] = CreateSolidBrush(c[k]);
     }
@@ -271,20 +272,27 @@ static Obj *lead(void)
     return b;
 }
 
-static unsigned char *comp_flags(Obj *o, int *n)
+/* does the current mode work on this component kind (M_VERT/M_EDGE/M_FACE)? Multi works on all three. */
+static int shows(int kind) { return mode == kind || mode == M_MULTI; }
+
+static unsigned char *comp_flags(Obj *o, int kind, int *n)
 {
     Mesh *m = &o->m;
-    if (mode == M_VERT) { *n = m->nv; return m->vs; }
-    if (mode == M_EDGE) { *n = m->ne; return m->es; }
+    if (kind == M_VERT) { *n = m->nv; return m->vs; }
+    if (kind == M_EDGE) { *n = m->ne; return m->es; }
     *n = m->nf;
     return m->fs;
 }
 
 static int comp_count(Obj *o)
 {
-    int n, c = 0;
-    unsigned char *f = comp_flags(o, &n);
-    for (int i = 0; i < n; i++) c += f[i] != 0;
+    int c = 0;
+    for (int k = M_VERT; k <= M_FACE; k++) {
+        if (!shows(k)) continue;
+        int n;
+        unsigned char *f = comp_flags(o, k, &n);
+        for (int i = 0; i < n; i++) c += f[i] != 0;
+    }
     return c;
 }
 
@@ -301,9 +309,11 @@ static void clear_sel(void)
     for (int i = 0; i < nob; i++) {
         if (mode == M_OBJ) ob[i].sel = 0;
         else if (ob[i].hil) {
-            int n;
-            unsigned char *f = comp_flags(&ob[i], &n);
-            memset(f, 0, n);
+            for (int k = M_VERT; k <= M_FACE; k++) {
+                int n;
+                unsigned char *f = comp_flags(&ob[i], k, &n);
+                if (shows(k)) memset(f, 0, n);
+            }
         }
     }
 }
@@ -479,28 +489,17 @@ static void load_view(void)
     glLoadMatrixf(Vm.m);
 }
 
-static void draw_tris(const Obj *o, int shade, int tint, int onlySel)
+/* selected faces only, untextured (wireframe face-mode tint) */
+static void draw_sel_tris(const Mesh *m)
 {
-    const Mesh *m = &o->m;
     glBegin(GL_TRIANGLES);
     for (int f = 0; f < m->nf; f++) {
-        if (onlySel && !m->fs[f]) continue;
+        if (!m->fs[f]) continue;
         int s = m->fo[f], n = m->fo[f + 1] - s;
-        int t = tint && m->fs[f];
-        if (shade) {
-            V3 nn = mesh_fnormal(m, f);
-            glNormal3f(nn.x, nn.y, nn.z);
-        }
         for (int k = 1; k + 1 < n; k++) {
-            int idx[3] = { m->fi[s], m->fi[s + k], m->fi[s + k + 1] };
-            for (int j = 0; j < 3; j++) {
-                if (shade) {
-                    V3 c = m->c[idx[j]];
-                    if (t) c = v3lerp(c, v3(1, 0.45f, 0.1f), 0.65f);
-                    glColor3f(c.x, c.y, c.z);
-                }
-                glVertex3fv(&m->p[idx[j]].x);
-            }
+            glVertex3fv(&m->p[m->fi[s]].x);
+            glVertex3fv(&m->p[m->fi[s + k]].x);
+            glVertex3fv(&m->p[m->fi[s + k + 1]].x);
         }
     }
     glEnd();
@@ -515,6 +514,117 @@ static void draw_edges(const Mesh *m, int selOnly)
         glVertex3fv(&m->p[m->ev[2 * e + 1]].x);
     }
     glEnd();
+}
+
+/* ================================================================ draw cache
+
+   Shaded triangles are expanded once into a vertex array (color, face normal, position per corner)
+   and drawn with one glDrawArrays call. The arrays are rebuilt only when geoGen changes, which
+   happens on every edit or selection change, so tumbling, hovering and idle redraws are cheap. */
+
+typedef struct { const V3 *key; int nv, nf, ntri; unsigned gen; float *v; V3 lo, hi; } DrawCache;
+static DrawCache *dcache;
+static int ndcache;
+static unsigned geoGen = 1;
+
+static void geo_changed(void) { geoGen++; }
+
+static DrawCache *cache_get(int i)
+{
+    if (i >= ndcache) {
+        dcache = realloc(dcache, (i + 1) * sizeof *dcache);
+        memset(dcache + ndcache, 0, (i + 1 - ndcache) * sizeof *dcache);
+        ndcache = i + 1;
+    }
+    DrawCache *c = &dcache[i];
+    const Obj *o = &ob[i];
+    const Mesh *m = &o->m;
+    if (c->gen == geoGen && c->key == m->p && c->nv == m->nv && c->nf == m->nf) return c;
+    int tint = o->hil && shows(M_FACE), nt = 0;
+    for (int f = 0; f < m->nf; f++) nt += m->fo[f + 1] - m->fo[f] - 2;
+    c->v = realloc(c->v, (size_t)(nt > 0 ? nt : 1) * 27 * sizeof(float));
+    float *w = c->v;
+    for (int f = 0; f < m->nf; f++) {
+        int s = m->fo[f], n = m->fo[f + 1] - s;
+        V3 nn = mesh_fnormal(m, f);
+        for (int k = 1; k + 1 < n; k++) {
+            int idx[3] = { m->fi[s], m->fi[s + k], m->fi[s + k + 1] };
+            for (int j = 0; j < 3; j++) {
+                V3 col = m->c[idx[j]], p = m->p[idx[j]];
+                if (tint && m->fs[f]) col = v3lerp(col, v3(1, 0.45f, 0.1f), 0.65f);
+                *w++ = col.x; *w++ = col.y; *w++ = col.z;
+                *w++ = nn.x; *w++ = nn.y; *w++ = nn.z;
+                *w++ = p.x; *w++ = p.y; *w++ = p.z;
+            }
+        }
+    }
+    c->lo = v3(1e30f, 1e30f, 1e30f);
+    c->hi = v3(-1e30f, -1e30f, -1e30f);
+    for (int v = 0; v < m->nv; v++) {
+        V3 p = m->p[v];
+        c->lo = v3(fminf(c->lo.x, p.x), fminf(c->lo.y, p.y), fminf(c->lo.z, p.z));
+        c->hi = v3(fmaxf(c->hi.x, p.x), fmaxf(c->hi.y, p.y), fmaxf(c->hi.z, p.z));
+    }
+    c->ntri = nt;
+    c->key = m->p;
+    c->nv = m->nv;
+    c->nf = m->nf;
+    c->gen = geoGen;
+    return c;
+}
+
+/* shade: colors and normals for lighting; otherwise positions only (depth pass) */
+static void draw_cached(int i, int shade)
+{
+    DrawCache *c = cache_get(i);
+    if (!c->ntri) return;
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(3, GL_FLOAT, 9 * sizeof(float), c->v + 6);
+    if (shade) {
+        glEnableClientState(GL_COLOR_ARRAY);
+        glEnableClientState(GL_NORMAL_ARRAY);
+        glColorPointer(3, GL_FLOAT, 9 * sizeof(float), c->v);
+        glNormalPointer(GL_FLOAT, 9 * sizeof(float), c->v + 3);
+    }
+    glDrawArrays(GL_TRIANGLES, 0, c->ntri * 3);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_NORMAL_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+}
+
+/* all edges straight from the mesh arrays (ev holds vertex index pairs) */
+static void draw_all_edges(const Mesh *m)
+{
+    if (!m->ne) return;
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(3, GL_FLOAT, sizeof(V3), m->p);
+    glDrawElements(GL_LINES, m->ne * 2, GL_UNSIGNED_INT, m->ev);
+    glDisableClientState(GL_VERTEX_ARRAY);
+}
+
+static int ray_box(V3 o, V3 d, V3 lo, V3 hi)
+{
+    float t0 = -1e30f, t1 = 1e30f;
+    for (int a = 0; a < 3; a++) {
+        float oa = (&o.x)[a], da = (&d.x)[a], l = (&lo.x)[a], h = (&hi.x)[a];
+        if (fabsf(da) < 1e-12f) { if (oa < l || oa > h) return 0; continue; }
+        float ta = (l - oa) / da, tb = (h - oa) / da;
+        if (ta > tb) { float t = ta; ta = tb; tb = t; }
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+    }
+    return t0 <= t1 && t1 >= 0;
+}
+
+/* world space ray against object i, skipping the triangles when the ray misses its bounding box */
+static int obj_raycast(int i, V3 o, V3 d, float *t)
+{
+    DrawCache *c = cache_get(i);
+    M4 iM = m4_inv(obj_mat(&ob[i]));
+    V3 lo = m4_pt(iM, o), ld = m4_dir(iM, d);
+    V3 pad = v3mul(v3sub(c->hi, c->lo), 1e-3f);
+    if (!ray_box(lo, ld, v3sub(c->lo, pad), v3add(c->hi, pad))) return -1;
+    return mesh_raycast(&ob[i].m, lo, ld, t);
 }
 
 /* ================================================================ depth readback for occlusion-aware picking */
@@ -544,7 +654,7 @@ static void depth_capture(int x0, int y0, int x1, int y1)
         M4 M = obj_mat(&ob[i]);
         glPushMatrix();
         glMultMatrixf(M.m);
-        draw_tris(&ob[i], 0, 0, 0);
+        draw_cached(i, 0);
         glPopMatrix();
     }
     glDisable(GL_POLYGON_OFFSET_FILL);
@@ -584,12 +694,65 @@ static int pick_object(int mx, int my, float *tout)
     int best = -1;
     float bt = 1e30f;
     for (int i = 0; i < nob; i++) {
-        M4 iM = m4_inv(obj_mat(&ob[i]));
         float t;
-        if (mesh_raycast(&ob[i].m, m4_pt(iM, o), m4_dir(iM, d), &t) >= 0 && t < bt) { bt = t; best = i; }
+        if (obj_raycast(i, o, d, &t) >= 0 && t < bt) { bt = t; best = i; }
     }
     if (tout) *tout = bt;
     return best;
+}
+
+/* Component of a hilited object under the cursor. Multi mode prefers a vertex, then an edge, then the
+   face under the cursor, like Maya's multi-component selection. Returns 0 when nothing is close. */
+static int pick_comp(int mx, int my, int *obj, int *kind, int *idx)
+{
+    int R = (int)(12 * ds), multi = mode == M_MULTI;
+    *obj = -1;
+    if (shows(M_VERT) || shows(M_EDGE)) depth_capture(mx - R - 4, my - R - 4, mx + R + 4, my + R + 4);
+    if (shows(M_VERT)) {
+        float best = multi ? 8 * ds : (float)R;
+        for (int i = 0; i < nob; i++) {
+            if (!ob[i].hil) continue;
+            Mesh *m = &ob[i].m;
+            M4 M = obj_mat(&ob[i]);
+            for (int v = 0; v < m->nv; v++) {
+                float x, y, z;
+                if (!proj(m4_pt(M, m->p[v]), &x, &y, &z)) continue;
+                float dd = hypotf(x - mx, y - my);
+                if (dd < best && visible(x, y, z)) { best = dd; *obj = i; *kind = M_VERT; *idx = v; }
+            }
+        }
+        if (*obj >= 0) return 1;
+    }
+    if (shows(M_EDGE)) {
+        float best = multi ? 6 * ds : (float)R;
+        for (int i = 0; i < nob; i++) {
+            if (!ob[i].hil) continue;
+            Mesh *m = &ob[i].m;
+            M4 M = obj_mat(&ob[i]);
+            for (int e = 0; e < m->ne; e++) {
+                V3 a = m4_pt(M, m->p[m->ev[2 * e]]), b = m4_pt(M, m->p[m->ev[2 * e + 1]]);
+                float ax, ay, bx, by, u, x, y, z;
+                if (!proj(a, &ax, &ay, NULL) || !proj(b, &bx, &by, NULL)) continue;
+                float dd = seg_dist((float)mx, (float)my, ax, ay, bx, by, &u);
+                if (dd >= best) continue;
+                if (!proj(v3lerp(a, b, u), &x, &y, &z) || !visible(x, y, z)) continue;
+                best = dd; *obj = i; *kind = M_EDGE; *idx = e;
+            }
+        }
+        if (*obj >= 0) return 1;
+    }
+    if (shows(M_FACE)) {
+        V3 o, d;
+        mouse_ray((float)mx, (float)my, &o, &d);
+        float bt = 1e30f;
+        for (int i = 0; i < nob; i++) {
+            if (!ob[i].hil) continue;
+            float t;
+            int f = obj_raycast(i, o, d, &t);
+            if (f >= 0 && t < bt) { bt = t; *obj = i; *kind = M_FACE; *idx = f; }
+        }
+    }
+    return *obj >= 0;
 }
 
 static void select_click(int mx, int my, int mod)
@@ -601,50 +764,12 @@ static void select_click(int mx, int my, int mod)
         if (hit >= 0) select_obj_flag(&ob[hit], mod);
         return;
     }
-    int R = (int)(12 * ds);
-    depth_capture(mx - R - 4, my - R - 4, mx + R + 4, my + R + 4);
-    int bo = -1, bi = -1;
-    float best = (float)R;
-    if (mode == M_FACE) {
-        V3 o, d;
-        mouse_ray((float)mx, (float)my, &o, &d);
-        float bt = 1e30f;
-        for (int i = 0; i < nob; i++) {
-            if (!ob[i].hil) continue;
-            M4 iM = m4_inv(obj_mat(&ob[i]));
-            float t;
-            int f = mesh_raycast(&ob[i].m, m4_pt(iM, o), m4_dir(iM, d), &t);
-            if (f >= 0 && t < bt) { bt = t; bo = i; bi = f; }
-        }
-    } else {
-        for (int i = 0; i < nob; i++) {
-            if (!ob[i].hil) continue;
-            Mesh *m = &ob[i].m;
-            M4 M = obj_mat(&ob[i]);
-            if (mode == M_VERT) {
-                for (int v = 0; v < m->nv; v++) {
-                    float x, y, z;
-                    if (!proj(m4_pt(M, m->p[v]), &x, &y, &z)) continue;
-                    float dd = hypotf(x - mx, y - my);
-                    if (dd < best && visible(x, y, z)) { best = dd; bo = i; bi = v; }
-                }
-            } else {
-                for (int e = 0; e < m->ne; e++) {
-                    V3 a = m4_pt(M, m->p[m->ev[2 * e]]), b = m4_pt(M, m->p[m->ev[2 * e + 1]]);
-                    float ax, ay, bx, by, u, x, y, z;
-                    if (!proj(a, &ax, &ay, NULL) || !proj(b, &bx, &by, NULL)) continue;
-                    float dd = seg_dist((float)mx, (float)my, ax, ay, bx, by, &u);
-                    if (dd >= best) continue;
-                    if (!proj(v3lerp(a, b, u), &x, &y, &z) || !visible(x, y, z)) continue;
-                    best = dd; bo = i; bi = e;
-                }
-            }
-        }
-    }
+    int bo, kind, bi;
+    pick_comp(mx, my, &bo, &kind, &bi);
     if (mod == 0) clear_sel();
     if (bo >= 0) {
         int n;
-        unsigned char *f = comp_flags(&ob[bo], &n);
+        unsigned char *f = comp_flags(&ob[bo], kind, &n);
         set_flag(&f[bi], mod);
         return;
     }
@@ -677,15 +802,17 @@ static void select_rect(int x0, int y0, int x1, int y1, int mod)
             continue;
         }
         if (!o->hil) continue;
-        if (mode == M_VERT) {
+        if (shows(M_VERT)) {
             for (int v = 0; v < m->nv; v++)
                 if (proj(m4_pt(M, m->p[v]), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) set_flag(&m->vs[v], mod);
-        } else if (mode == M_EDGE) {
+        }
+        if (shows(M_EDGE)) {
             for (int e = 0; e < m->ne; e++) {
                 V3 c = v3mul(v3add(m->p[m->ev[2 * e]], m->p[m->ev[2 * e + 1]]), 0.5f);
                 if (proj(m4_pt(M, c), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) set_flag(&m->es[e], mod);
             }
-        } else {
+        }
+        if (shows(M_FACE)) {
             for (int f = 0; f < m->nf; f++)
                 if (proj(m4_pt(M, mesh_fcenter(m, f)), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) set_flag(&m->fs[f], mod);
         }
@@ -774,11 +901,28 @@ static void set_tool(int t)
 
 typedef struct { V3 piv, ax[3]; float L; } MG;
 
-static int manip_vis(void) { return (tool == T_MOVE || tool == T_ROTATE || tool == T_SCALE) && has_sel(); }
+/* has_sel() and sel_pivot() walk every selected vertex, and the manipulator needs them on every
+   mouse move and redraw, so keep them until the next edit or selection change (geoGen) */
+static struct { unsigned gen; int any; V3 piv; } selc;
+
+static void sel_cache(void)
+{
+    if (selc.gen == geoGen) return;
+    selc.any = has_sel();
+    selc.piv = selc.any ? sel_pivot() : v3(0, 0, 0);
+    selc.gen = geoGen;
+}
+
+static int manip_vis(void)
+{
+    if (tool != T_MOVE && tool != T_ROTATE && tool != T_SCALE) return 0;
+    sel_cache();
+    return selc.any;
+}
 
 static M4 manip_frame(void)
 {
-    if (normalFrame && mode == M_FACE && tool != T_ROTATE) return nframe;
+    if (normalFrame && shows(M_FACE) && tool != T_ROTATE) return nframe;
     if (tool == T_SCALE && mode == M_OBJ) {
         Obj *l = lead();
         if (l) return m4_euler(l->r);
@@ -798,7 +942,8 @@ static struct {
 static MG mg_get(void)
 {
     MG g;
-    g.piv = dg.on ? dg.cur : sel_pivot();
+    sel_cache();
+    g.piv = dg.on ? dg.cur : selc.piv;
     M4 F = dg.on ? m4_id() : manip_frame();
     for (int i = 0; i < 3; i++) g.ax[i] = dg.on ? dg.ax[i] : v3norm(m4_col(F, i));
     g.L = manipSize * 80 * ds * wpp(g.piv);
@@ -1046,6 +1191,7 @@ static void drag_move(int mx, int my)
         }
     }
     dg.cur = v3add(dg.piv, delta);
+    geo_changed();
 }
 
 static void drag_end(void)
@@ -1163,6 +1309,7 @@ static void paint_dab(int mx, int my)
             m->c[v] = v3lerp(ps.orig[k][v], paintCol, w);
         }
     }
+    geo_changed();
 }
 
 static void paint_begin(int mx, int my)
@@ -1205,7 +1352,7 @@ enum {
     CM_APPLYCOL, CM_SETCOL,
     CM_WIRE, CM_SHADED, CM_FRAMESEL, CM_FRAMEALL, CM_PANEL,
     CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT,
-    CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE,
+    CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE, CM_MMULTI,
     CM_SELALL, CM_SELINV,
     CM_HELP,
     CM_THEME = 200               /* + theme index */
@@ -1234,9 +1381,12 @@ static void cmd_select_all(int invert)
             o->sel = invert ? !o->sel : 1;
             if (o->sel) o->order = ++stamp;
         } else if (o->hil) {
-            int n;
-            unsigned char *f = comp_flags(o, &n);
-            for (int k = 0; k < n; k++) f[k] = invert ? !f[k] : 1;
+            for (int k = M_VERT; k <= M_FACE; k++) {
+                int n;
+                unsigned char *f = comp_flags(o, k, &n);
+                if (shows(k))
+                    for (int j = 0; j < n; j++) f[j] = invert ? !f[j] : 1;
+            }
         }
     }
     normalFrame = 0;
@@ -1244,17 +1394,21 @@ static void cmd_select_all(int invert)
 
 static void cmd_extrude(void)
 {
-    if (mode != M_FACE && mode != M_EDGE) { msg("Extrude: select faces or edges"); return; }
+    if (mode != M_FACE && mode != M_EDGE && mode != M_MULTI) { msg("Extrude: select faces or edges"); return; }
     if (!has_sel()) { msg("Extrude: nothing selected"); return; }
+    /* multi: extrude the faces if any are selected, else the edges */
+    int faces = mode == M_FACE;
+    for (int i = 0; i < nob && mode == M_MULTI; i++)
+        for (int f = 0; ob[i].hil && f < ob[i].m.nf; f++) faces |= ob[i].m.fs[f];
     undo_push();
     V3 n = v3(0, 0, 0);
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
         if (!o->hil) continue;
-        int ok = mode == M_FACE ? mesh_extrude_faces(&o->m) : mesh_extrude_edges(&o->m);
+        int ok = faces ? mesh_extrude_faces(&o->m) : mesh_extrude_edges(&o->m);
         if (!ok) continue;
         o->prim.type = PRIM_NONE;
-        if (mode == M_FACE) {
+        if (faces) {
             M4 iM = m4_inv(obj_mat(o));
             for (int f = 0; f < o->m.nf; f++) {
                 if (!o->m.fs[f]) continue;
@@ -1264,7 +1418,7 @@ static void cmd_extrude(void)
         }
     }
     set_tool(T_MOVE);
-    if (mode == M_FACE && v3len(n) > 1e-6f) {
+    if (faces && v3len(n) > 1e-6f) {
         /* move manipulator follows the extrude direction (Z = average normal) */
         V3 z = v3norm(n), x = v3norm(v3cross(fabsf(z.y) < 0.9f ? v3(0, 1, 0) : v3(1, 0, 0), z)), y = v3cross(z, x);
         nframe = m4_id();
@@ -1306,8 +1460,11 @@ static void cmd_delete(void)
         for (int i = nob - 1; i >= 0; i--)
             if (ob[i].sel) obj_remove(i);
         msg("Deleted");
-    } else if (mode == M_FACE) {
-        if (!has_sel()) return;
+    } else if (shows(M_FACE)) {
+        int any = 0;
+        for (int i = 0; i < nob; i++)
+            for (int f = 0; ob[i].hil && f < ob[i].m.nf; f++) any |= ob[i].m.fs[f];
+        if (!any) { msg("Delete: select objects or faces"); return; }
         undo_push();
         for (int i = 0; i < nob; i++)
             if (ob[i].hil && mesh_delete_faces(&ob[i].m)) ob[i].prim.type = PRIM_NONE;
@@ -1453,6 +1610,7 @@ static const char *HELP_TEXT =
     "  Shift / Ctrl / Ctrl+Shift\tToggle / deselect / add\n"
     "  RMB\tComponent mode menu\n"
     "  F8 / F9 / F10 / F11\tObject / vertex / edge / face\n"
+    "  F7\tMulti: verts, edges and faces at once\n"
     "  Ctrl+Shift+A / Ctrl+Shift+I\tSelect all / invert\n\n"
     "Tools\n"
     "  Q W E R\tSelect / move / rotate / scale\n"
@@ -1533,7 +1691,7 @@ static void do_cmd(int id)
     case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT:
         set_tool(id - CM_TSEL);
         break;
-    case CM_MOBJ: case CM_MVERT: case CM_MEDGE: case CM_MFACE:
+    case CM_MOBJ: case CM_MVERT: case CM_MEDGE: case CM_MFACE: case CM_MMULTI:
         set_mode(id - CM_MOBJ);
         break;
     case CM_HELP: MessageBoxA(hMain, HELP_TEXT, APP_NAME " hotkeys", MB_OK); break;
@@ -1793,6 +1951,7 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     switch (m) {
     case WM_COMMAND: {
         int id = LOWORD(wp), code = HIWORD(wp);
+        if (id >= 1000 && id < 1000 + NROW && (code == EN_SETFOCUS || code == EN_KILLFOCUS)) InvalidateRect(h, NULL, TRUE);
         if (id >= 1000 && id < 1000 + NROW && code == EN_KILLFOCUS) panel_commit_edit(id - 1000);
         else if (id >= 2000 && id < 2000 + NROW && code == BN_CLICKED && !building) {
             int r = id - 2000;
@@ -1834,7 +1993,7 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (c != hSwatch) rc.top -= (int)(2 * ds) - 1;
             InflateRect(&rc, 1, 1);
             FillRect(dc, &rc, brField);
-            FrameRect(dc, &rc, brLine);
+            FrameRect(dc, &rc, GetFocus() == c ? brAcc : brLine);   /* the field being typed in */
         }
         return 1;
     }
@@ -1886,7 +2045,8 @@ typedef struct { const char *label, *hotkey; int cmd; } Tool;
 static const Tool tbItems[] = {
     { "Select", "Q", CM_TSEL }, { "Move", "W", CM_TMOVE }, { "Rotate", "E", CM_TROT }, { "Scale", "R", CM_TSCALE },
     { "Paint", "", CM_TPAINT }, { 0 },
-    { "Object", "F8", CM_MOBJ }, { "Vertex", "F9", CM_MVERT }, { "Edge", "F10", CM_MEDGE }, { "Face", "F11", CM_MFACE }, { 0 },
+    { "Object", "F8", CM_MOBJ }, { "Vertex", "F9", CM_MVERT }, { "Edge", "F10", CM_MEDGE }, { "Face", "F11", CM_MFACE },
+    { "Multi", "F7", CM_MMULTI }, { 0 },
     { "Cube", "", CM_CUBE }, { "Cylinder", "", CM_CYL }, { "Sphere", "", CM_SPHERE }, { "Plane", "", CM_PLANE }, { 0 },
     { "Extrude", "Ctrl+E", CM_EXTRUDE }, { "Merge", "", CM_MERGE }, { "Duplicate", "Ctrl+D", CM_DUP },
     { "Delete", "Del", CM_DELETE }, { 0 },
@@ -1900,7 +2060,7 @@ static int tbHover = -1, tbDown = -1;
 static int tb_on(int cmd)
 {
     if (cmd >= CM_TSEL && cmd <= CM_TPAINT) return tool == cmd - CM_TSEL;
-    if (cmd >= CM_MOBJ && cmd <= CM_MFACE) return mode == cmd - CM_MOBJ;
+    if (cmd >= CM_MOBJ && cmd <= CM_MMULTI) return mode == cmd - CM_MOBJ;
     if (cmd == CM_WIRE || cmd == CM_SHADED) return wire == (cmd == CM_WIRE);
     return 0;
 }
@@ -1946,8 +2106,6 @@ static void tb_paint(HWND h)
     RECT ln = rc;
     ln.top = ln.bottom - 1;
     FillRect(dc, &ln, brLine);
-    COLORREF accent = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
-    HBRUSH brAcc = CreateSolidBrush(accent);
     SetBkMode(dc, TRANSPARENT);
     for (int i = 0; i < NTB; i++) {
         const Tool *t = &tbItems[i];
@@ -1975,7 +2133,6 @@ static void tb_paint(HWND h)
         SetTextColor(dc, mix(th.text, mix(th.text, th.ui)));
         DrawTextA(dc, t->hotkey, -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
-    DeleteObject(brAcc);
     BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, old);
     DeleteObject(bm);
@@ -2025,7 +2182,7 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
 static void status_update(void)
 {
-    static const char *mn[] = { "Object mode", "Vertex mode", "Edge mode", "Face mode" };
+    static const char *mn[] = { "Object mode", "Vertex mode", "Edge mode", "Face mode", "Multi mode" };
     static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint Vertex Color tool" };
     int nsel = 0, ncomp = 0, tv = 0, tf = 0;
     for (int i = 0; i < nob; i++) {
@@ -2046,7 +2203,7 @@ static void status_update(void)
     snprintf(s, sizeof s, "%s%s - " APP_NAME, fn, modified ? "*" : "");
     SetWindowTextA(hMain, s);
     for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_TSEL + i, MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
-    for (int i = 0; i < 4; i++) CheckMenuItem(hMenu, CM_MOBJ + i, MF_BYCOMMAND | (mode == i ? MF_CHECKED : MF_UNCHECKED));
+    for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_MOBJ + i, MF_BYCOMMAND | (mode == i ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_PANEL, MF_BYCOMMAND | (panelOn ? MF_CHECKED : MF_UNCHECKED));
@@ -2056,6 +2213,8 @@ static void status_update(void)
 
 static void refresh_all(void)
 {
+    geo_changed();
+    if (hvObj >= nob) hvObj = -1;
     panel_build();
     status_update();
     redraw();
@@ -2111,6 +2270,81 @@ static int dk, dkBtn, mx0, my0, curx = -1000, cury = -1000, selMod;
 static float rad0;
 enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH };
 
+/* ---- preselection highlight: what a click would pick, drawn in red like Maya */
+
+static const float HOV[3] = { 1, .25f, .25f };
+
+static void draw_hover(const Obj *o)
+{
+    const Mesh *m = &o->m;
+    glColor3fv(HOV);
+    if (hvKind == M_VERT && hvIdx < m->nv) {
+        glPointSize(9 * ds);
+        glBegin(GL_POINTS);
+        glVertex3fv(&m->p[hvIdx].x);
+        glEnd();
+    } else if (hvKind == M_EDGE && hvIdx < m->ne) {
+        glLineWidth(3.5f * ds);
+        glBegin(GL_LINES);
+        glVertex3fv(&m->p[m->ev[2 * hvIdx]].x);
+        glVertex3fv(&m->p[m->ev[2 * hvIdx + 1]].x);
+        glEnd();
+    } else if (hvKind == M_FACE && hvIdx < m->nf) {
+        int s = m->fo[hvIdx], n = m->fo[hvIdx + 1] - s;
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(-1, -1);
+        glColor4f(HOV[0], HOV[1], HOV[2], .35f);
+        glBegin(GL_POLYGON);
+        for (int k = 0; k < n; k++) glVertex3fv(&m->p[m->fi[s + k]].x);
+        glEnd();
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glDisable(GL_BLEND);
+        glColor3fv(HOV);
+        glLineWidth(2 * ds);
+        glBegin(GL_LINE_LOOP);
+        for (int k = 0; k < n; k++) glVertex3fv(&m->p[m->fi[s + k]].x);
+        glEnd();
+    } else if (!hvKind) {
+        glLineWidth(1.5f * ds);
+        draw_all_edges(m);
+    }
+    glLineWidth(1);
+}
+
+/* x < -999: the mouse left the view */
+static void hover_update(int x, int y)
+{
+    int o = -1, k = 0, i = 0;
+    if (x > -1000 && dk == D_NONE && tool != T_PAINT && !(manip_vis() && hover)) {
+        cam_update();
+        if (mode != M_OBJ) pick_comp(x, y, &o, &k, &i);
+        if (o < 0) {
+            /* a whole object: selectable in object mode, or hilitable for component editing */
+            o = pick_object(x, y, NULL);
+            k = i = 0;
+            if (o >= 0 && (mode == M_OBJ ? ob[o].sel : ob[o].hil)) o = -1;
+        }
+    }
+    if (o != hvObj || k != hvKind || i != hvIdx) {
+        hvObj = o;
+        hvKind = k;
+        hvIdx = i;
+        redraw();
+    }
+}
+
+static HCURSOR view_cursor(void)
+{
+    LPCSTR c = IDC_ARROW;
+    if (dk == D_TUMBLE) c = IDC_SIZEALL;
+    else if (dk == D_PAN) c = IDC_HAND;
+    else if (dk == D_DOLLY) c = IDC_SIZENS;
+    else if (dk == D_MARQ || tool == T_PAINT) c = IDC_CROSS;
+    return LoadCursor(NULL, c);
+}
+
 static void render(void)
 {
     cam_update();
@@ -2153,32 +2387,33 @@ static void render(void)
             glEnable(GL_LIGHTING);
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(1, 1);
-            draw_tris(o, 1, hil && mode == M_FACE, 0);
+            draw_cached(i, 1);
             glDisable(GL_POLYGON_OFFSET_FILL);
             glDisable(GL_LIGHTING);
-        } else if (hil && mode == M_FACE) {
+        } else if (hil && shows(M_FACE)) {
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glColor4f(1, 0.45f, 0.1f, 0.35f);
-            draw_tris(o, 0, 0, 1);
+            draw_sel_tris(m);
             glDisable(GL_BLEND);
         }
         glLineWidth(1);
         if (hil) {
             glColor3f(0.35f, 0.75f, 1.0f);
-            draw_edges(m, 0);
-            if (mode == M_EDGE) {
+            draw_all_edges(m);
+            if (shows(M_EDGE)) {
                 glLineWidth(2.5f * ds);
                 glColor3f(1, 0.5f, 0.05f);
                 draw_edges(m, 1);
                 glLineWidth(1);
             }
-            if (mode == M_VERT) {
+            if (shows(M_VERT)) {
                 glPointSize(4 * ds);
                 glColor3f(0.75f, 0.1f, 0.75f);
-                glBegin(GL_POINTS);
-                for (int v = 0; v < m->nv; v++) if (!m->vs[v]) glVertex3fv(&m->p[v].x);
-                glEnd();
+                glEnableClientState(GL_VERTEX_ARRAY);
+                glVertexPointer(3, GL_FLOAT, sizeof(V3), m->p);
+                glDrawArrays(GL_POINTS, 0, m->nv);
+                glDisableClientState(GL_VERTEX_ARRAY);
                 glPointSize(6 * ds);
                 glColor3f(1, 1, 0);
                 glBegin(GL_POINTS);
@@ -2189,11 +2424,12 @@ static void render(void)
             Obj *l = lead();
             if (l == o) glColor3f(0.26f, 1, 0.64f);
             else glColor3fv(th.sel2);
-            draw_edges(m, 0);
+            draw_all_edges(m);
         } else if (wire) {
             glColor3fv(th.wire);
-            draw_edges(m, 0);
+            draw_all_edges(m);
         }
+        if (i == hvObj) draw_hover(o);
         glPopMatrix();
     }
 
@@ -2207,6 +2443,31 @@ static void render(void)
     glLoadIdentity();
     glDisable(GL_DEPTH_TEST);
     if (dk == D_MARQ) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(th.sel2[0], th.sel2[1], th.sel2[2], .12f);
+        glBegin(GL_QUADS);
+        glVertex2f((float)mx0, (float)my0); glVertex2f((float)curx, (float)my0);
+        glVertex2f((float)curx, (float)cury); glVertex2f((float)mx0, (float)cury);
+        glEnd();
+        glDisable(GL_BLEND);
+        if (selMod) {
+            /* modifier glyph by the cursor: + add, - deselect, +/- toggle */
+            float gx = curx + 14 * ds, gy = cury + 14 * ds, g = 4 * ds;
+            glColor3fv(th.sel2);
+            glLineWidth(1.5f * ds);
+            glBegin(GL_LINES);
+            if (selMod == 1) {
+                glVertex2f(gx - g, gy - g); glVertex2f(gx + g, gy - g);
+                glVertex2f(gx, gy - 2 * g); glVertex2f(gx, gy);
+                glVertex2f(gx - g, gy + g); glVertex2f(gx + g, gy + g);
+            } else {
+                glVertex2f(gx - g, gy); glVertex2f(gx + g, gy);
+                if (selMod == 3) { glVertex2f(gx, gy - g); glVertex2f(gx, gy + g); }
+            }
+            glEnd();
+            glLineWidth(1);
+        }
         glColor3fv(th.sel2);
         glEnable(GL_LINE_STIPPLE);
         glLineStipple(1, 0xF0F0);
@@ -2238,6 +2499,7 @@ static void marking_menu(int x, int y)
     AppendMenuA(m, MF_STRING | (mode == M_VERT ? MF_CHECKED : 0), CM_MVERT, "Vertex");
     AppendMenuA(m, MF_STRING | (mode == M_EDGE ? MF_CHECKED : 0), CM_MEDGE, "Edge");
     AppendMenuA(m, MF_STRING | (mode == M_FACE ? MF_CHECKED : 0), CM_MFACE, "Face");
+    AppendMenuA(m, MF_STRING | (mode == M_MULTI ? MF_CHECKED : 0), CM_MMULTI, "Multi");
     AppendMenuA(m, MF_STRING | (mode == M_OBJ ? MF_CHECKED : 0), CM_MOBJ, "Object Mode");
     POINT pt = { x, y };
     ClientToScreen(hView, &pt);
@@ -2269,6 +2531,9 @@ static void end_drag(int cancel)
     if (k == D_PEND || k == D_MARQ) normalFrame = 0;
     if (GetCapture() == hView) ReleaseCapture();
     refresh_all();
+    hvObj = -1;
+    hover_update(curx, cury);
+    SetCursor(view_cursor());
 }
 
 static void handle_key(WPARAM wp)
@@ -2288,6 +2553,7 @@ static void handle_key(WPARAM wp)
     case VK_F9: id = CM_MVERT; break;
     case VK_F10: id = CM_MEDGE; break;
     case VK_F11: id = CM_MFACE; break;
+    case VK_F7: id = CM_MMULTI; break;
     case 'Z': id = shift ? CM_REDO : CM_UNDO; break;
     case 'Y': if (ctrl) id = CM_REDO; break;
     case 'D': if (ctrl) id = CM_DUP; break;
@@ -2368,6 +2634,8 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         }
         dkBtn = btn;
         SetCapture(h);
+        hover_update(-10000, 0);
+        SetCursor(view_cursor());
         redraw();
         return 0;
     }
@@ -2395,7 +2663,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             break;
         }
         case D_PEND:
-            if (abs(x - mx0) > 3 || abs(y - my0) > 3) dk = D_MARQ;
+            if (abs(x - mx0) > 3 || abs(y - my0) > 3) { dk = D_MARQ; SetCursor(view_cursor()); }
             break;
         case D_MANIP: drag_move(x, y); panel_sync(); status_update(); break;
         case D_PAINT: paint_dab(x, y); break;
@@ -2405,10 +2673,15 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             panel_sync();
             break;
         default:
+            if (!tracking) {
+                TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
+                tracking = TrackMouseEvent(&tme);
+            }
             if (manip_vis()) {
                 int hh = manip_hit(x, y);
                 if (hh != hover) { hover = hh; redraw(); }
             }
+            hover_update(x, y);
             if (tool == T_PAINT) redraw();
             return 0;
         }
@@ -2423,6 +2696,15 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_CAPTURECHANGED:
         if (dk != D_NONE) end_drag(1);
         return 0;
+    case WM_MOUSELEAVE:
+        tracking = 0;
+        curx = cury = -1000;
+        hover_update(-10000, 0);
+        if (tool == T_PAINT) redraw();
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) { SetCursor(view_cursor()); return TRUE; }
+        break;
     case WM_MOUSEWHEEL:
         dist *= powf(0.88f, (short)HIWORD(wp) / 120.0f);
         redraw();
@@ -2478,6 +2760,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_MVERT, "&Vertex\tF9");
     AppendMenuA(m, MF_STRING, CM_MEDGE, "&Edge\tF10");
     AppendMenuA(m, MF_STRING, CM_MFACE, "&Face\tF11");
+    AppendMenuA(m, MF_STRING, CM_MMULTI, "&Multi (verts, edges, faces)\tF7");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_SELALL, "Select &All\tCtrl+Shift+A");
     AppendMenuA(m, MF_STRING, CM_SELINV, "&Invert Selection\tCtrl+Shift+I");

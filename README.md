@@ -1,9 +1,10 @@
 # tuff3d
 
 A small, minimalist polygon modeler for Windows with Autodesk Maya's navigation and hotkeys.
-It is one ~150 KB exe with no installer, and it only uses DLLs that ship with Windows
+It is one ~190 KB exe with no installer, and it only uses DLLs that ship with Windows
 (OpenGL 1.1, GDI, common dialogs). It redraws only when something changes, so it sits at
-0% CPU when idle.
+0% CPU when idle. Meshes are drawn from cached vertex arrays that are only rebuilt after an edit, so
+tumbling and hovering stay fast on dense meshes.
 
 **Download:** [`bin/tuff3d.exe`](bin/tuff3d.exe)
 
@@ -12,6 +13,11 @@ It is one ~150 KB exe with no installer, and it only uses DLLs that ship with Wi
 - Toolbar with the tools, selection modes, primitives and common commands, each labeled with its hotkey
 
 - Select objects, vertices, edges, faces (click, marquee, Shift/Ctrl modifiers; marquee only picks what's visible in shaded mode)
+- Multi mode (F7): vertices, edges and faces at once, like Maya's multi-component selection. A click picks a
+  nearby vertex first, then an edge, then the face under the cursor; Extrude works on the faces if any are selected
+- Preselection highlight: whatever a click would pick (object, vertex, edge or face) lights up red under the cursor.
+  The marquee is filled and shows +, - or +/- for add, deselect and toggle; the cursor changes while tumbling,
+  tracking and dollying; the side panel field you're typing in is outlined
 - Move / rotate / scale manipulators: axis handle = 1 axis, square handle = 2 axes, center = all 3.
   Scaling components stops at 0, so dragging a handle in past the pivot flattens them onto one plane
   (e.g. line up 2 vertices on X). The status bar shows the move/rotate/scale amount while dragging.
@@ -39,6 +45,7 @@ It is one ~150 KB exe with no installer, and it only uses DLLs that ship with Wi
 | F / A | Frame selected / frame all |
 | Q W E R | Select / move / rotate / scale tool |
 | F8 / F9 / F10 / F11 | Object / vertex / edge / face mode |
+| F7 | Multi (vertex + edge + face) mode |
 | RMB on object | Component mode menu |
 | Shift / Ctrl / Ctrl+Shift + click | Toggle / deselect / add |
 | Ctrl+Shift+A / Ctrl+Shift+I | Select all / invert selection |
