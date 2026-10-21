@@ -24,6 +24,7 @@ typedef struct {
     int hidden;          /* Ctrl+H; skipped when drawing and picking */
     unsigned order;      /* selection stamp, highest is the lead object */
     Prim prim;           /* construction history, PRIM_NONE once components are edited */
+    float nangle;        /* normal angle: 0 = hard shade, 180 = smooth, between = hard over that angle */
 } Obj;
 
 enum { M_OBJ, M_VERT, M_EDGE, M_FACE, M_MULTI };   /* component modes match COMP_* */
@@ -38,6 +39,7 @@ static Prim defPrim[PRIM_COUNT];
 static int normalFrame;
 static M4 nframe;
 static float manipSize = 1;
+static float defAngle;          /* normal angle for new objects: the last shading picked */
 static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
 static char g_path[MAX_PATH];
@@ -364,6 +366,7 @@ static Obj *obj_new(const char *base)
     Obj *o = &ob[nob];
     memset(o, 0, sizeof *o);
     o->s = v3(1, 1, 1);
+    o->nangle = defAngle;
     unique_name(o->name, base);
     nob++;
     return o;
@@ -643,7 +646,7 @@ static void draw_edges(const Mesh *m, int selOnly)
 
 /* ================================================================ draw cache
 
-   Shaded triangles are expanded once into a vertex array (color, face normal, position per corner)
+   Shaded triangles are expanded once into a vertex array (color, shading normal, position per corner)
    and drawn with one glDrawArrays call. The arrays are rebuilt only when geoGen changes, which
    happens on every edit or selection change, so tumbling, hovering and idle redraws are cheap. */
 
@@ -668,14 +671,15 @@ static DrawCache *cache_get(int i)
     int tint = o->hil && shows(M_FACE), nt = 0;
     for (int f = 0; f < m->nf; f++) nt += m->fo[f + 1] - m->fo[f] - 2;
     c->v = realloc(c->v, (size_t)(nt > 0 ? nt : 1) * 27 * sizeof(float));
+    V3 *cn = malloc((m->fo[m->nf] + 1) * sizeof(V3));
+    mesh_cnormals(m, o->nangle, cn);
     float *w = c->v;
     for (int f = 0; f < m->nf; f++) {
         int s = m->fo[f], n = m->fo[f + 1] - s;
-        V3 nn = mesh_fnormal(m, f);
         for (int k = 1; k + 1 < n; k++) {
-            int idx[3] = { m->fi[s], m->fi[s + k], m->fi[s + k + 1] };
+            int cs[3] = { s, s + k, s + k + 1 };
             for (int j = 0; j < 3; j++) {
-                V3 col = m->c[idx[j]], p = m->p[idx[j]];
+                V3 col = m->c[m->fi[cs[j]]], p = m->p[m->fi[cs[j]]], nn = cn[cs[j]];
                 if (tint && m->fs[f]) col = v3lerp(col, v3(1, 0.45f, 0.1f), 0.65f);
                 *w++ = col.x; *w++ = col.y; *w++ = col.z;
                 *w++ = nn.x; *w++ = nn.y; *w++ = nn.z;
@@ -683,6 +687,7 @@ static DrawCache *cache_get(int i)
             }
         }
     }
+    free(cn);
     c->lo = v3(1e30f, 1e30f, 1e30f);
     c->hi = v3(-1e30f, -1e30f, -1e30f);
     for (int v = 0; v < m->nv; v++) {
@@ -1599,7 +1604,7 @@ enum {
     CM_CUBE, CM_CYL, CM_SPHERE, CM_PLANE,
     CM_EXTRUDE, CM_MERGE,
     CM_APPLYCOL, CM_SETCOL,
-    CM_WIRE, CM_SHADED, CM_FRAMESEL, CM_FRAMEALL, CM_PANEL,
+    CM_WIRE, CM_SHADED, CM_HARD, CM_SMOOTH, CM_AUTOSMOOTH, CM_FRAMESEL, CM_FRAMEALL, CM_PANEL,
     CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT,
     CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE, CM_MMULTI,
     CM_SELALL, CM_SELINV,
@@ -1788,6 +1793,28 @@ static void cmd_dup(void)
     msg("Duplicated");
 }
 
+/* Hard / smooth / auto smooth shading on the selected (or hilited) objects.
+   The choice also becomes the default for new objects. */
+static void cmd_shade(float angle, const char *what)
+{
+    if (angle > 0 && angle < 180) {
+        Obj *l = lead();
+        float a = l ? l->nangle : defAngle;
+        angle = a > 0 && a < 180 ? a : 30;   /* keep a custom angle */
+    }
+    defAngle = angle;
+    int n = 0;
+    for (int i = 0; i < nob; i++) n += active(&ob[i]) && ob[i].nangle != angle;
+    if (n) {
+        undo_push(what);
+        for (int i = 0; i < nob; i++)
+            if (active(&ob[i])) ob[i].nangle = angle;
+    }
+    char b[96];
+    snprintf(b, sizeof b, "%s%s", what, lead() ? "" : " (for new objects)");
+    msg(b);
+}
+
 static void cmd_apply_color(void)
 {
     if (!has_sel()) { msg("Apply Color: select objects or components"); return; }
@@ -1828,16 +1855,18 @@ static int save_scene(const char *path, int selOnly)
     const Mesh **ms = malloc((nob + 1) * sizeof *ms);
     M4 *mats = malloc((nob + 1) * sizeof *mats);
     const char **names = malloc((nob + 1) * sizeof *names);
+    float *angles = malloc((nob + 1) * sizeof *angles);
     int n = 0;
     for (int i = 0; i < nob; i++) {
         if (selOnly && !active(&ob[i])) continue;
         ms[n] = &ob[i].m;
         mats[n] = obj_mat(&ob[i]);
         names[n] = ob[i].name;
+        angles[n] = ob[i].nangle;
         n++;
     }
-    int ok = obj_save(path, n, ms, mats, names);
-    free(ms); free(mats); free(names);
+    int ok = obj_save(path, n, ms, mats, names, angles);
+    free(ms); free(mats); free(names); free(angles);
     return ok ? n : -1;
 }
 
@@ -2631,6 +2660,9 @@ static void do_cmd(int id)
     case CM_SETCOL: cmd_set_color(); break;
     case CM_WIRE: wire = 1; break;
     case CM_SHADED: wire = 0; break;
+    case CM_HARD: cmd_shade(0, "Hard Shade"); break;
+    case CM_SMOOTH: cmd_shade(180, "Smooth Shade"); break;
+    case CM_AUTOSMOOTH: cmd_shade(30, "Auto Smooth"); break;
     case CM_WIRETOG: wire = !wire; break;
     case CM_FRAMESEL: frame(0); break;
     case CM_FRAMEALL: frame(1); break;
@@ -2673,6 +2705,7 @@ enum {
     PF_CW, PF_CH, PF_CD, PF_CSW, PF_CSH, PF_CSD,
     PF_YR, PF_YH, PF_YSIDES, PF_YHSEG, PF_YCAP, PF_YTOP, PF_YBOT,
     PF_SR, PF_SCOLS, PF_SROWS,
+    PF_NANGLE,
     PF_PW, PF_PD, PF_PSW, PF_PSD,
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY
 };
@@ -2700,6 +2733,7 @@ static float *fld_f(int id)
     case PF_YR: return &o->prim.cr;
     case PF_YH: return &o->prim.ch;
     case PF_SR: return &o->prim.sr;
+    case PF_NANGLE: return &o->nangle;
     case PF_PW: return &o->prim.pw;
     case PF_PD: return &o->prim.pd;
     }
@@ -2774,6 +2808,7 @@ static void panel_build(void)
     if (o) {
         add_row(RK_NAME, 0, "Name");
         for (int i = 0; i < 9; i++) add_row(RK_FLOAT, PF_TX + i, trs[i]);
+        add_row(RK_FLOAT, PF_NANGLE, "Normal Angle");
         if (o->prim.type == PRIM_CUBE) {
             add_row(RK_HEAD, 0, "polyCube");
             add_row(RK_FLOAT, PF_CW, "Width");
@@ -2884,6 +2919,12 @@ static void panel_set(int r, double v)
                 if (active(&ob[i]) || i == panelObj) (&ob[i].t.x)[id - PF_TX] = (float)v;
             return;
         }
+        if (id == PF_NANGLE) {
+            defAngle = (float)(v < 0 ? 0 : v > 180 ? 180 : v);
+            for (int i = 0; i < nob; i++)
+                if (active(&ob[i]) || i == panelObj) ob[i].nangle = defAngle;
+            return;
+        }
         *fld_f(id) = (float)v;
     } else {
         *fld_i(id) = (int)v;
@@ -2955,7 +2996,7 @@ static void scrub_move(int x)
 {
     int id = rows[scrub.row].id, dx = x - scrub.x0;
     float mul = key(VK_SHIFT) ? 10 : key(VK_CONTROL) ? 0.1f : 1;
-    double step = id >= PF_RX && id <= PF_RZ ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : 0.01;
+    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : 0.01;
     double v = rows[scrub.row].kind == RK_INT ? scrub.v0 + (int)(dx * mul / 6) : scrub.v0 + dx * step * mul;
     double cur;
     if (rows[scrub.row].kind == RK_FLOAT) v = round(v * 1000) / 1000;
@@ -3322,6 +3363,9 @@ static void status_update(void)
     for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_MOBJ + i, MF_BYCOMMAND | (mode == i ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
+    Obj *l = lead();
+    float a = l ? l->nangle : defAngle;
+    CheckMenuRadioItem(hMenu, CM_HARD, CM_AUTOSMOOTH, a <= 0 ? CM_HARD : a >= 180 ? CM_SMOOTH : CM_AUTOSMOOTH, MF_BYCOMMAND);
     CheckMenuItem(hMenu, CM_PANEL, MF_BYCOMMAND | (panelOn ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_HUD, MF_BYCOMMAND | (hudOn ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SNAPGRID, MF_BYCOMMAND | (snapGrid ? MF_CHECKED : MF_UNCHECKED));
@@ -4168,6 +4212,10 @@ static HMENU build_menu(void)
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_WIRE, "&Wireframe\t4");
     AppendMenuA(m, MF_STRING, CM_SHADED, "&Shaded\t5");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_HARD, "Hard Shade");
+    AppendMenuA(m, MF_STRING, CM_SMOOTH, "Smooth Shade");
+    AppendMenuA(m, MF_STRING, CM_AUTOSMOOTH, "Auto Smooth (Normal Angle)");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_FRAMESEL, "&Frame Selected\tF");
     AppendMenuA(m, MF_STRING, CM_FRAMEALL, "Frame &All\tA");

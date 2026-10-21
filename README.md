@@ -62,7 +62,10 @@ Comfort
   click to keep it, arrow keys to step through, R for a random one. Ctrl+Shift+T steps to the next
   theme. Themes color the viewport, side panel, toolbar, status bar, menu bar and (Windows 10/11)
   the title bar
-- Export OBJ (world space, vertex colors written as `v x y z r g b`) and open/import OBJ
+- Hard Shade, Smooth Shade and Auto Smooth per object (Display menu). Auto Smooth keeps edges
+  sharper than the Normal Angle (default 30°, editable in the side panel) hard and smooths the rest
+- Export OBJ (world space, vertex colors written as `v x y z r g b`, shading written as `vn` normals)
+  and open/import OBJ
 
 ## Controls (Maya defaults)
 

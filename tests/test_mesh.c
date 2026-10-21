@@ -123,14 +123,51 @@ int main(void)
     V3 q = m4_pt(ai, m4_pt(a, v3(0.3f, -0.7f, 2)));
     CHECK(fabsf(q.x - 0.3f) < 1e-4f && fabsf(q.y + 0.7f) < 1e-4f && fabsf(q.z - 2) < 1e-4f);
 
-    /* OBJ round trip with colors */
+    /* shading normals: hard keeps face normals, smooth averages, auto smooth splits at the angle */
+    prim_defaults(&p, PRIM_CUBE);
+    m = mesh_prim(&p);
+    {
+        V3 *cn = malloc(m.fo[m.nf] * sizeof(V3));
+        int hard = 1, soft = 1;
+        float ang[2] = { 30, 0 };
+        for (int a = 0; a < 2; a++) {
+            mesh_cnormals(&m, ang[a], cn);
+            for (int f = 0; f < m.nf; f++)
+                for (int c = m.fo[f]; c < m.fo[f + 1]; c++) hard &= v3dot(cn[c], mesh_fnormal(&m, f)) > 0.9999f;
+        }
+        mesh_cnormals(&m, 180, cn);
+        for (int c = 0; c < m.fo[m.nf]; c++)
+            soft &= fabsf(fabsf(cn[c].x) - 0.57735f) < 1e-3f && fabsf(fabsf(cn[c].y) - 0.57735f) < 1e-3f;
+        CHECK(hard && soft);
+        free(cn);
+    }
+    mesh_free(&m);
+    prim_defaults(&p, PRIM_SPHERE);
+    m = mesh_prim(&p);
+    {
+        V3 *cn = malloc(m.fo[m.nf] * sizeof(V3)), *first = calloc(m.nv, sizeof(V3));
+        mesh_cnormals(&m, 30, cn);
+        int smooth = 1;
+        for (int c = 0; c < m.fo[m.nf]; c++) {
+            V3 *q = &first[m.fi[c]];
+            if (v3dot(*q, *q) == 0) *q = cn[c];
+            else smooth &= v3dot(*q, cn[c]) > 0.9999f;
+            smooth &= v3dot(cn[c], v3norm(m.p[m.fi[c]])) > 0.99f;
+        }
+        CHECK(smooth);
+        free(cn); free(first);
+    }
+    mesh_free(&m);
+
+    /* OBJ round trip with colors and normals */
     prim_defaults(&p, PRIM_CUBE);
     m = mesh_prim(&p);
     m.c[3] = v3(1, 0, 0);
     const Mesh *ms[1] = { &m };
     M4 mats[1] = { m4_trs(v3(5, 0, 0), v3(0, 0, 0), v3(1, 1, -1)) };
     const char *names[1] = { "pCube1" };
-    CHECK(obj_save("test_out.obj", 1, ms, mats, names));
+    float angles[1] = { 30 };
+    CHECK(obj_save("test_out.obj", 1, ms, mats, names, angles));
     Mesh *lm;
     char (*ln)[32];
     int n = obj_load("test_out.obj", &lm, &ln);
@@ -141,6 +178,22 @@ int main(void)
         int red = 0;
         for (int v = 0; v < 8; v++) red += lm[0].c[v].y == 0;
         CHECK(red == 1);
+        mesh_free(&lm[0]);
+        free(lm); free(ln);
+    }
+    {
+        FILE *f = fopen("test_out.obj", "r");
+        char line[256];
+        int vn = 0, fslash = 0;
+        while (f && fgets(line, sizeof line, f)) { vn += !strncmp(line, "vn ", 3); fslash += line[0] == 'f' && strstr(line, "//") != NULL; }
+        if (f) fclose(f);
+        CHECK(vn == 6 && fslash == 6);   /* hard cube: one shared normal per face */
+    }
+    CHECK(obj_save("test_out.obj", 1, ms, mats, names, NULL));
+    n = obj_load("test_out.obj", &lm, &ln);
+    CHECK(n == 1);
+    if (n == 1) {
+        CHECK(lm[0].nv == 8 && lm[0].nf == 6);
         mesh_free(&lm[0]);
         free(lm); free(ln);
     }

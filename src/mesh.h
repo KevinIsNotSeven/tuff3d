@@ -59,6 +59,7 @@ Mesh mesh_copy(const Mesh *m);
 void mesh_edges(Mesh *m);
 V3 mesh_fnormal(const Mesh *m, int f);
 V3 mesh_fcenter(const Mesh *m, int f);
+void mesh_cnormals(const Mesh *m, float angle, V3 *out);   /* out: one per face corner, fo[nf] */
 int mesh_vmask(const Mesh *m, int comp, unsigned char *mask);
 int mesh_extrude_faces(Mesh *m);
 int mesh_extrude_edges(Mesh *m);
@@ -75,7 +76,8 @@ void mesh_flip(Mesh *m);                            /* reverse every face's wind
    touch is NULL). The new faces are the only selected faces afterwards. Returns how many were made. */
 int mesh_fill_holes(Mesh *m, const unsigned char *touch);
 
-int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names);
+/* angles: per mesh normal angle (writes vn + s), or NULL for positions only */
+int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles);
 int obj_load(const char *path, Mesh **ms, char (**names)[32]);
 
 /* build a mesh from plain arrays (face f uses fi[fo[f] .. fo[f+1]-1]); c may be NULL for white */

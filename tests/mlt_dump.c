@@ -19,7 +19,7 @@ int main(int argc, char **argv)
         M4 *mats = malloc((n + 1) * sizeof *mats);
         const char **nm = malloc((n + 1) * sizeof *nm);
         for (int i = 0; i < n; i++) { mp[i] = &ms[i]; mats[i] = m4_id(); nm[i] = names[i]; }
-        if (!obj_save(argv[2], n, mp, mats, nm)) return 1;
+        if (!obj_save(argv[2], n, mp, mats, nm, NULL)) return 1;
     }
     return 0;
 }
