@@ -57,8 +57,11 @@ Comfort
 - The title bar shows the file name with `*` for unexported changes, and New / Open / Exit ask before
   discarding them
 - Remembers the window position, side panel, wireframe, heads-up display, manipulator size and theme
-- Themes under Display > Theme: Classic, Light, Dark, Midnight, Tuff, Forest, Sunset. They color the
-  viewport, side panel, status bar, menu bar and (Windows 10/11) the title bar
+- 48 themes (Classic, 33 dark, 14 light), picked in the theme picker (Ctrl+T or Display > Theme):
+  a tile per theme showing tuff3d in its colors; hover a tile to preview it on the whole window,
+  click to keep it, arrow keys to step through, R for a random one. Ctrl+Shift+T steps to the next
+  theme. Themes color the viewport, side panel, toolbar, status bar, menu bar and (Windows 10/11)
+  the title bar
 - Export OBJ (world space, vertex colors written as `v x y z r g b`) and open/import OBJ
 
 ## Controls (Maya defaults)
@@ -93,6 +96,7 @@ Comfort
 | Ctrl+N / Ctrl+O / Ctrl+S | New / open / export OBJ |
 | Ctrl+Shift+O / Ctrl+Shift+S | Import OBJ into the scene / export as |
 | Ctrl+A | Toggle side panel |
+| Ctrl+T / Ctrl+Shift+T | Theme picker / next theme |
 | F1 | Hotkey list |
 
 Merge to Center and the Paint Vertex Color Tool are in the Mesh and Tools menus, as in Maya,

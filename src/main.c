@@ -70,27 +70,111 @@ static M4 obj_mat(const Obj *o) { return m4_trs(o->t, o->r, o->s); }
 /* ================================================================ themes */
 
 typedef struct {
-    const char *name;
+    const char *name, *group;
     int sys, dark;          /* sys: Windows colors and menu bar; dark: dark title bar and popup menus */
     COLORREF ui, text, head, field, fieldText, line, hot;
     float bgTop[3], bgBot[3], grid[3], gridMajor[3], gridAxis[3], wire[3], sel2[3];
 } Theme;
 
 static Theme themes[] = {
-    { "&Classic", 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    { "Classic", "System", 1, 0, 0, 0, 0, 0, 0, 0, 0,
       { .36f, .36f, .36f }, { .36f, .36f, .36f }, { .44f, .44f, .44f }, { .5f, .5f, .5f }, { .12f, .12f, .12f }, { 0, .02f, .4f }, { 1, 1, 1 } },
-    { "&Light", 0, 0, RGB(243, 243, 243), RGB(30, 30, 30), RGB(0, 90, 180), RGB(255, 255, 255), RGB(20, 20, 20), RGB(200, 200, 200), RGB(214, 224, 238),
+    { "Light", "Light", 0, 0, RGB(243, 243, 243), RGB(30, 30, 30), RGB(0, 90, 180), RGB(255, 255, 255), RGB(20, 20, 20), RGB(200, 200, 200), RGB(214, 224, 238),
       { .80f, .82f, .85f }, { .62f, .64f, .68f }, { .53f, .55f, .59f }, { .45f, .47f, .51f }, { .2f, .2f, .22f }, { 0, .05f, .45f }, { .1f, .1f, .1f } },
-    { "&Dark", 0, 1, RGB(37, 37, 38), RGB(220, 220, 220), RGB(255, 255, 255), RGB(28, 28, 28), RGB(230, 230, 230), RGB(70, 70, 72), RGB(62, 62, 64),
+    { "Dark", "Dark", 0, 1, RGB(37, 37, 38), RGB(220, 220, 220), RGB(255, 255, 255), RGB(28, 28, 28), RGB(230, 230, 230), RGB(70, 70, 72), RGB(62, 62, 64),
       { .27f, .27f, .28f }, { .13f, .13f, .14f }, { .31f, .31f, .32f }, { .38f, .38f, .39f }, { .05f, .05f, .05f }, { .6f, .7f, .9f }, { 1, 1, 1 } },
-    { "&Midnight", 0, 1, RGB(20, 26, 42), RGB(200, 210, 230), RGB(110, 200, 255), RGB(12, 16, 28), RGB(220, 230, 250), RGB(45, 58, 88), RGB(40, 56, 92),
+    { "Midnight", "Dark", 0, 1, RGB(20, 26, 42), RGB(200, 210, 230), RGB(110, 200, 255), RGB(12, 16, 28), RGB(220, 230, 250), RGB(45, 58, 88), RGB(40, 56, 92),
       { .13f, .19f, .31f }, { .04f, .06f, .12f }, { .18f, .25f, .38f }, { .24f, .32f, .48f }, { .02f, .03f, .06f }, { .45f, .75f, 1 }, { 1, 1, 1 } },
-    { "&Tuff", 0, 1, RGB(58, 10, 34), RGB(240, 225, 235), RGB(165, 255, 20), RGB(36, 4, 20), RGB(255, 240, 250), RGB(110, 30, 70), RGB(150, 16, 205),
+    { "Tuff", "Dark", 0, 1, RGB(58, 10, 34), RGB(240, 225, 235), RGB(165, 255, 20), RGB(36, 4, 20), RGB(255, 240, 250), RGB(110, 30, 70), RGB(150, 16, 205),
       { .08f, .36f, .80f }, { .03f, .12f, .32f }, { .15f, .40f, .75f }, { .25f, .52f, .90f }, { .35f, 0, .16f }, { .65f, 1, .08f }, { 1, 1, 1 } },
-    { "&Forest", 0, 1, RGB(28, 38, 31), RGB(214, 228, 210), RGB(140, 210, 120), RGB(18, 26, 21), RGB(225, 238, 220), RGB(54, 74, 60), RGB(50, 78, 58),
+    { "Forest", "Dark", 0, 1, RGB(28, 38, 31), RGB(214, 228, 210), RGB(140, 210, 120), RGB(18, 26, 21), RGB(225, 238, 220), RGB(54, 74, 60), RGB(50, 78, 58),
       { .24f, .31f, .26f }, { .10f, .14f, .11f }, { .28f, .36f, .30f }, { .34f, .44f, .36f }, { .04f, .06f, .04f }, { .75f, .95f, .6f }, { 1, 1, 1 } },
-    { "&Sunset", 0, 1, RGB(43, 29, 34), RGB(240, 222, 210), RGB(255, 154, 60), RGB(30, 20, 24), RGB(250, 235, 225), RGB(85, 55, 60), RGB(110, 58, 52),
+    { "Sunset", "Dark", 0, 1, RGB(43, 29, 34), RGB(240, 222, 210), RGB(255, 154, 60), RGB(30, 20, 24), RGB(250, 235, 225), RGB(85, 55, 60), RGB(110, 58, 52),
       { .42f, .24f, .30f }, { .12f, .07f, .12f }, { .46f, .30f, .34f }, { .54f, .36f, .38f }, { .08f, .03f, .05f }, { 1, .75f, .45f }, { 1, 1, 1 } },
+    /* made from a few key colors each by a palette script (field, line, hover and grid colors are
+       blends of the key colors); new themes go at the end so saved choices keep their number */
+    { "Graphite", "Dark", 0, 1, RGB(43, 45, 48), RGB(212, 214, 217), RGB(124, 196, 255), RGB(31, 32, 35), RGB(212, 214, 217), RGB(80, 82, 85), RGB(66, 87, 106),
+      { 0.353f, 0.373f, 0.4f }, { 0.165f, 0.173f, 0.188f }, { 0.349f, 0.361f, 0.38f }, { 0.435f, 0.447f, 0.463f }, { 0.063f, 0.071f, 0.075f }, { 0.561f, 0.784f, 1.f }, { 1.f, 1.f, 1.f } },
+    { "Charcoal", "Dark", 0, 1, RGB(27, 27, 27), RGB(207, 207, 207), RGB(255, 179, 71), RGB(19, 19, 19), RGB(207, 207, 207), RGB(67, 67, 67), RGB(91, 70, 39),
+      { 0.227f, 0.227f, 0.227f }, { 0.082f, 0.082f, 0.082f }, { 0.259f, 0.259f, 0.259f }, { 0.361f, 0.361f, 0.361f }, { 0.039f, 0.039f, 0.039f }, { 1.f, 0.753f, 0.439f }, { 1.f, 1.f, 1.f } },
+    { "Studio", "Dark", 0, 1, RGB(68, 68, 68), RGB(224, 224, 224), RGB(90, 176, 255), RGB(49, 49, 49), RGB(224, 224, 224), RGB(102, 102, 102), RGB(74, 98, 120),
+      { 0.522f, 0.592f, 0.659f }, { 0.18f, 0.208f, 0.251f }, { 0.431f, 0.471f, 0.522f }, { 0.51f, 0.545f, 0.584f }, { 0.086f, 0.102f, 0.114f }, { 0.071f, 0.227f, 0.541f }, { 1.f, 1.f, 1.f } },
+    { "Deep Space", "Dark", 0, 1, RGB(13, 15, 26), RGB(185, 192, 216), RGB(167, 139, 250), RGB(9, 11, 19), RGB(185, 192, 216), RGB(51, 54, 68), RGB(56, 50, 89),
+      { 0.102f, 0.122f, 0.227f }, { 0.02f, 0.024f, 0.051f }, { 0.176f, 0.18f, 0.243f }, { 0.286f, 0.294f, 0.349f }, { 0.016f, 0.016f, 0.035f }, { 0.706f, 0.612f, 1.f }, { 1.f, 1.f, 1.f } },
+    { "Ocean", "Dark", 0, 1, RGB(15, 42, 54), RGB(205, 232, 240), RGB(63, 208, 212), RGB(11, 30, 39), RGB(205, 232, 240), RGB(57, 84, 95), RGB(28, 88, 98),
+      { 0.114f, 0.373f, 0.471f }, { 0.031f, 0.125f, 0.169f }, { 0.18f, 0.341f, 0.404f }, { 0.294f, 0.431f, 0.486f }, { 0.016f, 0.063f, 0.078f }, { 0.373f, 0.878f, 0.894f }, { 1.f, 1.f, 1.f } },
+    { "Abyss", "Dark", 0, 1, RGB(6, 19, 28), RGB(169, 198, 214), RGB(46, 163, 255), RGB(4, 14, 20), RGB(169, 198, 214), RGB(42, 58, 69), RGB(17, 59, 92),
+      { 0.059f, 0.208f, 0.314f }, { 0.008f, 0.035f, 0.059f }, { 0.149f, 0.227f, 0.286f }, { 0.263f, 0.333f, 0.384f }, { 0.008f, 0.031f, 0.047f }, { 0.298f, 0.706f, 1.f }, { 1.f, 1.f, 1.f } },
+    { "Nordic", "Dark", 0, 1, RGB(46, 52, 64), RGB(216, 222, 233), RGB(136, 192, 208), RGB(33, 37, 46), RGB(216, 222, 233), RGB(83, 89, 101), RGB(71, 91, 104),
+      { 0.298f, 0.337f, 0.416f }, { 0.169f, 0.188f, 0.231f }, { 0.325f, 0.353f, 0.404f }, { 0.42f, 0.439f, 0.486f }, { 0.059f, 0.067f, 0.078f }, { 0.561f, 0.737f, 0.733f }, { 1.f, 1.f, 1.f } },
+    { "Night City", "Dark", 0, 1, RGB(26, 27, 38), RGB(192, 202, 245), RGB(122, 162, 247), RGB(19, 19, 27), RGB(192, 202, 245), RGB(63, 66, 84), RGB(53, 65, 97),
+      { 0.173f, 0.192f, 0.314f }, { 0.086f, 0.086f, 0.118f }, { 0.235f, 0.243f, 0.31f }, { 0.337f, 0.349f, 0.404f }, { 0.031f, 0.035f, 0.055f }, { 0.733f, 0.604f, 0.969f }, { 1.f, 1.f, 1.f } },
+    { "Vampire", "Dark", 0, 1, RGB(40, 42, 54), RGB(248, 248, 242), RGB(255, 121, 198), RGB(29, 30, 39), RGB(248, 248, 242), RGB(86, 87, 95), RGB(100, 64, 94),
+      { 0.267f, 0.278f, 0.353f }, { 0.118f, 0.122f, 0.161f }, { 0.29f, 0.294f, 0.349f }, { 0.384f, 0.392f, 0.435f }, { 0.047f, 0.051f, 0.063f }, { 0.741f, 0.576f, 0.976f }, { 1.f, 1.f, 1.f } },
+    { "Mocha", "Dark", 0, 1, RGB(30, 30, 46), RGB(205, 214, 244), RGB(245, 194, 231), RGB(22, 22, 33), RGB(205, 214, 244), RGB(68, 70, 90), RGB(90, 76, 98),
+      { 0.271f, 0.278f, 0.353f }, { 0.094f, 0.094f, 0.145f }, { 0.278f, 0.286f, 0.341f }, { 0.376f, 0.384f, 0.431f }, { 0.047f, 0.047f, 0.063f }, { 0.537f, 0.706f, 0.98f }, { 1.f, 1.f, 1.f } },
+    { "Neon Moss", "Dark", 0, 1, RGB(39, 40, 34), RGB(248, 248, 242), RGB(166, 226, 46), RGB(28, 29, 24), RGB(248, 248, 242), RGB(85, 86, 80), RGB(75, 92, 37),
+      { 0.286f, 0.282f, 0.243f }, { 0.118f, 0.122f, 0.102f }, { 0.298f, 0.298f, 0.271f }, { 0.396f, 0.396f, 0.373f }, { 0.051f, 0.051f, 0.043f }, { 0.902f, 0.859f, 0.455f }, { 1.f, 1.f, 1.f } },
+    { "Solar Dark", "Dark", 0, 1, RGB(0, 43, 54), RGB(147, 161, 161), RGB(181, 137, 0), RGB(0, 31, 39), RGB(147, 161, 161), RGB(32, 69, 78), RGB(51, 69, 39),
+      { 0.059f, 0.29f, 0.349f }, { 0.f, 0.129f, 0.169f }, { 0.149f, 0.306f, 0.349f }, { 0.263f, 0.4f, 0.435f }, { 0.008f, 0.055f, 0.063f }, { 0.165f, 0.631f, 0.596f }, { 1.f, 1.f, 1.f } },
+    { "Retro Groove", "Dark", 0, 1, RGB(40, 40, 40), RGB(235, 219, 178), RGB(250, 189, 47), RGB(29, 29, 29), RGB(235, 219, 178), RGB(83, 79, 70), RGB(99, 82, 42),
+      { 0.314f, 0.286f, 0.271f }, { 0.114f, 0.125f, 0.129f }, { 0.306f, 0.298f, 0.294f }, { 0.4f, 0.396f, 0.392f }, { 0.055f, 0.051f, 0.051f }, { 0.996f, 0.502f, 0.098f }, { 1.f, 1.f, 1.f } },
+    { "Teal Night", "Dark", 0, 1, RGB(16, 34, 38), RGB(199, 230, 227), RGB(46, 230, 196), RGB(12, 24, 27), RGB(199, 230, 227), RGB(56, 77, 80), RGB(24, 89, 82),
+      { 0.122f, 0.29f, 0.314f }, { 0.043f, 0.102f, 0.114f }, { 0.192f, 0.294f, 0.306f }, { 0.302f, 0.388f, 0.4f }, { 0.02f, 0.047f, 0.055f }, { 0.341f, 0.949f, 0.831f }, { 1.f, 1.f, 1.f } },
+    { "Aurora", "Dark", 0, 1, RGB(14, 26, 36), RGB(209, 240, 234), RGB(92, 242, 166), RGB(10, 19, 26), RGB(209, 240, 234), RGB(57, 73, 80), RGB(36, 86, 72),
+      { 0.114f, 0.353f, 0.353f }, { 0.102f, 0.063f, 0.212f }, { 0.216f, 0.302f, 0.369f }, { 0.322f, 0.396f, 0.455f }, { 0.027f, 0.051f, 0.071f }, { 0.616f, 0.949f, 0.784f }, { 1.f, 1.f, 1.f } },
+    { "Plum", "Dark", 0, 1, RGB(42, 24, 48), RGB(236, 216, 240), RGB(224, 124, 255), RGB(30, 17, 35), RGB(236, 216, 240), RGB(85, 66, 90), RGB(93, 52, 106),
+      { 0.329f, 0.188f, 0.373f }, { 0.102f, 0.059f, 0.122f }, { 0.31f, 0.231f, 0.337f }, { 0.404f, 0.337f, 0.427f }, { 0.055f, 0.031f, 0.063f }, { 0.941f, 0.659f, 1.f }, { 1.f, 1.f, 1.f } },
+    { "Royal", "Dark", 0, 1, RGB(27, 24, 64), RGB(220, 216, 255), RGB(255, 210, 63), RGB(19, 17, 46), RGB(220, 216, 255), RGB(69, 66, 106), RGB(91, 76, 64),
+      { 0.227f, 0.204f, 0.471f }, { 0.071f, 0.059f, 0.169f }, { 0.251f, 0.239f, 0.404f }, { 0.353f, 0.341f, 0.486f }, { 0.039f, 0.031f, 0.078f }, { 1.f, 0.867f, 0.4f }, { 1.f, 1.f, 1.f } },
+    { "Crimson", "Dark", 0, 1, RGB(42, 15, 18), RGB(240, 214, 214), RGB(255, 77, 94), RGB(30, 11, 13), RGB(240, 214, 214), RGB(86, 59, 61), RGB(102, 32, 39),
+      { 0.361f, 0.114f, 0.141f }, { 0.11f, 0.027f, 0.035f }, { 0.325f, 0.18f, 0.196f }, { 0.42f, 0.294f, 0.306f }, { 0.059f, 0.016f, 0.024f }, { 1.f, 0.478f, 0.522f }, { 1.f, 1.f, 1.f } },
+    { "Volcano", "Dark", 0, 1, RGB(31, 18, 16), RGB(242, 221, 210), RGB(255, 106, 0), RGB(22, 13, 12), RGB(242, 221, 210), RGB(77, 63, 59), RGB(94, 43, 12),
+      { 0.353f, 0.165f, 0.102f }, { 0.078f, 0.039f, 0.031f }, { 0.31f, 0.208f, 0.18f }, { 0.404f, 0.318f, 0.29f }, { 0.055f, 0.024f, 0.016f }, { 1.f, 0.627f, 0.251f }, { 1.f, 1.f, 1.f } },
+    { "Ember", "Dark", 0, 1, RGB(34, 26, 20), RGB(240, 224, 204), RGB(255, 159, 67), RGB(24, 19, 14), RGB(240, 224, 204), RGB(79, 70, 60), RGB(96, 63, 33),
+      { 0.29f, 0.208f, 0.149f }, { 0.09f, 0.067f, 0.047f }, { 0.286f, 0.239f, 0.208f }, { 0.384f, 0.345f, 0.314f }, { 0.047f, 0.035f, 0.024f }, { 1.f, 0.753f, 0.471f }, { 1.f, 1.f, 1.f } },
+    { "Coffee", "Dark", 0, 1, RGB(42, 32, 25), RGB(234, 220, 203), RGB(212, 163, 115), RGB(30, 23, 18), RGB(234, 220, 203), RGB(84, 73, 64), RGB(90, 69, 50),
+      { 0.31f, 0.239f, 0.188f }, { 0.114f, 0.086f, 0.067f }, { 0.306f, 0.267f, 0.231f }, { 0.4f, 0.365f, 0.337f }, { 0.055f, 0.039f, 0.031f }, { 0.902f, 0.769f, 0.612f }, { 1.f, 1.f, 1.f } },
+    { "Synthwave", "Dark", 0, 1, RGB(36, 23, 52), RGB(246, 230, 255), RGB(255, 47, 208), RGB(26, 17, 37), RGB(246, 230, 255), RGB(82, 69, 97), RGB(97, 30, 96),
+      { 0.29f, 0.122f, 0.431f }, { 0.102f, 0.043f, 0.18f }, { 0.294f, 0.192f, 0.388f }, { 0.388f, 0.302f, 0.471f }, { 0.047f, 0.02f, 0.078f }, { 0.212f, 0.976f, 0.965f }, { 1.f, 1.f, 1.f } },
+    { "Cyberpunk", "Dark", 0, 1, RGB(13, 13, 13), RGB(242, 242, 242), RGB(252, 238, 10), RGB(9, 9, 9), RGB(242, 242, 242), RGB(63, 63, 63), RGB(80, 76, 12),
+      { 0.165f, 0.165f, 0.165f }, { 0.f, 0.f, 0.f }, { 0.192f, 0.192f, 0.192f }, { 0.302f, 0.302f, 0.302f }, { 0.02f, 0.02f, 0.02f }, { 0.f, 0.941f, 1.f }, { 1.f, 1.f, 1.f } },
+    { "Matrix", "Dark", 0, 1, RGB(4, 10, 4), RGB(140, 255, 140), RGB(0, 255, 65), RGB(3, 7, 3), RGB(140, 255, 140), RGB(34, 64, 34), RGB(3, 79, 21),
+      { 0.051f, 0.165f, 0.051f }, { 0.f, 0.02f, 0.f }, { 0.141f, 0.204f, 0.141f }, { 0.259f, 0.31f, 0.259f }, { 0.008f, 0.024f, 0.008f }, { 0.f, 1.f, 0.255f }, { 1.f, 1.f, 1.f } },
+    { "Amber Terminal", "Dark", 0, 1, RGB(18, 12, 0), RGB(255, 204, 102), RGB(255, 176, 0), RGB(13, 9, 0), RGB(255, 204, 102), RGB(70, 54, 22), RGB(84, 58, 0),
+      { 0.18f, 0.122f, 0.f }, { 0.031f, 0.02f, 0.f }, { 0.212f, 0.18f, 0.122f }, { 0.322f, 0.294f, 0.239f }, { 0.027f, 0.016f, 0.f }, { 1.f, 0.69f, 0.f }, { 1.f, 1.f, 1.f } },
+    { "Blueprint", "Dark", 0, 1, RGB(15, 47, 92), RGB(230, 240, 255), RGB(255, 255, 255), RGB(11, 34, 66), RGB(230, 240, 255), RGB(62, 89, 128), RGB(82, 105, 138),
+      { 0.114f, 0.353f, 0.659f }, { 0.063f, 0.227f, 0.451f }, { 0.286f, 0.447f, 0.655f }, { 0.451f, 0.573f, 0.733f }, { 0.902f, 0.941f, 1.f }, { 0.902f, 0.941f, 1.f }, { 1.f, 1.f, 1.f } },
+    { "Ice Cave", "Dark", 0, 1, RGB(26, 42, 51), RGB(227, 244, 251), RGB(143, 227, 255), RGB(19, 30, 37), RGB(227, 244, 251), RGB(70, 86, 95), RGB(59, 94, 108),
+      { 0.247f, 0.435f, 0.522f }, { 0.086f, 0.188f, 0.231f }, { 0.267f, 0.396f, 0.451f }, { 0.365f, 0.478f, 0.525f }, { 0.039f, 0.078f, 0.094f }, { 0.741f, 0.937f, 1.f }, { 1.f, 1.f, 1.f } },
+    { "High Contrast", "Dark", 0, 1, RGB(0, 0, 0), RGB(255, 255, 255), RGB(255, 255, 0), RGB(0, 0, 0), RGB(255, 255, 255), RGB(56, 56, 56), RGB(71, 71, 0),
+      { 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f }, { 0.235f, 0.235f, 0.235f }, { 0.431f, 0.431f, 0.431f }, { 1.f, 1.f, 1.f }, { 0.f, 1.f, 1.f }, { 1.f, 1.f, 1.f } },
+    { "Paper", "Light", 0, 0, RGB(251, 250, 247), RGB(43, 43, 43), RGB(51, 102, 204), RGB(254, 254, 253), RGB(43, 43, 43), RGB(205, 204, 202), RGB(195, 209, 235),
+      { 0.949f, 0.941f, 0.918f }, { 0.851f, 0.839f, 0.8f }, { 0.792f, 0.784f, 0.757f }, { 0.686f, 0.678f, 0.651f }, { 0.455f, 0.451f, 0.439f }, { 0.122f, 0.231f, 0.502f }, { 0.067f, 0.067f, 0.067f } },
+    { "Sepia", "Light", 0, 0, RGB(241, 231, 208), RGB(67, 52, 34), RGB(160, 82, 45), RGB(251, 248, 241), RGB(67, 52, 34), RGB(203, 192, 170), RGB(218, 189, 162),
+      { 0.902f, 0.839f, 0.698f }, { 0.769f, 0.678f, 0.502f }, { 0.733f, 0.671f, 0.529f }, { 0.635f, 0.576f, 0.455f }, { 0.427f, 0.4f, 0.333f }, { 0.361f, 0.227f, 0.102f }, { 0.165f, 0.102f, 0.039f } },
+    { "Solar Light", "Light", 0, 0, RGB(253, 246, 227), RGB(88, 110, 117), RGB(38, 139, 210), RGB(254, 252, 247), RGB(88, 110, 117), RGB(217, 216, 203), RGB(193, 216, 222),
+      { 0.933f, 0.91f, 0.835f }, { 0.812f, 0.776f, 0.659f }, { 0.765f, 0.741f, 0.655f }, { 0.663f, 0.639f, 0.565f }, { 0.443f, 0.431f, 0.392f }, { 0.027f, 0.212f, 0.259f }, { 0.f, 0.169f, 0.212f } },
+    { "Latte", "Light", 0, 0, RGB(239, 241, 245), RGB(76, 79, 105), RGB(136, 57, 239), RGB(250, 251, 252), RGB(76, 79, 105), RGB(203, 205, 214), RGB(210, 189, 243),
+      { 0.863f, 0.878f, 0.91f }, { 0.737f, 0.753f, 0.8f }, { 0.706f, 0.718f, 0.753f }, { 0.608f, 0.62f, 0.651f }, { 0.416f, 0.42f, 0.435f }, { 0.118f, 0.4f, 0.961f }, { 0.067f, 0.067f, 0.106f } },
+    { "Mint", "Light", 0, 0, RGB(233, 247, 241), RGB(30, 61, 51), RGB(15, 157, 110), RGB(248, 253, 251), RGB(30, 61, 51), RGB(188, 206, 199), RGB(172, 222, 204),
+      { 0.816f, 0.937f, 0.89f }, { 0.624f, 0.831f, 0.753f }, { 0.635f, 0.78f, 0.725f }, { 0.549f, 0.675f, 0.627f }, { 0.384f, 0.447f, 0.424f }, { 0.043f, 0.361f, 0.251f }, { 0.039f, 0.165f, 0.122f } },
+    { "Lavender", "Light", 0, 0, RGB(241, 236, 250), RGB(58, 47, 85), RGB(123, 79, 214), RGB(251, 249, 254), RGB(58, 47, 85), RGB(201, 194, 214), RGB(208, 192, 240),
+      { 0.867f, 0.824f, 0.949f }, { 0.718f, 0.651f, 0.867f }, { 0.698f, 0.647f, 0.8f }, { 0.604f, 0.561f, 0.69f }, { 0.412f, 0.388f, 0.459f }, { 0.239f, 0.165f, 0.502f }, { 0.102f, 0.063f, 0.2f } },
+    { "Rose", "Light", 0, 0, RGB(251, 236, 239), RGB(77, 38, 48), RGB(214, 51, 108), RGB(254, 249, 250), RGB(77, 38, 48), RGB(213, 192, 197), RGB(241, 184, 202),
+      { 0.961f, 0.827f, 0.863f }, { 0.867f, 0.639f, 0.702f }, { 0.804f, 0.647f, 0.69f }, { 0.694f, 0.557f, 0.596f }, { 0.459f, 0.388f, 0.408f }, { 0.478f, 0.122f, 0.239f }, { 0.165f, 0.039f, 0.078f } },
+    { "Bubblegum", "Light", 0, 0, RGB(255, 230, 244), RGB(74, 26, 58), RGB(255, 62, 165), RGB(255, 248, 252), RGB(74, 26, 58), RGB(215, 185, 203), RGB(255, 183, 222),
+      { 1.f, 0.816f, 0.925f }, { 1.f, 0.624f, 0.824f }, { 0.878f, 0.635f, 0.769f }, { 0.761f, 0.549f, 0.663f }, { 0.494f, 0.384f, 0.443f }, { 0.541f, 0.039f, 0.353f }, { 0.2f, 0.f, 0.122f } },
+    { "Sky", "Light", 0, 0, RGB(234, 244, 252), RGB(29, 53, 80), RGB(30, 136, 229), RGB(249, 252, 254), RGB(29, 53, 80), RGB(189, 202, 214), RGB(177, 214, 246),
+      { 0.812f, 0.902f, 0.98f }, { 0.565f, 0.761f, 0.933f }, { 0.608f, 0.733f, 0.843f }, { 0.525f, 0.631f, 0.725f }, { 0.369f, 0.427f, 0.478f }, { 0.051f, 0.239f, 0.451f }, { 0.02f, 0.094f, 0.18f } },
+    { "Arctic", "Light", 0, 0, RGB(244, 248, 250), RGB(38, 50, 56), RGB(0, 172, 193), RGB(252, 253, 254), RGB(38, 50, 56), RGB(199, 204, 207), RGB(176, 227, 234),
+      { 0.89f, 0.929f, 0.949f }, { 0.714f, 0.792f, 0.831f }, { 0.706f, 0.761f, 0.784f }, { 0.608f, 0.655f, 0.678f }, { 0.416f, 0.439f, 0.451f }, { 0.f, 0.412f, 0.471f }, { 0.063f, 0.125f, 0.153f } },
+    { "Sand", "Light", 0, 0, RGB(245, 236, 220), RGB(74, 59, 37), RGB(201, 123, 26), RGB(252, 249, 244), RGB(74, 59, 37), RGB(207, 197, 180), RGB(233, 204, 166),
+      { 0.918f, 0.859f, 0.749f }, { 0.812f, 0.725f, 0.561f }, { 0.761f, 0.698f, 0.576f }, { 0.655f, 0.604f, 0.498f }, { 0.439f, 0.412f, 0.357f }, { 0.42f, 0.271f, 0.063f }, { 0.169f, 0.102f, 0.02f } },
+    { "Lemonade", "Light", 0, 0, RGB(255, 251, 224), RGB(61, 58, 18), RGB(230, 168, 0), RGB(255, 254, 246), RGB(61, 58, 18), RGB(212, 209, 179), RGB(248, 228, 161),
+      { 1.f, 0.953f, 0.659f }, { 0.949f, 0.847f, 0.376f }, { 0.855f, 0.792f, 0.455f }, { 0.737f, 0.686f, 0.392f }, { 0.482f, 0.455f, 0.302f }, { 0.42f, 0.325f, 0.f }, { 0.165f, 0.133f, 0.f } },
+    { "Retro 95", "Light", 0, 0, RGB(192, 192, 192), RGB(0, 0, 0), RGB(0, 0, 128), RGB(236, 236, 236), RGB(0, 0, 0), RGB(150, 150, 150), RGB(138, 138, 174),
+      { 0.f, 0.502f, 0.502f }, { 0.f, 0.376f, 0.376f }, { 0.122f, 0.506f, 0.506f }, { 0.239f, 0.573f, 0.573f }, { 0.f, 0.11f, 0.11f }, { 0.f, 0.f, 0.502f }, { 1.f, 1.f, 1.f } },
 };
 #define NTHEME ((int)(sizeof themes / sizeof *themes))
 static Theme th;            /* active theme, with the Classic colors filled in from Windows */
@@ -102,18 +186,25 @@ static COLORREF mix(COLORREF a, COLORREF b)
     return RGB((GetRValue(a) + GetRValue(b)) / 2, (GetGValue(a) + GetGValue(b)) / 2, (GetBValue(a) + GetBValue(b)) / 2);
 }
 
+/* a theme with the Classic colors filled in from Windows */
+static Theme theme_get(int i)
+{
+    Theme t = themes[i < 0 || i >= NTHEME ? 0 : i];
+    if (t.sys) {
+        t.ui = GetSysColor(COLOR_BTNFACE);
+        t.text = t.head = GetSysColor(COLOR_BTNTEXT);
+        t.field = GetSysColor(COLOR_WINDOW);
+        t.fieldText = GetSysColor(COLOR_WINDOWTEXT);
+        t.line = GetSysColor(COLOR_BTNSHADOW);
+        t.hot = GetSysColor(COLOR_BTNHIGHLIGHT);
+    }
+    return t;
+}
+
 static void theme_load(int i)
 {
     themeIdx = i < 0 || i >= NTHEME ? 0 : i;
-    th = themes[themeIdx];
-    if (th.sys) {
-        th.ui = GetSysColor(COLOR_BTNFACE);
-        th.text = th.head = GetSysColor(COLOR_BTNTEXT);
-        th.field = GetSysColor(COLOR_WINDOW);
-        th.fieldText = GetSysColor(COLOR_WINDOWTEXT);
-        th.line = GetSysColor(COLOR_BTNSHADOW);
-        th.hot = GetSysColor(COLOR_BTNHIGHLIGHT);
-    }
+    th = theme_get(themeIdx);
     HBRUSH *b[5] = { &brUi, &brField, &brLine, &brHot, &brAcc };
     COLORREF c[5] = { th.ui, th.field, th.line, th.hot, th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head };
     for (int k = 0; k < 5; k++) {
@@ -1515,7 +1606,7 @@ enum {
     CM_OPEN, CM_GROW, CM_SHRINK, CM_LOOP, CM_TOVERT, CM_TOEDGE, CM_TOFACE,
     CM_HIDE, CM_SHOWALL, CM_FREEZE, CM_CENTERPIV, CM_RESETXF, CM_FILLHOLE,
     CM_VFRONT, CM_VSIDE, CM_VTOP, CM_VHOME, CM_HUD, CM_SNAPGRID, CM_SNAPPOINT, CM_WIRETOG,
-    CM_HELP,
+    CM_HELP, CM_THEMEPICK, CM_THEMENEXT, CM_THEMEPREV, CM_THEMERAND,
     CM_RECENT = 300,             /* + recent file index */
     CM_THEME = 200               /* + theme index */
 };
@@ -2102,6 +2193,324 @@ static void cmd_set_color(void)
     paintCol = v3(GetRValue(cc.rgbResult) / 255.0f, GetGValue(cc.rgbResult) / 255.0f, GetBValue(cc.rgbResult) / 255.0f);
 }
 
+/* ================================================================ theme picker */
+
+/* switch the whole window to theme i (save: remember it for next time) */
+static void theme_apply(int i, int save)
+{
+    if (i == themeIdx && !save) return;
+    theme_load(i);
+    if (save) reg_set_int("Theme", themeIdx);
+    theme_window(hMain);
+    DrawMenuBar(hMain);
+    RedrawWindow(hMain, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+}
+
+/* A window of theme tiles, each a little picture of tuff3d in that theme. Hovering a tile
+   previews it on the main window, clicking keeps it; leaving the tiles goes back to the kept one. */
+static HWND hPick;
+static int pkKept, pkHover = -1, pkScroll, pkCols, pkTileW, pkTileH, pkGap, pkTop, pkContent;
+static int pkTileX[64], pkTileY[64], pkHeadY[8];
+static const char *pkGroups[] = { "System", "Dark", "Light" };
+
+static void pk_layout(int w)
+{
+    pkGap = (int)(10 * ds);
+    pkTileW = (int)(150 * ds);
+    pkTileH = (int)(118 * ds);
+    pkCols = (w - pkGap) / (pkTileW + pkGap);
+    if (pkCols < 1) pkCols = 1;
+    int y = pkTop = (int)(46 * ds);
+    for (int g = 0; g < 3; g++) {
+        pkHeadY[g] = y;
+        y += (int)(22 * ds);
+        int col = 0;
+        for (int i = 0; i < NTHEME; i++) {
+            if (strcmp(themes[i].group, pkGroups[g])) continue;
+            if (col == pkCols) { col = 0; y += pkTileH + pkGap; }
+            pkTileX[i] = pkGap + col * (pkTileW + pkGap);
+            pkTileY[i] = y;
+            col++;
+        }
+        y += pkTileH + pkGap + (int)(6 * ds);
+    }
+    pkContent = y;
+}
+
+static int pk_hit(int x, int y)
+{
+    y += pkScroll;
+    for (int i = 0; i < NTHEME; i++)
+        if (x >= pkTileX[i] && x < pkTileX[i] + pkTileW && y >= pkTileY[i] && y < pkTileY[i] + pkTileH) return i;
+    return -1;
+}
+
+static void fill(HDC dc, int x, int y, int w, int h, COLORREF c)
+{
+    RECT r = { x, y, x + w, y + h };
+    HBRUSH b = CreateSolidBrush(c);
+    FillRect(dc, &r, b);
+    DeleteObject(b);
+}
+
+static COLORREF f2c(const float *c) { return RGB((int)(c[0] * 255 + .5f), (int)(c[1] * 255 + .5f), (int)(c[2] * 255 + .5f)); }
+
+static COLORREF lerpc(COLORREF a, COLORREF b, float t)
+{
+    return RGB((int)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t), (int)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t),
+               (int)(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t));
+}
+
+static void line(HDC dc, int x0, int y0, int x1, int y1, COLORREF c, int w)
+{
+    HPEN p = CreatePen(PS_SOLID, w, c), old = SelectObject(dc, p);
+    MoveToEx(dc, x0, y0, NULL);
+    LineTo(dc, x1, y1);
+    SelectObject(dc, old);
+    DeleteObject(p);
+}
+
+/* tuff3d in miniature: menu bar, toolbar, viewport with grid and a cube, side panel, status bar */
+static void pk_tile(HDC dc, int i, int x, int y, int w, int h, int hot, int kept)
+{
+    Theme t = theme_get(i);
+    int u = (int)ds > 0 ? (int)ds : 1, nameH = (int)(20 * ds), mh = h - nameH;
+    fill(dc, x, y, w, h, t.ui);
+    /* menu bar text and toolbar buttons */
+    for (int k = 0; k < 4; k++) fill(dc, x + 5 * u + k * 17 * u, y + 4 * u, 12 * u, 3 * u, lerpc(t.text, t.ui, .35f));
+    for (int k = 0; k < 7; k++) fill(dc, x + 5 * u + k * 12 * u, y + 11 * u, 9 * u, 9 * u, k == 1 ? t.hot : t.line);
+    fill(dc, x + 5 * u + 12 * u + 2 * u, y + 13 * u, 5 * u, 5 * u, t.head);
+    int vx = x + 4 * u, vy = y + 24 * u, pw = 34 * u, vw2 = w - 8 * u - pw - 3 * u, vh2 = mh - 24 * u - 9 * u;
+    /* viewport: gradient, grid, axis lines and a wireframe cube with one selected edge */
+    COLORREF top = f2c(t.bgTop), bot = f2c(t.bgBot);
+    for (int r = 0; r < vh2; r++) fill(dc, vx, vy + r, vw2, 1, lerpc(top, bot, vh2 > 1 ? (float)r / (vh2 - 1) : 0));
+    int hy = vy + vh2 * 55 / 100, cx = vx + vw2 / 2;
+    HRGN clip = CreateRectRgn(vx, vy, vx + vw2, vy + vh2);
+    SelectClipRgn(dc, clip);
+    for (int k = -6; k <= 6; k++) {
+        COLORREF gc = k == 0 ? f2c(t.gridAxis) : k % 3 == 0 ? f2c(t.gridMajor) : f2c(t.grid);
+        line(dc, cx + k * 6 * u, hy, cx + k * 14 * u, vy + vh2, gc, 1);
+    }
+    for (int k = 0; k < 5; k++) {
+        int yy = hy + (vy + vh2 - hy) * k * k / 16;
+        line(dc, vx, yy, vx + vw2, yy, k == 2 ? f2c(t.gridAxis) : f2c(t.grid), 1);
+    }
+    int s = vh2 / 4, ox = cx - s / 2, oy = hy - s / 2, dx = s / 2, dy = s / 3;
+    POINT f[4] = { { ox, oy }, { ox + s, oy }, { ox + s, oy + s }, { ox, oy + s } };
+    POINT b[4] = { { ox + dx, oy - dy }, { ox + s + dx, oy - dy }, { ox + s + dx, oy + s - dy }, { ox + dx, oy + s - dy } };
+    COLORREF wc = f2c(t.wire);
+    for (int k = 0; k < 4; k++) {
+        line(dc, f[k].x, f[k].y, f[(k + 1) % 4].x, f[(k + 1) % 4].y, wc, u);
+        line(dc, b[k].x, b[k].y, b[(k + 1) % 4].x, b[(k + 1) % 4].y, wc, u);
+        line(dc, f[k].x, f[k].y, b[k].x, b[k].y, wc, u);
+    }
+    line(dc, f[0].x, f[0].y, f[1].x, f[1].y, RGB(255, 140, 0), 2 * u);   /* a selected edge */
+    SelectClipRgn(dc, NULL);
+    DeleteObject(clip);
+    /* side panel: heading, two fields, a highlighted row */
+    int px = vx + vw2 + 3 * u;
+    fill(dc, px, vy, pw, vh2, t.ui);
+    fill(dc, px + 3 * u, vy + 3 * u, pw - 10 * u, 3 * u, t.head);
+    for (int k = 0; k < 4; k++) {
+        fill(dc, px + 3 * u, vy + 10 * u + k * 9 * u, 10 * u, 3 * u, lerpc(t.text, t.ui, .4f));
+        fill(dc, px + 15 * u, vy + 9 * u + k * 9 * u, pw - 18 * u, 6 * u, k == 1 ? t.hot : t.field);
+    }
+    fill(dc, x + 4 * u, y + mh - 7 * u, w / 3, 3 * u, lerpc(t.text, t.ui, .4f));   /* status bar */
+    /* name strip */
+    fill(dc, x, y + mh, w, nameH, kept ? t.head : t.ui);
+    RECT nr = { x + 6 * u, y + mh, x + w - 4 * u, y + h };
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, kept ? t.ui : t.text);
+    SelectObject(dc, kept ? hBold : hFont);
+    DrawTextA(dc, t.name, -1, &nr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    /* frame: the kept theme thick in its accent, the hovered one in ours */
+    HBRUSH fb = CreateSolidBrush(kept ? t.head : hot ? th.head : t.line);
+    int fw = kept || hot ? 3 * u : u;
+    for (int k = 0; k < fw; k++) {
+        RECT fr = { x - k, y - k, x + w + k, y + h + k };
+        FrameRect(dc, &fr, fb);
+    }
+    DeleteObject(fb);
+}
+
+static void pk_paint(HWND h)
+{
+    PAINTSTRUCT ps;
+    HDC wdc = BeginPaint(h, &ps);
+    RECT rc;
+    GetClientRect(h, &rc);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bm = CreateCompatibleBitmap(wdc, rc.right, rc.bottom), oldbm = SelectObject(dc, bm);
+    FillRect(dc, &rc, brUi);
+    SetBkMode(dc, TRANSPARENT);
+    for (int g = 0; g < 3; g++) {
+        RECT hr = { pkGap, pkHeadY[g] - pkScroll, rc.right, pkHeadY[g] - pkScroll + (int)(20 * ds) };
+        SelectObject(dc, hBold);
+        SetTextColor(dc, th.head);
+        char buf[64];
+        int n = 0;
+        for (int i = 0; i < NTHEME; i++) n += !strcmp(themes[i].group, pkGroups[g]);
+        snprintf(buf, sizeof buf, g ? "%s (%d)" : "%s", pkGroups[g], n);
+        DrawTextA(dc, buf, -1, &hr, DT_SINGLELINE | DT_BOTTOM | DT_LEFT);
+    }
+    for (int i = 0; i < NTHEME; i++) {
+        int y = pkTileY[i] - pkScroll;
+        if (y + pkTileH < 0 || y > rc.bottom) continue;
+        pk_tile(dc, i, pkTileX[i], y, pkTileW, pkTileH, i == pkHover, i == pkKept);
+    }
+    /* header over the tiles: what to do, and the theme shown right now */
+    RECT top = { 0, 0, rc.right, pkTop - (int)(6 * ds) };
+    FillRect(dc, &top, brUi);
+    RECT tr = { pkGap, 0, rc.right - pkGap, top.bottom };
+    char hint[160];
+    snprintf(hint, sizeof hint, "%s%s  -  hover to preview, click to keep  (arrows move, R random, Enter/Esc close)",
+             themes[pkHover >= 0 ? pkHover : pkKept].name, pkHover >= 0 && pkHover != pkKept ? " (preview)" : "");
+    SelectObject(dc, hFont);
+    SetTextColor(dc, th.text);
+    DrawTextA(dc, hint, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+    BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldbm);
+    DeleteObject(bm);
+    DeleteDC(dc);
+    EndPaint(h, &ps);
+}
+
+static void pk_scroll_to(HWND h, int i)
+{
+    RECT rc;
+    GetClientRect(h, &rc);
+    if (pkTileY[i] - pkScroll < pkTop) pkScroll = pkTileY[i] - pkTop - (int)(24 * ds);
+    if (pkTileY[i] + pkTileH - pkScroll > rc.bottom) pkScroll = pkTileY[i] + pkTileH + pkGap - rc.bottom;
+    int maxs = pkContent - rc.bottom;
+    if (pkScroll > maxs) pkScroll = maxs;
+    if (pkScroll < 0) pkScroll = 0;
+}
+
+static void pk_keep(HWND h, int i)
+{
+    pkKept = i;
+    theme_apply(i, 1);
+    pk_scroll_to(h, i);
+    InvalidateRect(h, NULL, FALSE);
+}
+
+static LRESULT CALLBACK PickProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    switch (m) {
+    case WM_SIZE:
+        pk_layout(LOWORD(lp));
+        pk_scroll_to(h, pkKept);
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        pk_paint(h);
+        return 0;
+    case WM_MOUSEMOVE: {
+        int i = pk_hit((short)LOWORD(lp), (short)HIWORD(lp));
+        if ((short)HIWORD(lp) < pkTop) i = -1;
+        if (i != pkHover) {
+            pkHover = i;
+            theme_apply(i >= 0 ? i : pkKept, 0);
+            InvalidateRect(h, NULL, FALSE);
+        }
+        TRACKMOUSEEVENT te = { sizeof te, TME_LEAVE, h, 0 };
+        TrackMouseEvent(&te);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        pkHover = -1;
+        theme_apply(pkKept, 0);
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        int i = pk_hit((short)LOWORD(lp), (short)HIWORD(lp));
+        if (i >= 0 && (short)HIWORD(lp) >= pkTop) pk_keep(h, i);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK:
+        if (pk_hit((short)LOWORD(lp), (short)HIWORD(lp)) >= 0) DestroyWindow(h);
+        return 0;
+    case WM_MOUSEWHEEL: {
+        RECT rc;
+        GetClientRect(h, &rc);
+        pkScroll -= (short)HIWORD(wp) * (pkTileH + pkGap) / WHEEL_DELTA;
+        int maxs = pkContent - rc.bottom;
+        if (pkScroll > maxs) pkScroll = maxs;
+        if (pkScroll < 0) pkScroll = 0;
+        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        ScreenToClient(h, &pt);
+        int i = pk_hit(pt.x, pt.y);
+        if (i != pkHover && pt.y >= pkTop) { pkHover = i; theme_apply(i >= 0 ? i : pkKept, 0); }
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        /* arrows walk the tiles in screen order, R picks one at random */
+        int i = pkKept, best = -1;
+        long bd = 0x7fffffff;
+        if (wp == VK_ESCAPE || wp == VK_RETURN) { DestroyWindow(h); return 0; }
+        if (wp == 'R') { int r; do r = rand() % NTHEME; while (r == pkKept && NTHEME > 1); pk_keep(h, r); return 0; }
+        int dx = wp == VK_LEFT ? -1 : wp == VK_RIGHT ? 1 : 0, dy = wp == VK_UP ? -1 : wp == VK_DOWN ? 1 : 0;
+        if (wp == VK_HOME) { pk_keep(h, 0); return 0; }
+        if (!dx && !dy) return 0;
+        for (int k = 0; k < NTHEME; k++) {
+            int ex = pkTileX[k] - pkTileX[i], ey = pkTileY[k] - pkTileY[i];
+            if (k == i || (dx && (ex * dx <= 0 || ey)) || (dy && ey * dy <= 0)) continue;
+            long d = dy ? (long)abs(ey) * 4 + abs(ex) : abs(ex);
+            if (d < bd) { bd = d; best = k; }
+        }
+        if (best < 0 && dx) best = (i + dx + NTHEME) % NTHEME;   /* wrap at a row end */
+        if (best >= 0) pk_keep(h, best);
+        return 0;
+    }
+    case WM_DESTROY:
+        theme_apply(pkKept, 0);
+        hPick = NULL;
+        SetFocus(hView);
+        return 0;
+    }
+    return DefWindowProc(h, m, wp, lp);
+}
+
+static void theme_picker(void)
+{
+    if (hPick) { SetForegroundWindow(hPick); return; }
+    static int reg;
+    if (!reg) {
+        WNDCLASSEXA wc;
+        memset(&wc, 0, sizeof wc);
+        wc.cbSize = sizeof wc;
+        wc.style = CS_DBLCLKS;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_HAND);
+        wc.lpfnWndProc = PickProc;
+        wc.lpszClassName = "Tuff3DThemes";
+        RegisterClassExA(&wc);
+        reg = 1;
+    }
+    pkKept = themeIdx;
+    pkHover = -1;
+    pkScroll = 0;
+    /* five tiles across, as tall as fits on the screen */
+    RECT wa, mr;
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    GetWindowRect(hMain, &mr);
+    int cw = 5 * (int)(160 * ds) + (int)(10 * ds);
+    pk_layout(cw);
+    int chh = pkContent, maxh = (wa.bottom - wa.top) * 85 / 100;
+    RECT r = { 0, 0, cw, chh < maxh ? chh : maxh };
+    AdjustWindowRect(&r, WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, FALSE);
+    int w = r.right - r.left, hh = r.bottom - r.top;
+    int x = (mr.left + mr.right - w) / 2, y = (mr.top + mr.bottom - hh) / 2;
+    if (y < wa.top) y = wa.top;
+    hPick = CreateWindowExA(WS_EX_TOOLWINDOW, "Tuff3DThemes", "Themes", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                            x, y, w, hh, hMain, NULL, GetModuleHandle(NULL), NULL);
+    theme_window(hPick);
+    SetFocus(hPick);
+}
+
 static const char *HELP_TEXT =
     "Navigation (Maya)\n"
     "  Alt + LMB / MMB / RMB drag\tOrbit / pan / zoom\n"
@@ -2137,7 +2546,8 @@ static const char *HELP_TEXT =
     "  4 / 5\tWireframe / shaded\n"
     "  Ctrl+N / Ctrl+O / Ctrl+S\tNew / open / export OBJ\n"
     "  Ctrl+Shift+O\tImport OBJ into the scene\n"
-    "  Ctrl+A\tToggle side panel\n\n"
+    "  Ctrl+A\tToggle side panel\n"
+    "  Ctrl+T\tTheme picker (hover to preview, click to keep)\n\n"
     "Side panel: drag a label left/right to scrub its value (Shift fast, Ctrl fine).\n"
     "Drop .obj or Maya LT .mlt files on the window to open them (Shift adds them).";
 
@@ -2145,11 +2555,8 @@ static void do_cmd(int id)
 {
     g_msg[0] = 0;
     if (id >= CM_THEME && id < CM_THEME + NTHEME) {
-        theme_load(id - CM_THEME);
-        reg_set_int("Theme", themeIdx);
-        theme_window(hMain);
-        DrawMenuBar(hMain);
-        RedrawWindow(hMain, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+        theme_apply(id - CM_THEME, 1);
+        if (hPick) { pkKept = themeIdx; InvalidateRect(hPick, NULL, FALSE); }
     }
     if (id >= CM_RECENT && id < CM_RECENT + NRECENT && recent[id - CM_RECENT][0]) {
         char p[MAX_PATH];
@@ -2241,6 +2648,17 @@ static void do_cmd(int id)
         set_mode(id - CM_MOBJ);
         break;
     case CM_HELP: MessageBoxA(hMain, HELP_TEXT, APP_NAME " hotkeys", MB_OK); break;
+    case CM_THEMEPICK: theme_picker(); break;
+    case CM_THEMENEXT: case CM_THEMEPREV: case CM_THEMERAND: {
+        int i = themeIdx + (id == CM_THEMENEXT ? 1 : NTHEME - 1);
+        if (id == CM_THEMERAND) do i = rand() % NTHEME; while (i == themeIdx && NTHEME > 1);
+        theme_apply(i % NTHEME, 1);
+        if (hPick) { pkKept = themeIdx; InvalidateRect(hPick, NULL, FALSE); }
+        char b[64];
+        snprintf(b, sizeof b, "Theme: %s", themes[themeIdx].name);
+        toast(b);
+        break;
+    }
     }
     if ((id >= CM_DELETE && id <= CM_MERGE) || id == CM_APPLYCOL || id == CM_GROW || id == CM_SHRINK ||
         (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE)
@@ -3466,6 +3884,7 @@ static void handle_key(WPARAM wp)
     case 'N': if (ctrl) id = CM_NEW; break;
     case 'O': if (ctrl) id = shift ? CM_IMPORT : CM_OPEN; break;
     case 'H': if (ctrl) id = shift ? CM_SHOWALL : CM_HIDE; break;
+    case 'T': if (ctrl) id = shift ? CM_THEMENEXT : CM_THEMEPICK; break;
     case VK_OEM_PERIOD: id = CM_GROW; break;
     case VK_OEM_COMMA: id = CM_SHRINK; break;
     case VK_HOME: id = CM_VHOME; break;
@@ -3760,7 +4179,13 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_VSIDE, "S&ide View");
     AppendMenuA(m, MF_STRING, CM_VTOP, "&Top View");
     hThemeMenu = CreatePopupMenu();
-    for (int i = 0; i < NTHEME; i++) AppendMenuA(hThemeMenu, MF_STRING, CM_THEME + i, themes[i].name);
+    AppendMenuA(hThemeMenu, MF_STRING, CM_THEMEPICK, "Theme &Picker...\tCtrl+T");
+    AppendMenuA(hThemeMenu, MF_STRING, CM_THEMENEXT, "&Next Theme\tCtrl+Shift+T");
+    AppendMenuA(hThemeMenu, MF_STRING, CM_THEMEPREV, "Pre&vious Theme");
+    AppendMenuA(hThemeMenu, MF_STRING, CM_THEMERAND, "&Random Theme");
+    AppendMenuA(hThemeMenu, MF_SEPARATOR, 0, NULL);
+    for (int i = 0; i < NTHEME; i++)   /* the full list, in columns */
+        AppendMenuA(hThemeMenu, MF_STRING | (i && i % 16 == 0 ? MF_MENUBARBREAK : 0), CM_THEME + i, themes[i].name);
     AppendMenuA(m, MF_POPUP, (UINT_PTR)hThemeMenu, "&Theme");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Display");
     m = CreatePopupMenu();
@@ -3871,6 +4296,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ReleaseDC(NULL, sdc);
     if (ds < 1) ds = 1;
     for (int t = 0; t < PRIM_COUNT; t++) prim_defaults(&defPrim[t], t);
+    srand(GetTickCount());
     theme_load(reg_int("Theme", 0));
     panelOn = reg_int("Panel", 1);
     hudOn = reg_int("Hud", 1);
