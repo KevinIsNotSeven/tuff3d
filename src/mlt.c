@@ -11,6 +11,7 @@
    Vertex numbers inside the history follow Maya's conventions where they are known; rings of
    vertices made by edge extrusion are matched to their tweaks by geometry, and a final vertex
    color node (which lists the faces around every vertex) maps Maya's vertex numbers onto ours. */
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +46,7 @@ typedef struct {
     uint32_t code; char name[64], parent[160], path[256];
     int pidx; Attr *a; int na;
 } Node;
-typedef struct { char src[160], dst[160]; } Conn;
+typedef struct { char src[160], dst[160]; int sn, dn; const char *sat, *dat; } Conn;   /* resolved node + attribute */
 typedef struct {
     const uint8_t *d; size_t n;
     Node *nd; int nn;
@@ -139,13 +140,14 @@ static int is_ident(const char *s, int path)
 }
 
 /* node names: rotated by a length dependent amount and XORed with NAME_CYCLE from (n + 4) % 10 */
-static const int NAME_ROT[20] = { -1, -1, -1, 1, 3, 2, 4, -1, 3, 4, 2, 6, 5, 8, 7, 9, 6, 7, 6, 10 };   /* seen so far */
+static const int NAME_ROT[29] = { -1, -1, -1, 1, 3, 2, 4, 5, 3, 4, 2, 6, 5, 8, 7, 9, 6, 7, 6, 10,
+                                  13, -1, -1, -1, -1, 8, -1, -1, 12 };   /* seen so far */
 
 static void decode_name(const uint8_t *e, int n, char *out, int outsz, Doc *D)
 {
     char best[160] = "", s[160];
     if (n >= (int)sizeof s || n >= outsz) n = outsz - 1;
-    int e0 = (n + 4) % 10, fixed = n < 20 ? NAME_ROT[n] : -1;
+    int e0 = (n + 4) % 10, fixed = n < 29 ? NAME_ROT[n] : -1;
     /* the known rotation for this length first, then every other one */
     for (int t = -1; t < n; t++) {
         int r = t < 0 ? fixed : t;
@@ -246,6 +248,8 @@ static void parse_connections(Doc *D, size_t p)
     }
 }
 
+static int find_node(Doc *D, const char *name);
+
 static int doc_parse(Doc *D)
 {
     if (D->n < 32 || memcmp(D->d, "FOR8", 4) || memcmp(D->d + 16, "MBLT", 4)) return 0;
@@ -303,6 +307,18 @@ static int doc_parse(Doc *D)
             }
         }
         snprintf(n->path, sizeof n->path, "%s|%s", n->pidx >= 0 ? D->nd[n->pidx].path : "", n->name);
+    }
+    /* connection ends: node (a name or a |path) up to the first '.', then the attribute */
+    for (int c = 0; c < D->nc; c++) {
+        Conn *k = &D->cn[c];
+        char tmp[160];
+        char *dot = strchr(k->src, '.');
+        k->sn = k->dn = -1;
+        k->sat = dot ? dot + 1 : "";
+        if (dot) { snprintf(tmp, sizeof tmp, "%.*s", (int)(dot - k->src), k->src); k->sn = find_node(D, tmp); }
+        dot = strchr(k->dst, '.');
+        k->dat = dot ? dot + 1 : "";
+        if (dot) { snprintf(tmp, sizeof tmp, "%.*s", (int)(dot - k->dst), k->dst); k->dn = find_node(D, tmp); }
     }
     return D->nn > 0;
 }
@@ -376,33 +392,18 @@ static int find_node(Doc *D, const char *name)
 /* what feeds node.attr: returns the source node and copies the source attribute into sattr */
 static int input(Doc *D, int node, const char *at, char *sattr)
 {
-    char want[256];
-    snprintf(want, sizeof want, "%s.%s", D->nd[node].name, at);
     for (int c = 0; c < D->nc; c++) {
-        if (strcmp(D->cn[c].dst, want)) continue;
-        char tmp[160];
-        strcpy(tmp, D->cn[c].src);
-        char *dot = strchr(tmp, '.');
-        if (!dot) continue;
-        *dot = 0;
-        if (sattr) strcpy(sattr, dot + 1);
-        return find_node(D, tmp);
+        if (D->cn[c].dn != node || strcmp(D->cn[c].dat, at) || D->cn[c].sn < 0) continue;
+        if (sattr) snprintf(sattr, 160, "%s", D->cn[c].sat);
+        return D->cn[c].sn;
     }
     return -1;
 }
 
 static int consumer(Doc *D, int node, const char *at)
 {
-    char want[256];
-    snprintf(want, sizeof want, "%s.%s", D->nd[node].name, at);
-    for (int c = 0; c < D->nc; c++) {
-        if (strcmp(D->cn[c].src, want)) continue;
-        char tmp[160];
-        strcpy(tmp, D->cn[c].dst);
-        char *dot = strchr(tmp, '.');
-        if (dot) *dot = 0;
-        return find_node(D, tmp);
-    }
+    for (int c = 0; c < D->nc; c++)
+        if (D->cn[c].sn == node && !strcmp(D->cn[c].sat, at)) return D->cn[c].dn;
     return -1;
 }
 
@@ -702,11 +703,11 @@ static G g_subset(const G *g, const unsigned char *keep)
     return out;
 }
 
-/* shells in order of their first face; returns shell k */
-static G g_shell(const G *g, int k)
+/* number of shells, and each face's shell (shells numbered in order of their first face) */
+static int g_shell_ids(const G *g, int *sid)
 {
-    int *par = xalloc((g->nv + 1) * sizeof(int));
-    for (int v = 0; v < g->nv; v++) par[v] = v;
+    int *par = xalloc((g->nv + 1) * sizeof(int)), *num = xalloc((g->nv + 1) * sizeof(int)), shells = 0;
+    for (int v = 0; v < g->nv; v++) { par[v] = v; num[v] = -1; }
     for (int f = 0; f < g->nf; f++)
         for (int j = g->fo[f] + 1; j < g->fo[f + 1]; j++) {
             int a = g->fi[g->fo[f]], b = g->fi[j];
@@ -714,19 +715,26 @@ static G g_shell(const G *g, int k)
             while (par[b] != b) b = par[b];
             par[b] = a;
         }
-    int *root = xalloc((g->nf + 1) * sizeof(int)), shells = 0, want = -1;
     for (int f = 0; f < g->nf; f++) {
         int a = g->fi[g->fo[f]];
         while (par[a] != a) a = par[a];
-        root[f] = a;
-        int seen = 0;
-        for (int h = 0; h < f; h++) if (root[h] == a) { seen = 1; break; }
-        if (!seen) { if (shells == k) want = a; shells++; }
+        if (num[a] < 0) num[a] = shells++;
+        sid[f] = num[a];
     }
+    free(par); free(num);
+    return shells;
+}
+
+/* shell k, or with rest shells k and up (a separate with fewer outputs than shells leaves the
+   remaining shells together in its last output) */
+static G g_shell(const G *g, int k, int rest)
+{
+    int *sid = xalloc((g->nf + 1) * sizeof(int));
+    g_shell_ids(g, sid);
     unsigned char *keep = xalloc(g->nf + 1);
-    for (int f = 0; f < g->nf; f++) keep[f] = root[f] == want;
+    for (int f = 0; f < g->nf; f++) keep[f] = rest ? sid[f] >= k : sid[f] == k;
     G out = g_subset(g, keep);
-    free(par); free(root); free(keep);
+    free(sid); free(keep);
     return out;
 }
 
@@ -892,6 +900,98 @@ static void g_merge(G *g, const Comps *c, float dist)
     free(to); free(map);
 }
 
+/* A mesh stored as data (MESH chunk: a shape saved without history, or a cached copy):
+   [n][n/3 points as float xyz] [n][edge vertex pairs, top bit = hard edge]
+   [n][face loops as edge numbers: bit 31 = edge used backwards, bit 29 = last edge of the face,
+   bit 30 = last edge of a loop (a face's later loops are holes)]
+   [0][uv set count]{ [0] name\0 [n][floats] [n][indices] }
+   [color set count]{ [0] name\0 [channels] [n][floats] [n][indices per face corner, -1 = none] } */
+static int g_from_data(const Attr *a, G *out)
+{
+    const uint8_t *v = a->v, *e = a->v + a->n;
+#define NEED(k) if (e - v < (ptrdiff_t)(k)) goto bad
+    NEED(4);
+    uint32_t np = be32(v) / 3;
+    v += 4;
+    NEED((size_t)np * 12);
+    V3 *P = xalloc((np + 1) * sizeof(V3));
+    for (uint32_t i = 0; i < np; i++, v += 12) P[i] = v3(beflt(v), beflt(v + 4), beflt(v + 8));
+    NEED(4);
+    uint32_t ne = be32(v) / 2;
+    v += 4;
+    NEED((size_t)ne * 8);
+    int *E = xalloc((ne + 1) * 2 * sizeof(int));
+    for (uint32_t i = 0; i < ne; i++, v += 8) { E[2 * i] = (int)(be32(v) & 0x7fffffff); E[2 * i + 1] = (int)(be32(v + 4) & 0x7fffffff); }
+    NEED(4);
+    uint32_t nl = be32(v);
+    v += 4;
+    NEED((size_t)nl * 4);
+    *out = g_new((int)np, P, 0, (int[]){ 0 }, NULL);
+    free(P);
+    int *q = xalloc((nl + 1) * sizeof(int)), nq = 0, hole = 0, corners = 0;
+    int *corner_face = xalloc((nl + 1) * sizeof(int));   /* face of each face corner, for colors */
+    for (uint32_t i = 0; i < nl; i++, v += 4) {
+        uint32_t x = be32(v), k = x & 0x1fffffff;
+        int vert = k < ne ? E[2 * k + (x >> 31)] : 0;
+        if (vert >= (int)np) vert = 0;
+        corner_face[corners++] = out->nf;
+        if (!hole) q[nq++] = vert;   /* holes are dropped: tuff3d faces are simple polygons */
+        if (x & 0x40000000u) hole = 1;
+        if (x & 0x20000000u) {
+            if (nq >= 3) g_face(out, q, nq, v3(-1, -1, -1));
+            else for (int c = corners - 1; c >= 0 && corner_face[c] == out->nf; c--) corner_face[c] = -1;
+            nq = 0; hole = 0;
+        }
+    }
+    free(q); free(E);
+    /* uv sets are skipped; the first color set gives per face colors */
+    if (e - v >= 8) {
+        uint32_t nuv = be32(v + 4);
+        v += 8;
+        for (uint32_t s = 0; s < nuv && s < 64; s++) {
+            NEED(4); v += 4;
+            while (v < e && *v) v++;
+            v++;
+            NEED(4); v += 4 + (size_t)be32(v) * 4;
+            NEED(4); v += 4 + (size_t)be32(v) * 4;
+        }
+        if (e - v >= 4 && be32(v) > 0) {
+            v += 4;
+            NEED(4); v += 4;
+            while (v < e && *v) v++;
+            v++;
+            NEED(8);
+            uint32_t ch = be32(v), nf = be32(v + 4);
+            v += 8;
+            NEED((size_t)nf * 4);
+            const uint8_t *cols = v;
+            v += (size_t)nf * 4;
+            NEED(4);
+            uint32_t ni = be32(v);
+            v += 4;
+            NEED((size_t)ni * 4);
+            if (ch >= 3 && ch <= 4) {
+                V3 *sum = xalloc((out->nf + 1) * sizeof(V3));
+                int *cnt = xalloc((out->nf + 1) * sizeof(int));
+                for (uint32_t i = 0; i < ni && (int)i < corners; i++) {
+                    int32_t k = (int32_t)be32(v + 4 * i), f = corner_face[i];
+                    if (k < 0 || f < 0 || f >= out->nf || (uint32_t)(k + 1) * ch > nf) continue;
+                    const uint8_t *c = cols + (size_t)k * ch * 4;
+                    sum[f] = v3add(sum[f], v3(beflt(c), beflt(c + 4), beflt(c + 8)));
+                    cnt[f]++;
+                }
+                for (int f = 0; f < out->nf; f++) if (cnt[f]) out->fc[f] = v3mul(sum[f], 1.0f / cnt[f]);
+                free(sum); free(cnt);
+            }
+        }
+    }
+    free(corner_face);
+    return out->nf > 0;
+bad:
+#undef NEED
+    return out->nf > 0;
+}
+
 /* ---------------------------------------------------------------- transforms */
 
 static M4 local_matrix(const Node *n)
@@ -920,8 +1020,10 @@ static M4 world_matrix(Doc *D, int node)
 
 typedef struct {
     Doc *D;
-    int depth, steps;
+    int depth, steps, debug;
     char skipped[256];
+    struct { int node; char plug[32]; G g; } *memo;   /* results by node and output plug */
+    int nmemo;
 } Ctx;
 
 static void skip_note(Ctx *x, const char *what)
@@ -1062,13 +1164,141 @@ static int color_node_before(Ctx *x, int shape)
     return -1;
 }
 
+static int eval_op(Ctx *x, int node, const char *plug, G *out);
+
+static M4 attr_m4(const Node *n, const char *name)
+{
+    M4 m = m4_id();
+    const Attr *a = attr(n, name);
+    if (a && a->n >= 128) for (int i = 0; i < 16; i++) m.m[i] = (float)bedbl(a->v + 8 * i);
+    return m;
+}
+
+/* place the new cap of an extrusion: local translate along the face normals (lt, plus thickness
+   tk), world translate (t) and world scale about the pivot (s), local scale (ls) about each cap's
+   center. Distances are in world space; ix is the object's world matrix at the time. */
+static void move_extruded(const Node *nd, G *g, const Comps *c, int first)
+{
+    V3 lt = attr_v3(nd, "lt", v3(0, 0, 0)), t = attr_v3(nd, "t", v3(0, 0, 0)), sc = attr_v3(nd, "s", v3(1, 1, 1));
+    V3 ls = attr_v3(nd, "ls", v3(1, 1, 1)), pvt = attr_v3(nd, "pvt", v3(0, 0, 0));
+    lt.z += (float)attr_d(nd, "tk", 0);
+    if (g->nv <= first) return;
+    int n = g->nv - first;
+    M4 ix = attr_m4(nd, "ix"), inv = m4_inv(ix);
+    V3 *nrm = xalloc((n + 1) * sizeof(V3)), *w = xalloc((n + 1) * sizeof(V3));
+    for (int i = 0; i < n; i++) w[i] = m4_pt(ix, g->p[first + i]);
+    for (int i = 0; i < c->n; i++) {
+        int f = c->idx[i];
+        if (f < 0 || f >= g->nf) continue;
+        V3 fn = v3(0, 0, 0);
+        int a = g->fo[f], b = g->fo[f + 1];
+        for (int j = a; j < b; j++) {
+            int u = g->fi[j], v = g->fi[j + 1 < b ? j + 1 : a];
+            if (u < first || v < first) continue;
+            fn = v3add(fn, v3cross(w[u - first], w[v - first]));
+        }
+        for (int j = a; j < b; j++) if (g->fi[j] >= first) nrm[g->fi[j] - first] = v3add(nrm[g->fi[j] - first], fn);
+    }
+    V3 ctr = v3(0, 0, 0);
+    for (int i = 0; i < n; i++) ctr = v3add(ctr, w[i]);
+    ctr = v3mul(ctr, 1.0f / n);
+    for (int i = 0; i < n; i++) {
+        V3 p = w[i];
+        if (ls.x != 1 || ls.y != 1) p = v3add(ctr, v3mul(v3sub(p, ctr), (ls.x + ls.y) * 0.5f));
+        V3 nn = nrm[i];
+        float l = v3len(nn);
+        if (l > 1e-12f) p = v3add(p, v3mul(nn, lt.z / l));
+        p = v3add(pvt, v3(sc.x * (p.x - pvt.x), sc.y * (p.y - pvt.y), sc.z * (p.z - pvt.z)));
+        p = v3add(p, t);
+        g->p[first + i] = m4_pt(inv, p);
+    }
+    free(nrm); free(w);
+}
+
+/* debugging aid: operations record the bounding box (cbn/cbx, world space) of the components
+   they work on; compare it with the replayed mesh to see where numbering goes wrong */
+static void check_box(Ctx *x, const Node *nd, const G *g, const Comps *c)
+{
+    if (!x->debug || !attr(nd, "cbn")) return;
+    M4 ix = attr_m4(nd, "ix");
+    V3 lo = v3(1e30f, 1e30f, 1e30f), hi = v3(-1e30f, -1e30f, -1e30f);
+    for (int i = 0; i < c->n; i++) {
+        int k = c->idx[i];
+        int a = 0, b = 0;
+        if (c->type == 'F' && k < g->nf) { a = g->fo[k]; b = g->fo[k + 1]; }
+        for (int j = a; j < b; j++) {
+            V3 p = m4_pt(ix, g->p[g->fi[j]]);
+            lo = v3(fminf(lo.x, p.x), fminf(lo.y, p.y), fminf(lo.z, p.z));
+            hi = v3(fmaxf(hi.x, p.x), fmaxf(hi.y, p.y), fmaxf(hi.z, p.z));
+        }
+        if (c->type == 'V' && k < g->nv) {
+            V3 p = m4_pt(ix, g->p[k]);
+            lo = v3(fminf(lo.x, p.x), fminf(lo.y, p.y), fminf(lo.z, p.z));
+            hi = v3(fmaxf(hi.x, p.x), fmaxf(hi.y, p.y), fmaxf(hi.z, p.z));
+        }
+    }
+    V3 wl = attr_v3(nd, "cbn", lo), wh = attr_v3(nd, "cbx", hi);
+    float err = fmaxf(v3len(v3sub(lo, wl)), v3len(v3sub(hi, wh))), size = v3len(v3sub(wh, wl)) + 1e-6f;
+    fprintf(stderr, "  [box %s: %s err %.4f (%.1f%%)  ours %.3f %.3f %.3f / %.3f %.3f %.3f  maya %.3f %.3f %.3f / %.3f %.3f %.3f]\n",
+            nd->name, err < size * 0.01f ? "OK" : "MISMATCH", err, 100 * err / size, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, wl.x, wl.y, wl.z, wh.x, wh.y, wh.z);
+}
+
+/* debugging aid: a vertex color node lists the faces around each vertex; count the vertices whose
+   face list differs from the replayed mesh */
+static void check_topology(Ctx *x, const Node *cpv, const G *g)
+{
+    if (!x->debug) return;
+    int nm = 0, bad = 0, first = -1;
+    for (int k = 0; k < cpv->na; k++) {
+        int v, f;
+        if (sscanf(cpv->a[k].name, "vclr[%d].vfcl[%d]", &v, &f) == 2 && v + 1 > nm) nm = v + 1;
+    }
+    if (!nm) return;
+    for (int v = 0; v < nm; v++) {
+        int have = 0, want = 0, match = 0;
+        for (int k = 0; k < cpv->na; k++) {
+            int vv, f;
+            if (sscanf(cpv->a[k].name, "vclr[%d].vfcl[%d]", &vv, &f) != 2 || vv != v) continue;
+            /* each face lists three channels; count each face once via its r entry */
+            if (!strstr(cpv->a[k].name, "vfcr")) continue;
+            want++;
+            if (v < g->nv && f < g->nf)
+                for (int j = g->fo[f]; j < g->fo[f + 1]; j++) if (g->fi[j] == v) { match++; break; }
+        }
+        if (v < g->nv)
+            for (int f = 0; f < g->nf; f++)
+                for (int j = g->fo[f]; j < g->fo[f + 1]; j++) if (g->fi[j] == v) { have++; break; }
+        if (want && (match != want || have != want)) { bad++; if (first < 0) first = v; }
+    }
+    fprintf(stderr, "  [topology %s: maya %d verts, ours %d verts %d faces, %d verts differ (first %d)]\n", cpv->name, nm, g->nv, g->nf, bad, first);
+}
+
+/* evaluate a node's output once; branches that share history reuse the result */
 static int eval(Ctx *x, int node, const char *plug, G *out)
+{
+    for (int i = 0; i < x->nmemo; i++)
+        if (x->memo[i].node == node && !strcmp(x->memo[i].plug, plug)) { *out = g_copy(&x->memo[i].g); return 1; }
+    if (++x->depth > 400) { x->depth--; return 0; }
+    int ok = eval_op(x, node, plug, out);
+    x->depth--;
+    if (x->debug)
+        fprintf(stderr, "%*s%s.%s -> %s %d verts %d faces\n", x->depth, "", x->D->nd[node].name, plug, ok ? "ok" : "FAILED",
+                ok ? out->nv : 0, ok ? out->nf : 0);
+    if (ok) {
+        x->memo = xgrow(x->memo, (x->nmemo + 1) * sizeof *x->memo);
+        x->memo[x->nmemo].node = node;
+        snprintf(x->memo[x->nmemo].plug, sizeof x->memo[x->nmemo].plug, "%s", plug);
+        x->memo[x->nmemo++].g = g_copy(out);
+    }
+    return ok;
+}
+
+static int eval_op(Ctx *x, int node, const char *plug, G *out)
 {
     Doc *D = x->D;
     const Node *nd = &D->nd[node];
     char op[64];
     op_name(nd, op);
-    if (++x->depth > 200) { x->depth--; return 0; }
     int ok = 0;
     memset(out, 0, sizeof *out);
     x->steps++;
@@ -1090,7 +1320,23 @@ static int eval(Ctx *x, int node, const char *plug, G *out)
             tweaks_free(&t);
             ok = 1;
         } else {
-            skip_note(x, "meshes saved without history");
+            /* saved without history: the mesh itself is stored, as the output (o), or as the
+               cached input (ci) that the shape's own tweaks (pt) still apply to */
+            const Attr *m = NULL;
+            for (int k = 0; k < nd->na && !m; k++) if (!strcmp(nd->a[k].tag, "MESH") && !strcmp(nd->a[k].name, "o")) m = &nd->a[k];
+            for (int k = 0; k < nd->na && !m; k++) if (!strcmp(nd->a[k].tag, "MESH")) m = &nd->a[k];
+            if (m && g_from_data(m, out)) {
+                if (strcmp(m->name, "o")) {
+                    Tweaks t = tweaks(nd, "pt");
+                    for (int k = 0; k < t.n; k++)
+                        if (t.i[k] >= 0 && t.i[k] < out->nv) out->p[t.i[k]] = v3add(out->p[t.i[k]], t.v[k]);
+                    tweaks_free(&t);
+                }
+                ok = 1;
+            } else {
+                g_free(out);
+                skip_note(x, "an object with no stored shape");
+            }
         }
     } else if (!strcmp(op, "polyCube")) {
         *out = g_cube((float)attr_d(nd, "w", 1), (float)attr_d(nd, "h", 1), (float)attr_d(nd, "d", 1),
@@ -1135,7 +1381,9 @@ static int eval(Ctx *x, int node, const char *plug, G *out)
         G in;
         int k = 0;
         sscanf(plug, "out[%d]", &k);
-        if ((ok = eval_in(x, node, "ip", &in))) { *out = g_shell(&in, k); g_free(&in); }
+        const Attr *no = attr(nd, "out");
+        int nout = no && no->n >= 4 ? (int)be32(no->v) : 0;
+        if ((ok = eval_in(x, node, "ip", &in))) { *out = g_shell(&in, k, nout > 0 && k == nout - 1); g_free(&in); }
     } else if (!strcmp(op, "polyExtrudeEdge")) {
         if ((ok = eval_in(x, node, "ip", out))) {
             V3 col = v3(-1, -1, -1);
@@ -1144,7 +1392,19 @@ static int eval(Ctx *x, int node, const char *plug, G *out)
     } else if (!strcmp(op, "polyExtrudeFace")) {
         if ((ok = eval_in(x, node, "ip", out))) {
             Comps c = comps(nd, "ics", out->nf);
+            check_box(x, nd, out, &c);
+            int first = out->nv;
+            if (x->debug > 1) {
+                for (int i = 0; i < c.n; i++) {
+                    int f = c.idx[i];
+                    fprintf(stderr, "    f%d:", f);
+                    for (int j = out->fo[f]; j < out->fo[f + 1]; j++) fprintf(stderr, " %d", out->fi[j]);
+                    fprintf(stderr, "\n");
+                }
+                for (int f = 0; f < out->nf; f++) { fprintf(stderr, "      all f%d:", f); for (int j = out->fo[f]; j < out->fo[f + 1]; j++) fprintf(stderr, " %d", out->fi[j]); fprintf(stderr, "\n"); }
+            }
             g_extrude_faces(out, &c);
+            move_extruded(nd, out, &c, first);
             out->ringn = 0;
             free(c.idx);
         }
@@ -1186,7 +1446,7 @@ static int eval(Ctx *x, int node, const char *plug, G *out)
             ok = 1;
         }
     } else if (!strcmp(op, "polyColorPerVertex")) {
-        if ((ok = eval_in(x, node, "ip", out))) color_faces(nd, out);
+        if ((ok = eval_in(x, node, "ip", out))) { check_topology(x, nd, out); color_faces(nd, out); }
     } else {
         /* normals, UV and other non-shape operations pass their input through */
         static const char *const pass[] = { "polySoftEdge", "polyNormal", "polyAutoProj", "polyPlanarProj", "polyMapCut",
@@ -1198,7 +1458,6 @@ static int eval(Ctx *x, int node, const char *plug, G *out)
             ok = eval_in(x, node, "ip", out) || eval_in(x, node, "ig", out);
         }
     }
-    x->depth--;
     return ok;
 }
 
@@ -1226,6 +1485,7 @@ int mlt_load(const char *path, Mesh **ms, char (**names)[32], char *report, int 
         Ctx x;
         memset(&x, 0, sizeof x);
         x.D = &D;
+        x.debug = getenv("MLT_DEBUG") ? atoi(getenv("MLT_DEBUG")) : 0;
         count = 0;
         for (int i = 0; i < D.nn; i++) {
             const Node *nd = &D.nd[i];
@@ -1252,6 +1512,8 @@ int mlt_load(const char *path, Mesh **ms, char (**names)[32], char *report, int 
             free(col); free(cnt);
             g_free(&g);
         }
+        for (int i = 0; i < x.nmemo; i++) g_free(&x.memo[i].g);
+        free(x.memo);
         if (report)
             snprintf(report, report_size, "%d object(s) rebuilt from %d history step(s)%s%s", count, x.steps,
                      x.skipped[0] ? "; not supported yet: " : "", x.skipped);
