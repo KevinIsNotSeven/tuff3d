@@ -280,7 +280,7 @@ static int doc_parse(Doc *D)
             while (q + 16 <= end) {
                 if (is_group(D->d + q)) { q += 16 + (((be32(D->d + q + 12) ^ GROUP_KEY) + 3) & ~3u); continue; }
                 size_t s = chunk_size(D, q, end);
-                if (q + 16 + s > end) break;
+                if (q + 16 + s > end) s = end - q - 16;   /* a learned size key can be a few bytes off */
                 nd.a = xgrow(nd.a, (nd.na + 1) * sizeof(Attr));
                 Attr *a = &nd.a[nd.na++];
                 memset(a, 0, sizeof *a);
