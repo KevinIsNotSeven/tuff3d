@@ -5,12 +5,12 @@
    are rotated and XOR-masked with a 10 byte cycle, attribute names are reversed and masked, and
    multi attribute paths are masked with one byte. The connection list is plain text.
 
-   Maya LT saves construction history rather than finished meshes, so the visible meshes are
-   rebuilt here by replaying the supported poly operations (cube/sphere/cylinder/plane, smooth,
-   chip off, separate, extrude edge/face, tweaks, delete faces, unite, merge, vertex colors).
-   Vertex numbers inside the history follow Maya's conventions where they are known; rings of
-   vertices made by edge extrusion are matched to their tweaks by geometry, and a final vertex
-   color node (which lists the faces around every vertex) maps Maya's vertex numbers onto ours. */
+   Shapes saved without history store their mesh, which is read as is. Otherwise Maya LT saves
+   construction history rather than finished meshes, so the visible meshes are rebuilt by
+   replaying the poly operations (primitives, smooth, chip off, separate, extrude, bridge, split,
+   bevel, close border, delete, unite, merge, tweaks, vertex colors). Later steps refer to
+   vertices, edges and faces by number, so the replay numbers them the way Maya does; the rules
+   were worked out against the checks Maya leaves in the file (MLT_DEBUG=1 prints them). */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -400,13 +400,6 @@ static int input(Doc *D, int node, const char *at, char *sattr)
     return -1;
 }
 
-static int consumer(Doc *D, int node, const char *at)
-{
-    for (int c = 0; c < D->nc; c++)
-        if (D->cn[c].sn == node && !strcmp(D->cn[c].sat, at)) return D->cn[c].dn;
-    return -1;
-}
-
 /* component list (CMP#): groups of [type][range count][a b ...]; 0xffffffff means "all" */
 typedef struct { char type; int n; int *idx; } Comps;
 
@@ -466,15 +459,13 @@ static void tweaks_free(Tweaks *t) { free(t->i); free(t->v); }
    loops of edges. Operations number new vertices, edges and faces in a fixed order, and later
    history steps (tweaks, component selections) refer to those numbers, so the replay keeps the
    same three lists in the same order. Faces are kept as vertex loops plus the edge leaving each
-   corner; fc is a per face color (x < 0: none). ring0/ringn mark the newest edge-extrusion ring. */
+   corner; fc is a per face color (x < 0: none). */
 typedef struct {
     int nv, ne, nf;
     V3 *p;
     int *ea, *eb;
     int *fo, *fi, *fe;
     V3 *fc;
-    int ring0, ringn;
-    float ringsign;
     int *hk, hcap, hn;   /* edge lookup by vertex pair, covering edges [0, hn) */
 } G;
 
@@ -623,7 +614,6 @@ static G g_compact(const G *g, const unsigned char *keepf, const unsigned char *
         g_face(&out, v, e, n, g->fc[f]);
         free(v); free(e);
     }
-    out.ring0 = g->ring0; out.ringn = 0; out.ringsign = g->ringsign;
     free(vm); free(em);
     return out;
 }
@@ -772,8 +762,7 @@ static G g_sphere(float r, int sa, int sh)
 
 /* ---- operations */
 
-/* one Catmull-Clark level: corner points, then edge points (in edge order), then face points;
-   the subface at corner k of face f is face 4f+k for quads (Maya's face numbering) */
+/* one Catmull-Clark level: corner points, then edge points, then face points */
 static G g_smooth(G *g)
 {
     int nv = g->nv, ne = g->ne, nf = g->nf;
@@ -809,22 +798,40 @@ static G g_smooth(G *g)
             vp[v] = v3mul(v3add(v3add(Q, v3mul(R, 2)), v3mul(g->p[v], n - 3)), 1 / n);
         }
     }
+    /* edge points are numbered in the order the edges are met going through the faces, starting
+       nf edges in (checked against Maya on a twice smoothed cube) */
+    int *walk = xalloc((ne + 1) * sizeof(int)), nw = 0, *epn = xalloc((ne + 1) * sizeof(int));
+    for (int i = 0; i < ne; i++) epn[i] = -1;
+    for (int f = 0; f < nf; f++)
+        for (int j = g->fo[f]; j < g->fo[f + 1]; j++)
+            if (g->fe[j] >= 0 && epn[g->fe[j]] < 0) { epn[g->fe[j]] = 0; walk[nw++] = g->fe[j]; }
+    for (int i = 0; i < ne; i++) if (epn[i] < 0) walk[nw++] = i;
+    for (int i = 0; i < nw; i++) epn[walk[(i + nf) % nw]] = nv + i;
     G out = g_new(0, NULL);
     for (int v = 0; v < nv; v++) g_vert(&out, vp[v]);
-    for (int i = 0; i < ne; i++) g_vert(&out, ep[i]);
+    for (int i = 0; i < nw; i++) g_vert(&out, ep[walk[(i + nf) % nw]]);
     for (int f = 0; f < nf; f++) g_vert(&out, fp[f]);
-    /* edges: the two halves of every edge, then the spokes of every face */
-    for (int i = 0; i < ne; i++) { g_add_edge(&out, g->ea[i], nv + i); g_add_edge(&out, nv + i, g->eb[i]); }
-    for (int f = 0; f < nf; f++)
-        for (int j = g->fo[f]; j < g->fo[f + 1]; j++) g_add_edge(&out, nv + ne + f, nv + g->fe[j]);
+    /* edges: the two halves of every edge (in edge order), then the spokes in the order the new
+       faces meet them. The face at corner k of face f is face 4f+k, its loop rotated so the old
+       corner sits at position k. */
+    for (int i = 0; i < ne; i++) { g_add_edge(&out, g->ea[i], epn[i]); g_add_edge(&out, epn[i], g->eb[i]); }
+    int nq = g->fo[nf], *Q = xalloc((nq * 4 + 1) * sizeof(int));
     for (int f = 0; f < nf; f++) {
         int s = g->fo[f], n = g_fn(g, f);
         for (int k = 0; k < n; k++) {
             int c = g->fi[s + k], en = g->fe[s + k], epv = g->fe[s + (k - 1 + n) % n];
-            int q[4] = { c, nv + en, nv + ne + f, nv + epv };
-            g_face(&out, q, NULL, 4, g->fc[f]);
+            int q[4] = { c, epn[en], nv + ne + f, epn[epv] }, r = k % 4;
+            for (int z = 0; z < 4; z++) Q[4 * (s + k) + (z + r) % 4] = q[z];
         }
     }
+    for (int i = 0; i < nq; i++)
+        for (int z = 0; z < 4; z++) {
+            int a = Q[4 * i + z], b = Q[4 * i + (z + 1) % 4];
+            if ((a >= nv + ne || b >= nv + ne) && g_find_edge(&out, a, b) < 0) g_add_edge(&out, a, b);
+        }
+    for (int f = 0; f < nf; f++)
+        for (int j = g->fo[f]; j < g->fo[f + 1]; j++) g_face(&out, Q + 4 * j, NULL, 4, g->fc[f]);
+    free(Q); free(walk); free(epn);
     free(fp); free(ep); free(vp); free(val); free(bord); free(nfv); free(Rsum); free(Qsum); free(Bsum); free(ef);
     return out;
 }
@@ -1057,7 +1064,7 @@ static void g_extrude_thick(G *g, const Comps *c, int *nfirst)
 }
 
 /* Extrude edges: new vertices at the ends of the selected (border) edges in edge order, the
-   edges up from them, the outer edges, and a face per edge; the new vertices become the ring */
+   edges up from them, the outer edges, and a face per edge */
 static void g_extrude_edges(G *g, const Comps *c, V3 col, int **vmap)
 {
     int *ef = g_edge_faces(g);
@@ -1090,8 +1097,6 @@ static void g_extrude_edges(G *g, const Comps *c, V3 col, int **vmap)
     }
     free(top);
     if (vmap) { *vmap = vm; vm = NULL; }
-    g->ring0 = nv0;
-    g->ringn = g->nv - nv0;
     g_hash_reset(g);
     free(ef); free(sel); free(vm); free(up);
 }
@@ -1186,42 +1191,6 @@ static void g_delete_edges(G *g, const Comps *c, int clean)
             free(keepf); free(keepv); free(keepe);
         }
     }
-}
-
-/* Fit tweak vectors onto the current ring: each goes to the ring vertex whose direction from the
-   ring's center it lines up with best; sign picks inward (-1) or outward (+1) offsets. */
-static void g_fit_ring(G *g, const Tweaks *t, float sign)
-{
-    int n = g->ringn, r0 = g->ring0;
-    V3 c = v3(0, 0, 0);
-    for (int i = 0; i < n; i++) c = v3add(c, g->p[r0 + i]);
-    c = v3mul(c, 1.0f / n);
-    unsigned char *taken = xalloc(n + 1);
-    V3 *np = xalloc((n + 1) * sizeof(V3));
-    for (int i = 0; i < n; i++) np[i] = g->p[r0 + i];
-    for (int k = 0; k < t->n; k++) {
-        V3 tv = t->v[k];
-        float tl = sqrtf(tv.x * tv.x + tv.z * tv.z), best = -1e30f;
-        int bi = -1;
-        for (int i = 0; i < n; i++) {
-            if (taken[i]) continue;
-            V3 d = v3sub(g->p[r0 + i], c);
-            float dl = sqrtf(d.x * d.x + d.z * d.z), s = tl > 1e-9f && dl > 1e-9f ? sign * (d.x * tv.x + d.z * tv.z) / (dl * tl) : 0;
-            if (s > best) { best = s; bi = i; }
-        }
-        if (bi < 0) break;
-        taken[bi] = 1;
-        np[bi] = v3add(np[bi], tv);
-    }
-    for (int i = 0; i < n; i++) g->p[r0 + i] = np[i];
-    free(taken); free(np);
-}
-
-static int tweaks_cover_ring(const G *g, const Tweaks *t)
-{
-    if (!g->ringn || t->n != g->ringn) return 0;
-    for (int k = 0; k < t->n; k++) if (t->i[k] < g->ring0 || t->i[k] >= g->ring0 + g->ringn) return 0;
-    return 1;
 }
 
 static void g_reverse_face(G *g, int f)
@@ -1726,49 +1695,8 @@ static int eval_in(Ctx *x, int node, const char *at, G *out)
     return src >= 0 && eval(x, src, sp, out);
 }
 
-/* the sign (inward/outward) for fitting tweak t on ring g: compare the ring's size with the
-   bounding box the next extrude recorded (cbn/cbx), when there is one */
-static float ring_sign(Ctx *x, int node, G *g, const Tweaks *t)
+static void apply_tweaks(G *g, const Tweaks *t)
 {
-    int ext = consumer(x->D, node, "out");
-    for (int hops = 0; ext >= 0 && hops < 4; hops++) {
-        char op[64];
-        op_name(&x->D->nd[ext], op);
-        if (!strncmp(op, "polyExtrude", 11)) break;
-        ext = consumer(x->D, ext, "og");
-    }
-    if (ext >= 0 && attr(&x->D->nd[ext], "cbx") && attr(&x->D->nd[ext], "cbn")) {
-        const Node *e = &x->D->nd[ext];
-        V3 bmin = attr_v3(e, "cbn", v3(0, 0, 0)), bmax = attr_v3(e, "cbx", v3(0, 0, 0));
-        float want = bmax.x - bmin.x, best = 1e30f, sign = -1;
-        for (int s = -1; s <= 1; s += 2) {
-            G tmp = g_copy(g);
-            g_fit_ring(&tmp, t, (float)s);
-            M4 ix = m4_id();
-            const Attr *a = attr(e, "ix");
-            if (a && a->n >= 128) for (int i = 0; i < 16; i++) ix.m[i] = (float)bedbl(a->v + 8 * i);
-            float lo = 1e30f, hi = -1e30f;
-            for (int i = 0; i < tmp.ringn; i++) {
-                V3 p = m4_pt(ix, tmp.p[tmp.ring0 + i]);
-                lo = fminf(lo, p.x); hi = fmaxf(hi, p.x);
-            }
-            float err = fabsf((hi - lo) - want);
-            if (err < best) { best = err; sign = (float)s; }
-            g_free(&tmp);
-        }
-        return sign;
-    }
-    return g->ringsign ? g->ringsign : -1;
-}
-
-static void apply_tweaks(Ctx *x, int node, G *g, const Tweaks *t)
-{
-    if (tweaks_cover_ring(g, t)) {
-        float s = ring_sign(x, node, g, t);
-        g_fit_ring(g, t, s);
-        g->ringsign = s;
-        return;
-    }
     for (int k = 0; k < t->n; k++)
         if (t->i[k] >= 0 && t->i[k] < g->nv) g->p[t->i[k]] = v3add(g->p[t->i[k]], t->v[k]);
 }
@@ -2118,7 +2046,7 @@ static int eval_op(Ctx *x, int node, const char *plug, G *out)
                 }
                 free(map);
             } else {
-                apply_tweaks(x, node, out, &t);
+                apply_tweaks(out, &t);
             }
             tweaks_free(&t);
             ok = 1;
@@ -2231,13 +2159,12 @@ static int eval_op(Ctx *x, int node, const char *plug, G *out)
             if (attr_d(nd, "tk", 0) != 0) g_extrude_thick(out, &c, &first);
             else g_extrude_faces(out, &c, &first);
             move_extruded(nd, out, &c, first);
-            out->ringn = 0;
             free(c.idx);
         }
     } else if (!strcmp(op, "polyTweak")) {
         if ((ok = eval_in(x, node, "ip", out))) {
             Tweaks t = tweaks(nd, "tk");
-            apply_tweaks(x, node, out, &t);
+            apply_tweaks(out, &t);
             tweaks_free(&t);
         }
     } else if (!strcmp(op, "deleteComponent")) {
@@ -2253,7 +2180,6 @@ static int eval_op(Ctx *x, int node, const char *plug, G *out)
         if ((ok = eval_in(x, node, "ip", out))) {
             Comps c = comps(nd, "ics", out->nv);
             g_merge(out, &c, (float)attr_d(nd, "d", 0));
-            out->ringn = 0;
             free(c.idx);
         }
     } else if (!strcmp(op, "polyUnite")) {
