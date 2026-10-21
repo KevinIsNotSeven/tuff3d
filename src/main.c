@@ -4,6 +4,7 @@
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <GL/gl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@ typedef struct {
     Mesh m;
     V3 t, r, s;          /* translate, rotate (degrees, xyz order), scale */
     int sel, hil;        /* selected (object mode) / hilited for component editing */
+    int hidden;          /* Ctrl+H; skipped when drawing and picking */
     unsigned order;      /* selection stamp, highest is the lead object */
     Prim prim;           /* construction history, PRIM_NONE once components are edited */
 } Obj;
@@ -40,21 +42,28 @@ static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
 static char g_path[MAX_PATH];
 static char g_msg[200];
-static int lastCmd, lastHandle, hover, modified;
-static int hvObj = -1, hvKind, hvIdx, tracking;   /* preselection highlight (hvKind 0 = whole object) */
+static int lastCmd, lastHandle, hover, modified, snapGrid, snapPoint;
+static unsigned editStamp;
+static int hvObj = -1, hvKind, hvIdx, tracking, hudOn = 1;
+static int dk, dkBtn, mx0, my0, curx = -1000, cury = -1000, selMod;
+static float rad0;
+enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH };   /* preselection highlight (hvKind 0 = whole object) */
 
 static HWND hMain, hView, hPanel, hStatus, hBar;
 static HDC hdc;
 static HMENU hMenu, hThemeMenu;
-static HFONT hFont, hBold, hSmall;
+static HFONT hFont, hBold, hSmall, hHud;
 static HBRUSH swatchBrush;
 static int vw = 1, vh = 1, panelOn = 1;
 static float ds = 1;
 
 static void refresh_all(void);
+static void status_text(void);
 static void redraw(void) { InvalidateRect(hView, NULL, FALSE); }
 static int key(int vk) { return GetKeyState(vk) < 0; }
-static void msg(const char *s) { snprintf(g_msg, sizeof g_msg, "%s", s); }
+static void toast(const char *s);
+static DWORD msgT;
+static void msg(const char *s) { snprintf(g_msg, sizeof g_msg, "%s", s); msgT = GetTickCount(); toast(s); }
 
 static M4 obj_mat(const Obj *o) { return m4_trs(o->t, o->r, o->s); }
 
@@ -145,20 +154,34 @@ static void theme_window(HWND h)
     }
 }
 
-static int theme_saved(void)
+/* ---- settings, stored under HKEY_CURRENT_USER\Software\tuff3d */
+
+#define REG_KEY "Software\\" APP_NAME
+
+static int reg_get(const char *name, DWORD type, void *out, DWORD n)
 {
-    DWORD v = 0, sz = sizeof v;
-    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\" APP_NAME, "Theme", RRF_RT_REG_DWORD, NULL, &v, &sz)) return 0;
-    return (int)v;
+    DWORD flags = type == REG_DWORD ? RRF_RT_REG_DWORD : type == REG_SZ ? RRF_RT_REG_SZ : RRF_RT_REG_BINARY;
+    return RegGetValueA(HKEY_CURRENT_USER, REG_KEY, name, flags, NULL, out, &n) == ERROR_SUCCESS;
 }
 
-static void theme_save(void)
+static void reg_set(const char *name, DWORD type, const void *data, DWORD n)
 {
     HKEY k;
-    DWORD v = (DWORD)themeIdx;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\" APP_NAME, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL)) return;
-    RegSetValueExA(k, "Theme", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL)) return;
+    RegSetValueExA(k, name, 0, type, (const BYTE *)data, n);
     RegCloseKey(k);
+}
+
+static int reg_int(const char *name, int def)
+{
+    DWORD v;
+    return reg_get(name, REG_DWORD, &v, sizeof v) ? (int)v : def;
+}
+
+static void reg_set_int(const char *name, int v)
+{
+    DWORD d = (DWORD)v;
+    reg_set(name, REG_DWORD, &d, sizeof d);
 }
 
 /* Undocumented messages uxtheme sends to let an app paint its own menu bar (as Notepad++ does). */
@@ -320,7 +343,7 @@ static void clear_sel(void)
 
 /* ================================================================ undo */
 
-typedef struct { Obj *o; int n, mode; } Snap;
+typedef struct { Obj *o; int n, mode; char what[40]; } Snap;   /* what: the action it undoes */
 #define UNDO_MAX 60
 static Snap undo_s[UNDO_MAX], redo_s[UNDO_MAX];
 static int nundo, nredo;
@@ -367,29 +390,40 @@ static void stack_push(Snap *st, int *n, Snap s)
     st[(*n)++] = s;
 }
 
-static void undo_push(void)
+static void undo_push(const char *what)
 {
+    Snap s = snap_take();
+    snprintf(s.what, sizeof s.what, "%s", what);
     modified = 1;
-    stack_push(undo_s, &nundo, snap_take());
+    editStamp++;
+    stack_push(undo_s, &nundo, s);
     while (nredo) snap_free(&redo_s[--nredo]);
 }
 
 static void do_undo(void)
 {
     if (!nundo) { msg("Nothing to undo"); return; }
-    stack_push(redo_s, &nredo, snap_take());
+    Snap s = snap_take();
+    memcpy(s.what, undo_s[nundo - 1].what, sizeof s.what);
+    stack_push(redo_s, &nredo, s);
     snap_restore(&undo_s[--nundo]);
     modified = 1;
-    msg("Undo");
+    editStamp++;
+    snprintf(g_msg, sizeof g_msg, "Undo %s", s.what);
+    toast(g_msg);
 }
 
 static void do_redo(void)
 {
     if (!nredo) { msg("Nothing to redo"); return; }
-    stack_push(undo_s, &nundo, snap_take());
+    Snap s = snap_take();
+    memcpy(s.what, redo_s[nredo - 1].what, sizeof s.what);
+    stack_push(undo_s, &nundo, s);
     snap_restore(&redo_s[--nredo]);
     modified = 1;
-    msg("Redo");
+    editStamp++;
+    snprintf(g_msg, sizeof g_msg, "Redo %s", s.what);
+    toast(g_msg);
 }
 
 /* ================================================================ camera */
@@ -619,6 +653,7 @@ static int ray_box(V3 o, V3 d, V3 lo, V3 hi)
 /* world space ray against object i, skipping the triangles when the ray misses its bounding box */
 static int obj_raycast(int i, V3 o, V3 d, float *t)
 {
+    if (ob[i].hidden) return -1;
     DrawCache *c = cache_get(i);
     M4 iM = m4_inv(obj_mat(&ob[i]));
     V3 lo = m4_pt(iM, o), ld = m4_dir(iM, d);
@@ -652,6 +687,7 @@ static void depth_capture(int x0, int y0, int x1, int y1)
     glPolygonOffset(1, 1);
     for (int i = 0; i < nob; i++) {
         M4 M = obj_mat(&ob[i]);
+        if (ob[i].hidden) continue;
         glPushMatrix();
         glMultMatrixf(M.m);
         draw_cached(i, 0);
@@ -796,6 +832,7 @@ static void select_rect(int x0, int y0, int x1, int y1, int mod)
         Mesh *m = &o->m;
         M4 M = obj_mat(o);
         float x, y, z;
+        if (o->hidden) continue;
         if (mode == M_OBJ) {
             for (int v = 0; v < m->nv; v++)
                 if (proj(m4_pt(M, m->p[v]), &x, &y, NULL) && INSIDE(x, y)) { select_obj_flag(o, mod); break; }
@@ -830,6 +867,7 @@ static int sel_bbox(V3 *mn, V3 *mx, int all)
         Obj *o = &ob[i];
         Mesh *m = &o->m;
         unsigned char *mask = NULL;
+        if (o->hidden) continue;
         if (!all) {
             if (!active(o)) continue;
             if (mode != M_OBJ) {
@@ -861,19 +899,79 @@ static V3 sel_pivot(void)
     return v3mul(v3add(a, b), 0.5f);
 }
 
+/* ---- animation: smooth camera moves and fading toasts. A timer runs only while something
+   is moving, so the app still sits at 0% CPU when idle. */
+
+#define TOAST_MS 2200
+static struct { int on; DWORD t0; V3 c0, c1; float d0, d1, y0, y1, p0, p1; } tween;
+static char toastS[160];
+static DWORD toastT;
+static int animOn;
+
+static void anim_start(void)
+{
+    if (!animOn && hView) { SetTimer(hView, 1, 15, NULL); animOn = 1; }
+}
+
+static void toast(const char *s)
+{
+    snprintf(toastS, sizeof toastS, "%s", s);
+    toastT = GetTickCount();
+    anim_start();
+    if (hView) redraw();
+}
+
+/* glide the camera to a new center/distance/angles */
+static void cam_to(V3 c, float d, float yw, float pt)
+{
+    float dy = fmodf(yw - yaw, 2 * PI_F);
+    if (dy > PI_F) dy -= 2 * PI_F;
+    if (dy < -PI_F) dy += 2 * PI_F;
+    tween.c0 = coi; tween.c1 = c;
+    tween.d0 = dist; tween.d1 = d;
+    tween.y0 = yaw; tween.y1 = yaw + dy;
+    tween.p0 = pitch; tween.p1 = pt;
+    tween.t0 = GetTickCount();
+    tween.on = 1;
+    anim_start();
+}
+
+/* one timer tick; returns 0 when nothing is animating any more */
+static int anim_step(void)
+{
+    if (tween.on) {
+        float t = (GetTickCount() - tween.t0) / 260.0f;
+        if (t >= 1) { t = 1; tween.on = 0; }
+        float e = t * t * (3 - 2 * t);
+        coi = v3lerp(tween.c0, tween.c1, e);
+        dist = tween.d0 * powf(tween.d1 / tween.d0, e);
+        yaw = tween.y0 + (tween.y1 - tween.y0) * e;
+        pitch = tween.p0 + (tween.p1 - tween.p0) * e;
+    }
+    return tween.on || (toastS[0] && GetTickCount() - toastT < TOAST_MS);
+}
+
 static void frame(int all)
 {
     V3 a, b;
     if (!sel_bbox(&a, &b, all) && !sel_bbox(&a, &b, 1)) {
-        coi = v3(0, 0, 0);
-        dist = 10;
+        cam_to(v3(0, 0, 0), 10, yaw, pitch);
         return;
     }
-    coi = v3mul(v3add(a, b), 0.5f);
     float r = v3len(v3sub(b, a)) * 0.5f;
     if (r < 0.05f) r = 0.05f;
     float half = FOVY * 0.5f, hh = atanf(tanf(half) * vw / vh);
-    dist = r / sinf(hh < half ? hh : half) * 1.1f;
+    cam_to(v3mul(v3add(a, b), 0.5f), r / sinf(hh < half ? hh : half) * 1.1f, yaw, pitch);
+}
+
+/* look along an axis (0 X, 1 Y, 2 Z; sign picks the side), keeping the current framing */
+static void view_axis(int axis, int neg)
+{
+    float yw = axis == 0 ? PI_F / 2 : 0, pt = axis == 1 ? 1.55f : 0;
+    if (neg) { if (axis == 1) pt = -pt; else yw += PI_F; }
+    cam_to(coi, dist, yw, pt);
+    static const char *names[3][2] = { { "Side view (+X)", "Side view (-X)" }, { "Top view", "Bottom view" }, { "Front view", "Back view" } };
+    toast(names[axis][neg]);
 }
 
 /* ================================================================ modes & tools */
@@ -1110,6 +1208,38 @@ static void drag_begin(int h, int mx, int my)
     dg.on = 1;
 }
 
+static float nz(float v) { return fabsf(v) < 5e-4f ? 0 : v; }   /* no "-0.000" in readouts */
+
+static int snapOn;      /* point snap found a target this drag step */
+static V3 snapAt;
+
+/* nearest vertex on screen (within 20 px) that is not itself being moved */
+static int snap_target(int mx, int my, V3 *out)
+{
+    float best = 20 * ds;
+    int found = 0;
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        DEnt *e = NULL;
+        if (o->hidden) continue;
+        for (int k = 0; k < dg.ne; k++) if (dg.e[k].obj == i) e = &dg.e[k];
+        if (e && mode == M_OBJ) continue;
+        unsigned char *skip = e ? calloc(o->m.nv + 1, 1) : NULL;
+        for (int j = 0; e && j < e->n; j++) skip[e->vi[j]] = 1;
+        M4 M = obj_mat(o);
+        for (int v = 0; v < o->m.nv; v++) {
+            float x, y;
+            if (skip && skip[v]) continue;
+            V3 w = m4_pt(M, o->m.p[v]);
+            if (!proj(w, &x, &y, NULL)) continue;
+            float d = hypotf(x - mx, y - my);
+            if (d < best) { best = d; *out = w; found = 1; }
+        }
+        free(skip);
+    }
+    return found;
+}
+
 static void drag_move(int mx, int my)
 {
     cam_update();
@@ -1126,14 +1256,28 @@ static void drag_move(int mx, int my)
             delta = v3sub(hit, dg.hit0);
         }
         int world = dg.ax[0].x > 0.9999f && dg.ax[1].y > 0.9999f;
-        if (key('X') && world) {
+        if ((key('X') || snapGrid) && world) {
             /* hold X: snap to the grid */
             V3 np = v3add(dg.piv, delta);
             for (int c = 0; c < 3; c++)
                 if (fabsf((&delta.x)[c]) > 1e-6f) (&np.x)[c] = roundf((&np.x)[c]);
             delta = v3sub(np, dg.piv);
         }
-        snprintf(g_msg, sizeof g_msg, "Move %.3f, %.3f, %.3f", delta.x, delta.y, delta.z);
+        snapOn = 0;
+        if (key('V') || snapPoint) {
+            /* point snap: put the pivot on the nearest vertex, within the handle's constraint */
+            V3 tp;
+            if (snap_target(mx, my, &tp)) {
+                V3 want = v3sub(tp, dg.piv);
+                if (h >= H_X && h <= H_Z) delta = v3mul(dg.axis, v3dot(want, dg.axis));
+                else if (h != H_C) delta = v3sub(want, v3mul(dg.pn, v3dot(want, dg.pn)));
+                else delta = want;
+                snapOn = 1;
+                snapAt = tp;
+            }
+        }
+        snprintf(g_msg, sizeof g_msg, "Move %.3f, %.3f, %.3f%s", nz(delta.x), nz(delta.y), nz(delta.z),
+                 snapOn ? "  (point snap)" : (key('X') || snapGrid) && world ? "  (grid snap)" : "");
     } else if (tool == T_ROTATE) {
         if (dg.planeMode) {
             V3 hit;
@@ -1149,7 +1293,7 @@ static void drag_move(int mx, int my)
         float a = dg.ang;
         if (key('J')) a = roundf(a / (PI_F / 12)) * (PI_F / 12);   /* hold J: 15 degree steps */
         R = m4_axis_angle(dg.axis, a);
-        snprintf(g_msg, sizeof g_msg, "Rotate %.1f deg", a * 180 / PI_F);
+        snprintf(g_msg, sizeof g_msg, "Rotate %.1f deg%s", nz(a * 180 / PI_F), key('J') ? "  (15 deg steps)" : "");
     } else {
         float f = 1 + ((mx - dg.mx0) * dg.sdx + (my - dg.my0) * dg.sdy) / dg.Lpx;
         if (mode != M_OBJ) {
@@ -1163,7 +1307,7 @@ static void drag_move(int mx, int my)
     }
     if (!dg.dirty) {
         if (mx == dg.mx0 && my == dg.my0) return;
-        undo_push();
+        undo_push(tool == T_MOVE ? "Move" : tool == T_ROTATE ? "Rotate" : "Scale");
         dg.dirty = 1;
     }
     for (int k = 0; k < dg.ne; k++) {
@@ -1228,6 +1372,20 @@ static void draw_manip(void)
     static const float col[4][3] = { { .9f, .15f, .15f }, { .2f, .85f, .2f }, { .25f, .4f, 1 }, { .4f, .8f, 1 } };
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_LIGHTING);
+    if (dg.on && tool != T_ROTATE && dg.handle >= H_X && dg.handle <= H_Z) {
+        /* the line the drag is locked to */
+        V3 a = v3mul(dg.ax[dg.handle - H_X], g.L * 200), p0 = v3sub(dg.piv, a), p1 = v3add(dg.piv, a);
+        const float *c = col[dg.handle - H_X];
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(c[0], c[1], c[2], .55f);
+        glLineWidth(1);
+        glBegin(GL_LINES);
+        glVertex3fv(&p0.x);
+        glVertex3fv(&p1.x);
+        glEnd();
+        glDisable(GL_BLEND);
+    }
     glLineWidth(2 * ds);
 #define HCOL(i, hid) (act == (hid) ? glColor3f(1, 1, 0) : glColor3fv(col[i]))
     if (tool == T_ROTATE) {
@@ -1304,7 +1462,7 @@ static void paint_dab(int mx, int my)
             f = f * f * (3 - 2 * f);
             float w = paintOpa * f;
             if (w <= ps.wt[k][v]) continue;
-            if (!ps.dirty) { undo_push(); ps.dirty = 1; }
+            if (!ps.dirty) { undo_push("Paint Vertex Color"); ps.dirty = 1; }
             ps.wt[k][v] = w;
             m->c[v] = v3lerp(ps.orig[k][v], paintCol, w);
         }
@@ -1354,14 +1512,19 @@ enum {
     CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT,
     CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE, CM_MMULTI,
     CM_SELALL, CM_SELINV,
+    CM_OPEN, CM_GROW, CM_SHRINK, CM_LOOP, CM_TOVERT, CM_TOEDGE, CM_TOFACE,
+    CM_HIDE, CM_SHOWALL, CM_FREEZE, CM_CENTERPIV, CM_RESETXF,
+    CM_VFRONT, CM_VSIDE, CM_VTOP, CM_VHOME, CM_HUD, CM_SNAPGRID, CM_SNAPPOINT, CM_WIRETOG,
     CM_HELP,
+    CM_RECENT = 300,             /* + recent file index */
     CM_THEME = 200               /* + theme index */
 };
 
 static void cmd_create(int type)
 {
     static const char *names[] = { "", "pCube", "pCylinder", "pSphere", "pPlane" };
-    undo_push();
+    static const char *what[] = { "", "Create Cube", "Create Cylinder", "Create Sphere", "Create Plane" };
+    undo_push(what[type]);
     set_mode(M_OBJ);
     clear_sel();
     Obj *o = obj_new(names[type]);
@@ -1370,13 +1533,16 @@ static void cmd_create(int type)
     o->m = mesh_prim(&o->prim);
     o->sel = 1;
     o->order = ++stamp;
-    msg("Created primitive");
+    char b[64];
+    snprintf(b, sizeof b, "Created %s", o->name);
+    msg(b);
 }
 
 static void cmd_select_all(int invert)
 {
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
+        if (o->hidden) continue;
         if (mode == M_OBJ) {
             o->sel = invert ? !o->sel : 1;
             if (o->sel) o->order = ++stamp;
@@ -1400,7 +1566,7 @@ static void cmd_extrude(void)
     int faces = mode == M_FACE;
     for (int i = 0; i < nob && mode == M_MULTI; i++)
         for (int f = 0; ob[i].hil && f < ob[i].m.nf; f++) faces |= ob[i].m.fs[f];
-    undo_push();
+    undo_push("Extrude");
     V3 n = v3(0, 0, 0);
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
@@ -1441,7 +1607,7 @@ static void cmd_merge(void)
         free(mask);
     }
     if (!any) { msg("Merge to Center: select at least two vertices"); return; }
-    undo_push();
+    undo_push("Merge to Center");
     for (int i = 0; i < nob; i++) {
         if (!ob[i].hil) continue;
         unsigned char *mask = malloc(ob[i].m.nv + 1);
@@ -1456,7 +1622,7 @@ static void cmd_delete(void)
 {
     if (mode == M_OBJ) {
         if (!has_sel()) return;
-        undo_push();
+        undo_push("Delete");
         for (int i = nob - 1; i >= 0; i--)
             if (ob[i].sel) obj_remove(i);
         msg("Deleted");
@@ -1465,7 +1631,7 @@ static void cmd_delete(void)
         for (int i = 0; i < nob; i++)
             for (int f = 0; ob[i].hil && f < ob[i].m.nf; f++) any |= ob[i].m.fs[f];
         if (!any) { msg("Delete: select objects or faces"); return; }
-        undo_push();
+        undo_push("Delete Faces");
         for (int i = 0; i < nob; i++)
             if (ob[i].hil && mesh_delete_faces(&ob[i].m)) ob[i].prim.type = PRIM_NONE;
         msg("Deleted faces");
@@ -1477,7 +1643,7 @@ static void cmd_delete(void)
 static void cmd_dup(void)
 {
     if (mode != M_OBJ || !has_sel()) { msg("Duplicate: select objects"); return; }
-    undo_push();
+    undo_push("Duplicate");
     int n0 = nob;
     for (int i = 0; i < n0; i++) {
         if (!ob[i].sel) continue;
@@ -1498,7 +1664,7 @@ static void cmd_dup(void)
 static void cmd_apply_color(void)
 {
     if (!has_sel()) { msg("Apply Color: select objects or components"); return; }
-    undo_push();
+    undo_push("Apply Color");
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
         if (!active(o)) continue;
@@ -1526,11 +1692,11 @@ static int file_dlg(int save, char *path)
     return save ? GetSaveFileNameA(&of) : GetOpenFileNameA(&of);
 }
 
-static void cmd_export(int ask, int selOnly)
+static void recent_add(const char *path);
+
+/* writes the scene (or the selected objects) in world space; returns the object count or -1 */
+static int save_scene(const char *path, int selOnly)
 {
-    char path[MAX_PATH];
-    strcpy(path, g_path);
-    if ((ask || !path[0]) && !file_dlg(1, path)) return;
     const Mesh **ms = malloc((nob + 1) * sizeof *ms);
     M4 *mats = malloc((nob + 1) * sizeof *mats);
     const char **names = malloc((nob + 1) * sizeof *names);
@@ -1542,13 +1708,21 @@ static void cmd_export(int ask, int selOnly)
         names[n] = ob[i].name;
         n++;
     }
-    if (obj_save(path, n, ms, mats, names)) {
-        if (!selOnly) { strcpy(g_path, path); modified = 0; }
-        snprintf(g_msg, sizeof g_msg, "Exported %d object(s) to %s", n, path);
-    } else {
-        MessageBoxA(hMain, "Could not write the file.", APP_NAME, MB_ICONERROR);
-    }
+    int ok = obj_save(path, n, ms, mats, names);
     free(ms); free(mats); free(names);
+    return ok ? n : -1;
+}
+
+static void cmd_export(int ask, int selOnly)
+{
+    char path[MAX_PATH], b[MAX_PATH + 64];
+    strcpy(path, g_path);
+    if ((ask || !path[0]) && !file_dlg(1, path)) return;
+    int n = save_scene(path, selOnly);
+    if (n < 0) { MessageBoxA(hMain, "Could not write the file.", APP_NAME, MB_ICONERROR); return; }
+    if (!selOnly) { strcpy(g_path, path); modified = 0; recent_add(path); }
+    snprintf(b, sizeof b, "Exported %d object(s) to %s", n, path);
+    msg(b);
 }
 
 /* ask before throwing away unexported work; 0 = cancel */
@@ -1563,26 +1737,295 @@ static int confirm_discard(void)
     return 1;
 }
 
-static void cmd_import(void)
+/* Open replaces the scene, Import adds to it. path NULL asks with a file dialog. */
+static void load_file(const char *path, int replace)
 {
-    char path[MAX_PATH] = "";
-    if (!file_dlg(0, path)) return;
+    char p[MAX_PATH] = "", b[MAX_PATH + 64];
+    if (replace && !confirm_discard()) return;
+    if (path) snprintf(p, sizeof p, "%s", path);
+    else if (!file_dlg(0, p)) return;
     Mesh *ms;
     char (*names)[32];
-    int n = obj_load(path, &ms, &names);
-    if (n < 0) { MessageBoxA(hMain, "Could not read the file.", APP_NAME, MB_ICONERROR); return; }
-    undo_push();
+    int n = obj_load(p, &ms, &names);
+    if (n < 0) {
+        snprintf(b, sizeof b, "Could not read %s", p);
+        MessageBoxA(hMain, b, APP_NAME, MB_ICONERROR);
+        return;
+    }
+    undo_push(replace ? "Open" : "Import");
+    if (replace) {
+        for (int i = 0; i < nob; i++) mesh_free(&ob[i].m);
+        nob = 0;
+    }
     set_mode(M_OBJ);
     clear_sel();
     for (int i = 0; i < n; i++) {
         Obj *o = obj_new(names[i]);
         o->m = ms[i];
-        o->sel = 1;
+        o->sel = !replace;
         o->order = ++stamp;
     }
     free(ms);
     free(names);
-    snprintf(g_msg, sizeof g_msg, "Imported %d object(s)", n);
+    if (replace) {
+        snprintf(g_path, sizeof g_path, "%s", p);
+        modified = 0;
+        recent_add(p);
+        geo_changed();
+        frame(1);
+    }
+    const char *fn = strrchr(p, '\\') ? strrchr(p, '\\') + 1 : p;
+    snprintf(b, sizeof b, "%s %d object(s) from %s", replace ? "Opened" : "Imported", n, fn);
+    msg(b);
+}
+
+/* ---- recent files (File > Open Recent), kept in the registry as Recent0..4 */
+
+#define NRECENT 5
+static char recent[NRECENT][MAX_PATH];
+static HMENU hRecentMenu;
+
+static void recent_menu(void)
+{
+    if (!hRecentMenu) return;
+    while (GetMenuItemCount(hRecentMenu) > 0) DeleteMenu(hRecentMenu, 0, MF_BYPOSITION);
+    for (int i = 0; i < NRECENT; i++) {
+        if (!recent[i][0]) continue;
+        char b[MAX_PATH + 8];
+        snprintf(b, sizeof b, "&%d  %s", i + 1, recent[i]);
+        AppendMenuA(hRecentMenu, MF_STRING, CM_RECENT + i, b);
+    }
+    if (!recent[0][0]) AppendMenuA(hRecentMenu, MF_STRING | MF_GRAYED, 0, "(none yet)");
+}
+
+static void recent_load(void)
+{
+    for (int i = 0; i < NRECENT; i++) {
+        char k[16];
+        sprintf(k, "Recent%d", i);
+        if (!reg_get(k, REG_SZ, recent[i], MAX_PATH)) recent[i][0] = 0;
+    }
+}
+
+static void recent_add(const char *path)
+{
+    int j = NRECENT - 1;
+    for (int i = 0; i < NRECENT; i++)
+        if (!lstrcmpiA(recent[i], path)) j = i;
+    memmove(recent[1], recent[0], j * MAX_PATH);
+    snprintf(recent[0], MAX_PATH, "%s", path);
+    for (int i = 0; i < NRECENT; i++) {
+        char k[16];
+        sprintf(k, "Recent%d", i);
+        reg_set(k, REG_SZ, recent[i], (DWORD)strlen(recent[i]) + 1);
+    }
+    recent_menu();
+}
+
+/* ---- autosave: every minute while there are unexported changes, to
+   %LOCALAPPDATA%\tuff3d\autosave-<process id>-<start time>.obj, deleted on a normal exit. A file
+   left behind by a process that is no longer running means a crash, and is offered back on start.
+   (The start time keeps a new process that reuses an old process id from clobbering its file.) */
+
+static unsigned autosaveStamp;
+
+static int autosave_dir(char *out)
+{
+    char base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base);
+    if (!n || n >= sizeof base) return 0;
+    snprintf(out, MAX_PATH, "%s\\" APP_NAME, base);
+    CreateDirectoryA(out, NULL);
+    return 1;
+}
+
+static void autosave_path(char *out)
+{
+    char d[MAX_PATH];
+    out[0] = 0;
+    static DWORD started;
+    if (!started) started = GetTickCount() | 1;
+    if (autosave_dir(d)) snprintf(out, MAX_PATH, "%s\\autosave-%lu-%lu.obj", d, GetCurrentProcessId(), started);
+}
+
+static void autosave_tick(void)
+{
+    char p[MAX_PATH];
+    if (!modified || editStamp == autosaveStamp || dk != D_NONE) return;
+    autosave_path(p);
+    if (p[0] && save_scene(p, 0) >= 0) autosaveStamp = editStamp;
+}
+
+static void autosave_remove(void)
+{
+    char p[MAX_PATH];
+    autosave_path(p);
+    if (p[0]) DeleteFileA(p);
+}
+
+static void autosave_recover(void)
+{
+    char d[MAX_PATH], pat[MAX_PATH], best[MAX_PATH] = "";
+    FILETIME bt = { 0, 0 };
+    WIN32_FIND_DATAA fd;
+    if (!autosave_dir(d)) return;
+    snprintf(pat, sizeof pat, "%s\\autosave-*.obj", d);
+    HANDLE f = FindFirstFileA(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        DWORD pid = strtoul(fd.cFileName + 9, NULL, 10);
+        HANDLE pr = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        int alive = pr && WaitForSingleObject(pr, 0) == WAIT_TIMEOUT;
+        if (pr) CloseHandle(pr);
+        if (alive && pid != GetCurrentProcessId()) continue;   /* another running tuff3d owns it */
+        char p[MAX_PATH];
+        snprintf(p, sizeof p, "%s\\%s", d, fd.cFileName);
+        if (CompareFileTime(&fd.ftLastWriteTime, &bt) > 0) {
+            if (best[0]) DeleteFileA(best);
+            bt = fd.ftLastWriteTime;
+            strcpy(best, p);
+        } else {
+            DeleteFileA(p);
+        }
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+    if (!best[0]) return;
+    if (MessageBoxA(hMain, "tuff3d did not close normally last time.\n\nRecover the unexported work it autosaved?",
+                    APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        load_file(best, 1);
+        g_path[0] = 0;          /* recovered work is untitled until exported */
+        modified = 1;
+        autosave_tick();        /* safe in our own autosave before the old one goes */
+        msg("Recovered autosaved work - export it to keep it");
+    }
+    DeleteFileA(best);
+}
+
+/* ---- selection tools */
+
+static void cmd_grow(int shrink)
+{
+    if (mode == M_OBJ) { msg(shrink ? "Shrink: switch to a component mode" : "Grow: switch to a component mode"); return; }
+    for (int i = 0; i < nob; i++)
+        for (int k = M_VERT; k <= M_FACE && ob[i].hil; k++)
+            if (shows(k)) mesh_grow(&ob[i].m, k, shrink);
+    msg(shrink ? "Shrank selection" : "Grew selection");
+}
+
+static void cmd_loop(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) {
+        Mesh *m = &ob[i].m;
+        if (!ob[i].hil) continue;
+        unsigned char *was = malloc(m->ne + 1);
+        memcpy(was, m->es, m->ne);
+        for (int e = 0; e < m->ne; e++) if (was[e]) { mesh_edge_loop(m, e); n++; }
+        free(was);
+    }
+    if (n) set_mode(mode == M_MULTI ? M_MULTI : M_EDGE);
+    msg(n ? "Selected edge loops (tip: double-click an edge)" : "Edge Loop: select an edge first, or double-click one");
+}
+
+/* Ctrl+F9/F10/F11: convert the selection to vertices/edges/faces and switch to that mode */
+static void cmd_convert(int to)
+{
+    static const char *nm[] = { "", "vertices", "edges", "faces" };
+    char b[64];
+    if (mode == to) return;
+    if (mode == M_OBJ) {
+        /* objects: their components become the selection */
+        int any = 0;
+        for (int i = 0; i < nob; i++) any |= ob[i].sel;
+        if (!any) { msg("Convert: select something first"); return; }
+        set_mode(to);
+        for (int i = 0; i < nob; i++)
+            if (ob[i].hil) {
+                int n;
+                unsigned char *f = comp_flags(&ob[i], to, &n);
+                memset(f, 1, n);
+            }
+    } else {
+        for (int i = 0; i < nob; i++) {
+            Obj *o = &ob[i];
+            int n;
+            if (!o->hil) continue;
+            unsigned char *dst = comp_flags(o, to, &n), *keep = malloc(n + 1);
+            memcpy(keep, dst, n);
+            if (mode != M_MULTI) memset(keep, 0, n);
+            for (int k = M_VERT; k <= M_FACE; k++) {
+                if (k == to || !shows(k)) continue;
+                mesh_convert(&o->m, k, to);
+                for (int j = 0; j < n; j++) keep[j] |= dst[j];
+            }
+            memcpy(dst, keep, n);
+            free(keep);
+        }
+        set_mode(to);
+    }
+    snprintf(b, sizeof b, "Converted selection to %s", nm[to]);
+    msg(b);
+}
+
+static void cmd_hide(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++)
+        if (active(&ob[i])) { ob[i].hidden = 1; ob[i].sel = ob[i].hil = 0; n++; }
+    char b[64];
+    if (n) snprintf(b, sizeof b, "Hid %d object(s) - Ctrl+Shift+H shows them again", n);
+    msg(n ? b : "Hide: select objects first");
+}
+
+static void cmd_show_all(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) if (ob[i].hidden) { ob[i].hidden = 0; n++; }
+    char b[64];
+    snprintf(b, sizeof b, "Showing %d hidden object(s)", n);
+    msg(n ? b : "Nothing is hidden");
+}
+
+/* ---- Modify menu: bake or reset object transforms */
+
+enum { XF_FREEZE, XF_CENTER, XF_RESET };
+
+static void cmd_transform(int what)
+{
+    static const char *names[] = { "Freeze Transformations", "Center Pivot", "Reset Transformations" };
+    int any = 0;
+    for (int i = 0; i < nob; i++) any |= active(&ob[i]);
+    if (!any) { msg("Select objects first"); return; }
+    undo_push(names[what]);
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        Mesh *m = &o->m;
+        if (!active(o)) continue;
+        M4 M = obj_mat(o);
+        if (what == XF_FREEZE) {
+            /* bake into the vertices; a mirrored scale also flips the winding */
+            for (int v = 0; v < m->nv; v++) m->p[v] = m4_pt(M, m->p[v]);
+            if (o->s.x * o->s.y * o->s.z < 0) mesh_flip(m);
+            o->t = o->r = v3(0, 0, 0);
+            o->s = v3(1, 1, 1);
+            o->prim.type = PRIM_NONE;
+        } else if (what == XF_CENTER) {
+            V3 lo = v3(1e30f, 1e30f, 1e30f), hi = v3(-1e30f, -1e30f, -1e30f);
+            for (int v = 0; v < m->nv; v++) {
+                lo = v3(fminf(lo.x, m->p[v].x), fminf(lo.y, m->p[v].y), fminf(lo.z, m->p[v].z));
+                hi = v3(fmaxf(hi.x, m->p[v].x), fmaxf(hi.y, m->p[v].y), fmaxf(hi.z, m->p[v].z));
+            }
+            V3 c = v3mul(v3add(lo, hi), 0.5f);
+            if (v3len(c) < 1e-6f) continue;
+            for (int v = 0; v < m->nv; v++) m->p[v] = v3sub(m->p[v], c);
+            o->t = m4_pt(M, c);
+            o->prim.type = PRIM_NONE;
+        } else {
+            o->t = o->r = v3(0, 0, 0);
+            o->s = v3(1, 1, 1);
+        }
+    }
+    msg(names[what]);
 }
 
 static void cmd_set_color(void)
@@ -1601,50 +2044,61 @@ static void cmd_set_color(void)
 
 static const char *HELP_TEXT =
     "Navigation (Maya)\n"
-    "  Alt + LMB drag\tTumble\n"
-    "  Alt + MMB drag\tTrack (pan)\n"
-    "  Alt + RMB drag / wheel\tDolly (zoom)\n"
-    "  F / A\tFrame selected / frame all\n\n"
+    "  Alt + LMB / MMB / RMB drag\tOrbit / pan / zoom\n"
+    "  Wheel\tZoom\n"
+    "  F / A / Home\tFrame selected / frame all / home view\n"
+    "  Click X, Y or Z on the corner gizmo\tLook down that axis (again: other side)\n\n"
     "Selection\n"
-    "  Click / drag\tSelect (marquee)\n"
-    "  Shift / Ctrl / Ctrl+Shift\tToggle / deselect / add\n"
-    "  RMB\tComponent mode menu\n"
-    "  F8 / F9 / F10 / F11\tObject / vertex / edge / face\n"
-    "  F7\tMulti: verts, edges and faces at once\n"
+    "  Click / drag\tSelect / box select (red highlight = what a click picks)\n"
+    "  Shift / Ctrl / Ctrl+Shift\tToggle / remove / add\n"
+    "  RMB on an object\tComponent mode menu\n"
+    "  F8 / F9 / F10 / F11 / F7\tObject / vertex / edge / face / multi\n"
+    "  Ctrl+F9 / F10 / F11\tConvert selection to vertices / edges / faces\n"
+    "  Double-click an edge\tSelect its edge loop\n"
+    "  > / <\tGrow / shrink selection\n"
     "  Ctrl+Shift+A / Ctrl+Shift+I\tSelect all / invert\n\n"
     "Tools\n"
     "  Q W E R\tSelect / move / rotate / scale\n"
-    "  Manip handles\tAxis = 1 axis, square = 2 axes, center = all 3\n"
-    "  Ctrl + drag axis\tMove/scale on the other 2 axes\n"
+    "  Handles\tArrow = 1 axis, square = 2 axes, center = all / view plane\n"
+    "  Ctrl + drag arrow\tMove/scale on the other two axes\n"
     "  MMB drag\tDrag the last used handle\n"
-    "  hold X / hold J\tSnap move to grid / snap rotate 15 deg\n"
-    "  Scale past the pivot\tFlatten components (scale 0)\n"
+    "  hold X / V / J\tSnap to grid / to vertices / rotate in 15 deg steps\n"
+    "  Scale past the center\tFlatten components\n"
+    "  Esc while dragging\tCancel the drag\n"
     "  + / -\tManipulator size\n"
     "  B + LMB drag\tBrush radius (paint tool)\n\n"
     "Edit\n"
     "  Ctrl+E\tExtrude faces / edges\n"
-    "  Ctrl+D\tDuplicate\n"
-    "  Delete\tDelete objects / faces\n"
+    "  Ctrl+D / Delete\tDuplicate / delete\n"
+    "  Ctrl+H / Ctrl+Shift+H\tHide selected / show all\n"
     "  Z, Ctrl+Z / Shift+Z, Ctrl+Y\tUndo / redo\n"
     "  G\tRepeat last command\n"
     "  4 / 5\tWireframe / shaded\n"
-    "  Ctrl+N / Ctrl+O / Ctrl+S\tNew / import OBJ / export OBJ\n"
-    "  Ctrl+A\tToggle side panel";
+    "  Ctrl+N / Ctrl+O / Ctrl+S\tNew / open / export OBJ\n"
+    "  Ctrl+Shift+O\tImport OBJ into the scene\n"
+    "  Ctrl+A\tToggle side panel\n\n"
+    "Side panel: drag a label left/right to scrub its value (Shift fast, Ctrl fine).\n"
+    "Drop .obj files on the window to open them (Shift adds them).";
 
 static void do_cmd(int id)
 {
     g_msg[0] = 0;
     if (id >= CM_THEME && id < CM_THEME + NTHEME) {
         theme_load(id - CM_THEME);
-        theme_save();
+        reg_set_int("Theme", themeIdx);
         theme_window(hMain);
         DrawMenuBar(hMain);
         RedrawWindow(hMain, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
     }
+    if (id >= CM_RECENT && id < CM_RECENT + NRECENT && recent[id - CM_RECENT][0]) {
+        char p[MAX_PATH];
+        strcpy(p, recent[id - CM_RECENT]);
+        load_file(p, 1);
+    }
     switch (id) {
     case CM_NEW:
         if (!confirm_discard()) break;
-        if (nob) undo_push();
+        if (nob) undo_push("New Scene");
         for (int i = 0; i < nob; i++) mesh_free(&ob[i].m);
         nob = 0;
         mode = M_OBJ;
@@ -1652,7 +2106,36 @@ static void do_cmd(int id)
         modified = 0;
         msg("New scene");
         break;
-    case CM_IMPORT: cmd_import(); break;
+    case CM_OPEN: load_file(NULL, 1); break;
+    case CM_IMPORT: load_file(NULL, 0); break;
+    case CM_GROW: cmd_grow(0); break;
+    case CM_SHRINK: cmd_grow(1); break;
+    case CM_LOOP: cmd_loop(); break;
+    case CM_TOVERT: case CM_TOEDGE: case CM_TOFACE: cmd_convert(M_VERT + id - CM_TOVERT); break;
+    case CM_HIDE: cmd_hide(); break;
+    case CM_SHOWALL: cmd_show_all(); break;
+    case CM_FREEZE: cmd_transform(XF_FREEZE); break;
+    case CM_CENTERPIV: cmd_transform(XF_CENTER); break;
+    case CM_RESETXF: cmd_transform(XF_RESET); break;
+    case CM_VFRONT: view_axis(2, 0); break;
+    case CM_VSIDE: view_axis(0, 0); break;
+    case CM_VTOP: view_axis(1, 0); break;
+    case CM_VHOME: {
+        V3 a, b;
+        float d = 10;
+        V3 c = v3(0, 0, 0);
+        if (sel_bbox(&a, &b, 1)) {
+            float r = fmaxf(v3len(v3sub(b, a)) * 0.5f, 0.05f), half = FOVY * 0.5f, hh = atanf(tanf(half) * vw / vh);
+            c = v3mul(v3add(a, b), 0.5f);
+            d = r / sinf(hh < half ? hh : half) * 1.1f;
+        }
+        cam_to(c, d, 0.7854f, 0.46f);
+        toast("Home view");
+        break;
+    }
+    case CM_HUD: hudOn = !hudOn; break;
+    case CM_SNAPGRID: snapGrid = !snapGrid; msg(snapGrid ? "Grid snap on" : "Grid snap off"); break;
+    case CM_SNAPPOINT: snapPoint = !snapPoint; msg(snapPoint ? "Point snap on" : "Point snap off"); break;
     case CM_EXPORT: cmd_export(0, 0); break;
     case CM_EXPORT_AS: cmd_export(1, 0); break;
     case CM_EXPORT_SEL:
@@ -1679,6 +2162,7 @@ static void do_cmd(int id)
     case CM_SETCOL: cmd_set_color(); break;
     case CM_WIRE: wire = 1; break;
     case CM_SHADED: wire = 0; break;
+    case CM_WIRETOG: wire = !wire; break;
     case CM_FRAMESEL: frame(0); break;
     case CM_FRAMEALL: frame(1); break;
     case CM_PANEL: {
@@ -1696,7 +2180,9 @@ static void do_cmd(int id)
         break;
     case CM_HELP: MessageBoxA(hMain, HELP_TEXT, APP_NAME " hotkeys", MB_OK); break;
     }
-    if ((id >= CM_DELETE && id <= CM_MERGE) || id == CM_APPLYCOL) lastCmd = id;
+    if ((id >= CM_DELETE && id <= CM_MERGE) || id == CM_APPLYCOL || id == CM_GROW || id == CM_SHRINK ||
+        (id >= CM_FREEZE && id <= CM_RESETXF))
+        lastCmd = id;
     refresh_all();
 }
 
@@ -1710,7 +2196,7 @@ enum {
     PF_PW, PF_PD, PF_PSW, PF_PSD,
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY
 };
-enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON };
+enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP };
 #define NROW 32
 typedef struct { int kind, id; char label[40]; } Row;
 static Row rows[NROW];
@@ -1773,6 +2259,7 @@ static void fmt_float(char *b, float v)
 static void row_text(int r)
 {
     char b[64] = "";
+    if (rows[r].kind == RK_NAME) { if (panelObj >= 0 && panelObj < nob) SetWindowTextA(rEdit[r], ob[panelObj].name); return; }
     if (rows[r].kind == RK_FLOAT) { float *p = fld_f(rows[r].id); if (p) fmt_float(b, *p); }
     else { int *p = fld_i(rows[r].id); if (p) sprintf(b, "%d", *p); }
     SetWindowTextA(rEdit[r], b);
@@ -1782,7 +2269,7 @@ static void panel_sync(void)
 {
     HWND f = GetFocus();
     for (int r = 0; r < nrows; r++) {
-        if ((rows[r].kind == RK_FLOAT || rows[r].kind == RK_INT) && rEdit[r] != f) row_text(r);
+        if ((rows[r].kind == RK_FLOAT || rows[r].kind == RK_INT || rows[r].kind == RK_NAME) && rEdit[r] != f) row_text(r);
         if (rows[r].kind == RK_BOOL) { int *p = fld_i(rows[r].id); SendMessage(rChk[r], BM_SETCHECK, p && *p ? BST_CHECKED : BST_UNCHECKED, 0); }
     }
     InvalidateRect(hSwatch, NULL, TRUE);
@@ -1805,7 +2292,7 @@ static void panel_build(void)
     Obj *o = lead();
     panelObj = o ? (int)(o - ob) : -1;
     if (o) {
-        add_row(RK_HEAD, 0, o->name);
+        add_row(RK_NAME, 0, "Name");
         for (int i = 0; i < 9; i++) add_row(RK_FLOAT, PF_TX + i, trs[i]);
         if (o->prim.type == PRIM_CUBE) {
             add_row(RK_HEAD, 0, "polyCube");
@@ -1838,6 +2325,9 @@ static void panel_build(void)
         }
     } else {
         add_row(RK_HEAD, 0, "Nothing selected");
+        add_row(RK_TIP, 0, "Click an object to edit it here.");
+        add_row(RK_TIP, 0, "Tip: drag a label left or right");
+        add_row(RK_TIP, 0, "to scrub its value (Shift = fast).");
     }
     add_row(RK_HEAD, 0, "Vertex Color");
     add_row(RK_COLOR, PF_COLOR, "Color");
@@ -1853,17 +2343,21 @@ static void panel_build(void)
     for (int r = 0; r < NROW; r++) {
         int k = r < nrows ? rows[r].kind : 0;
         if (k == RK_HEAD && r) y += pad;
-        if (k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR) {
+        int lab = k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR || k == RK_TIP;
+        if (lab) {
+            int wide = k == RK_HEAD || k == RK_TIP;
             SendMessage(rLab[r], WM_SETFONT, (WPARAM)(k == RK_HEAD ? hBold : hFont), FALSE);
             SetWindowTextA(rLab[r], rows[r].label);
-            MoveWindow(rLab[r], pad, y + (int)(3 * ds), k == RK_HEAD ? W - 2 * pad : lw - 4, rh - (int)(4 * ds), TRUE);
+            MoveWindow(rLab[r], pad, y + (int)(3 * ds), wide ? W - 2 * pad : lw - 4, rh - (int)(4 * ds), TRUE);
         }
-        ShowWindow(rLab[r], k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR ? SW_SHOW : SW_HIDE);
-        if (k == RK_FLOAT || k == RK_INT) {
-            MoveWindow(rEdit[r], pad + lw + 1, y + (int)(2 * ds), ew - 2, rh - 3 - (int)(2 * ds), TRUE);
+        ShowWindow(rLab[r], lab ? SW_SHOW : SW_HIDE);
+        if (k == RK_FLOAT || k == RK_INT || k == RK_NAME) {
+            int x0 = k == RK_NAME ? pad : pad + lw, w = k == RK_NAME ? W - 2 * pad : ew;
+            SendMessage(rEdit[r], WM_SETFONT, (WPARAM)(k == RK_NAME ? hBold : hFont), FALSE);
+            MoveWindow(rEdit[r], x0 + 1, y + (int)(2 * ds), w - 2, rh - 3 - (int)(2 * ds), TRUE);
             row_text(r);
         }
-        ShowWindow(rEdit[r], k == RK_FLOAT || k == RK_INT ? SW_SHOW : SW_HIDE);
+        ShowWindow(rEdit[r], k == RK_FLOAT || k == RK_INT || k == RK_NAME ? SW_SHOW : SW_HIDE);
         if (k == RK_BOOL) {
             SetWindowTextA(rChk[r], rows[r].label);
             MoveWindow(rChk[r], pad + lw, y, ew, rh - 2, TRUE);
@@ -1871,11 +2365,11 @@ static void panel_build(void)
         ShowWindow(rChk[r], k == RK_BOOL ? SW_SHOW : SW_HIDE);
         if (k == RK_COLOR) { MoveWindow(hSwatch, pad + lw + 1, y + 1, ew - 2, rh - 4, TRUE); swatchShown = hSwatch; }
         if (k == RK_BUTTON) { MoveWindow(hApply, pad, y, W - 2 * pad, rh + 2, TRUE); applyShown = hApply; y += 4; }
-        if (k) y += rh;
+        if (k) y += k == RK_TIP ? rh * 3 / 4 : rh;
     }
     ShowWindow(hSwatch, swatchShown ? SW_SHOW : SW_HIDE);
     ShowWindow(hApply, applyShown ? SW_SHOW : SW_HIDE);
-    InvalidateRect(hPanel, NULL, TRUE);
+    RedrawWindow(hPanel, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     panel_sync();
     building = 0;
 }
@@ -1890,37 +2384,66 @@ static void prim_rebuild(Obj *o)
     defPrim[o->prim.type] = o->prim;
 }
 
-static void panel_commit(int r, double v)
+static int panel_get(int r, double *v)
 {
-    Row *row = &rows[r];
-    int id = row->id;
-    if (row->kind == RK_FLOAT) {
-        float *p = fld_f(id);
-        if (!p || fabs(*p - v) < 1e-7) return;
+    if (rows[r].kind == RK_FLOAT) { float *p = fld_f(rows[r].id); if (p) *v = *p; return p != NULL; }
+    if (rows[r].kind == RK_INT || rows[r].kind == RK_BOOL) { int *p = fld_i(rows[r].id); if (p) *v = *p; return p != NULL; }
+    return 0;
+}
+
+/* writes a value with no undo step or refresh (scrubbing calls this on every mouse move) */
+static void panel_set(int r, double v)
+{
+    int id = rows[r].id;
+    if (rows[r].kind == RK_FLOAT) {
         if (id == PF_OPA) { paintOpa = (float)(v < 0 ? 0 : v > 1 ? 1 : v); return; }
         if (id == PF_RAD) { paintRad = (float)(v < 1 ? 1 : v > 2000 ? 2000 : v); return; }
-        undo_push();
         if (id <= PF_SZ) {
             /* channel edits apply to every selected object */
             for (int i = 0; i < nob; i++)
                 if (active(&ob[i]) || i == panelObj) (&ob[i].t.x)[id - PF_TX] = (float)v;
-        } else {
-            *p = (float)v;
-            prim_rebuild(&ob[panelObj]);
+            return;
         }
+        *fld_f(id) = (float)v;
     } else {
-        int *p = fld_i(id);
-        if (!p || *p == (int)v) return;
-        undo_push();
-        *p = (int)v;
-        prim_rebuild(&ob[panelObj]);
+        *fld_i(id) = (int)v;
     }
+    prim_rebuild(&ob[panelObj]);
+}
+
+static int panel_undoable(int r) { return rows[r].id != PF_OPA && rows[r].id != PF_RAD; }
+
+static void panel_commit(int r, double v)
+{
+    double cur;
+    if (!panel_get(r, &cur) || (rows[r].kind == RK_FLOAT ? fabs(cur - v) < 1e-7 : (int)cur == (int)v)) return;
+    if (panel_undoable(r)) undo_push(rows[r].label);
+    panel_set(r, v);
+    refresh_all();
+}
+
+static void panel_rename(int r)
+{
+    char b[64], nm[32];
+    Obj *o = panelObj >= 0 && panelObj < nob ? &ob[panelObj] : NULL;
+    GetWindowTextA(rEdit[r], b, sizeof b);
+    char *p = b;
+    while (*p == ' ') p++;
+    for (char *c = p; *c; c++) if (*c == ' ' || *c == '\t') *c = '_';    /* OBJ names are one word */
+    if (!o || !*p || !strcmp(p, o->name)) { row_text(r); return; }
+    snprintf(nm, sizeof nm, "%s", p);
+    if (name_used(nm)) unique_name(nm, nm);
+    undo_push("Rename");
+    strcpy(o->name, nm);
+    snprintf(b, sizeof b, "Renamed to %s", nm);
+    msg(b);
     refresh_all();
 }
 
 static void panel_commit_edit(int r)
 {
     if (building || r >= nrows) return;
+    if (rows[r].kind == RK_NAME) { panel_rename(r); return; }
     char b[64];
     GetWindowTextA(rEdit[r], b, sizeof b);
     char *end;
@@ -1928,6 +2451,40 @@ static void panel_commit_edit(int r)
     if (end == b) { row_text(r); return; }
     panel_commit(r, v);
     row_text(r);
+}
+
+/* ---- scrubbing: drag a value's label left/right, like Maya's virtual slider */
+
+static struct { int row, x0, pushed; double v0; } scrub = { -1, 0, 0, 0 };
+
+static int scrub_row(int x, int y)
+{
+    POINT pt = { x, y };
+    for (int r = 0; r < nrows; r++) {
+        RECT rc;
+        if ((rows[r].kind != RK_FLOAT && rows[r].kind != RK_INT) || !IsWindowVisible(rLab[r])) continue;
+        GetWindowRect(rLab[r], &rc);
+        MapWindowPoints(NULL, hPanel, (POINT *)&rc, 2);
+        InflateRect(&rc, 0, 2);
+        if (PtInRect(&rc, pt)) return r;
+    }
+    return -1;
+}
+
+static void scrub_move(int x)
+{
+    int id = rows[scrub.row].id, dx = x - scrub.x0;
+    float mul = key(VK_SHIFT) ? 10 : key(VK_CONTROL) ? 0.1f : 1;
+    double step = id >= PF_RX && id <= PF_RZ ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : 0.01;
+    double v = rows[scrub.row].kind == RK_INT ? scrub.v0 + (int)(dx * mul / 6) : scrub.v0 + dx * step * mul;
+    double cur;
+    if (rows[scrub.row].kind == RK_FLOAT) v = round(v * 1000) / 1000;
+    if (!panel_get(scrub.row, &cur) || cur == v) return;
+    if (!scrub.pushed && panel_undoable(scrub.row)) { undo_push(rows[scrub.row].label); scrub.pushed = 1; }
+    panel_set(scrub.row, v);
+    geo_changed();
+    panel_sync();
+    redraw();
 }
 
 static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
@@ -1967,13 +2524,43 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             swatchBrush = CreateSolidBrush(RGB((int)(paintCol.x * 255 + .5f), (int)(paintCol.y * 255 + .5f), (int)(paintCol.z * 255 + .5f)));
             return (LRESULT)swatchBrush;
         }
-        int head = 0;
+        int kind = 0;
         for (int r = 0; r < nrows; r++)
-            if (rLab[r] == (HWND)lp) head = rows[r].kind == RK_HEAD;
-        SetTextColor((HDC)wp, head ? th.head : th.text);
+            if (rLab[r] == (HWND)lp) kind = rows[r].kind;
+        SetTextColor((HDC)wp, kind == RK_HEAD ? th.head : kind == RK_TIP ? mix(th.text, th.ui) : th.text);
         SetBkColor((HDC)wp, th.ui);
         return (LRESULT)brUi;
     }
+    case WM_SETCURSOR: {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(h, &pt);
+        if (LOWORD(lp) == HTCLIENT && (scrub.row >= 0 || scrub_row(pt.x, pt.y) >= 0)) {
+            SetCursor(LoadCursor(NULL, IDC_SIZEWE));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN: {
+        int r = scrub_row((short)LOWORD(lp), (short)HIWORD(lp));
+        if (r < 0 || !panel_get(r, &scrub.v0)) return 0;
+        scrub.row = r;
+        scrub.x0 = (short)LOWORD(lp);
+        scrub.pushed = 0;
+        SetFocus(hView);
+        SetCapture(h);
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (scrub.row >= 0) scrub_move((short)LOWORD(lp));
+        return 0;
+    case WM_LBUTTONUP: case WM_CAPTURECHANGED:
+        if (scrub.row >= 0) {
+            scrub.row = -1;
+            if (GetCapture() == h) ReleaseCapture();
+            refresh_all();
+        }
+        return 0;
     case WM_CTLCOLOREDIT:
         SetTextColor((HDC)wp, th.fieldText);
         SetBkColor((HDC)wp, th.field);
@@ -2041,17 +2628,32 @@ static void panel_create(HINSTANCE inst)
 /* ================================================================ toolbar (shelf) */
 
 /* Every button shows its hotkey under its name, so the toolbar doubles as a cheat sheet. */
-typedef struct { const char *label, *hotkey; int cmd; } Tool;
+typedef struct { const char *label, *hotkey; int cmd; const char *desc; } Tool;
 static const Tool tbItems[] = {
-    { "Select", "Q", CM_TSEL }, { "Move", "W", CM_TMOVE }, { "Rotate", "E", CM_TROT }, { "Scale", "R", CM_TSCALE },
-    { "Paint", "", CM_TPAINT }, { 0 },
-    { "Object", "F8", CM_MOBJ }, { "Vertex", "F9", CM_MVERT }, { "Edge", "F10", CM_MEDGE }, { "Face", "F11", CM_MFACE },
-    { "Multi", "F7", CM_MMULTI }, { 0 },
-    { "Cube", "", CM_CUBE }, { "Cylinder", "", CM_CYL }, { "Sphere", "", CM_SPHERE }, { "Plane", "", CM_PLANE }, { 0 },
-    { "Extrude", "Ctrl+E", CM_EXTRUDE }, { "Merge", "", CM_MERGE }, { "Duplicate", "Ctrl+D", CM_DUP },
-    { "Delete", "Del", CM_DELETE }, { 0 },
-    { "Wire", "4", CM_WIRE }, { "Shaded", "5", CM_SHADED }, { "Frame", "F", CM_FRAMESEL }, { 0 },
-    { "Undo", "Z", CM_UNDO }, { "Redo", "Shift+Z", CM_REDO },
+    { "Select", "Q", CM_TSEL, "Select tool: click or drag a box to select" },
+    { "Move", "W", CM_TMOVE, "Move tool: drag the arrows (1 axis), squares (2 axes) or center" },
+    { "Rotate", "E", CM_TROT, "Rotate tool: drag a ring; hold J for 15 degree steps" },
+    { "Scale", "R", CM_TSCALE, "Scale tool: drag a handle; drag components past the center to flatten them" },
+    { "Paint", "", CM_TPAINT, "Paint vertex colors: drag over a mesh; B + drag sets the brush size" }, { 0 },
+    { "Object", "F8", CM_MOBJ, "Object mode: pick whole objects (F8 toggles object/component)" },
+    { "Vertex", "F9", CM_MVERT, "Vertex mode (Ctrl+F9 converts the selection to vertices)" },
+    { "Edge", "F10", CM_MEDGE, "Edge mode: double-click an edge to select its loop" },
+    { "Face", "F11", CM_MFACE, "Face mode (Ctrl+F11 converts the selection to faces)" },
+    { "Multi", "F7", CM_MMULTI, "Multi mode: vertices, edges and faces at once" }, { 0 },
+    { "Cube", "", CM_CUBE, "Create a polygon cube (edit its size and divisions in the side panel)" },
+    { "Cylinder", "", CM_CYL, "Create a polygon cylinder" },
+    { "Sphere", "", CM_SPHERE, "Create a polygon sphere" },
+    { "Plane", "", CM_PLANE, "Create a polygon plane" }, { 0 },
+    { "Extrude", "Ctrl+E", CM_EXTRUDE, "Extrude the selected faces or edges, then drag the blue handle" },
+    { "Merge", "", CM_MERGE, "Merge the selected vertices to their center" },
+    { "Duplicate", "Ctrl+D", CM_DUP, "Duplicate the selected objects" },
+    { "Delete", "Del", CM_DELETE, "Delete the selected objects or faces" }, { 0 },
+    { "Grid Snap", "X", CM_SNAPGRID, "Toggle snapping moves to the grid (or hold X while dragging)" },
+    { "Point Snap", "V", CM_SNAPPOINT, "Toggle snapping moves onto vertices (or hold V while dragging)" }, { 0 },
+    { "Wireframe", "4 / 5", CM_WIRETOG, "Toggle wireframe (4) and shaded (5) display" },
+    { "Frame", "F", CM_FRAMESEL, "Frame the selection (A frames everything, Home resets the view)" }, { 0 },
+    { "Undo", "Z", CM_UNDO, "Undo the last change" },
+    { "Redo", "Shift+Z", CM_REDO, "Redo" },
 };
 #define NTB ((int)(sizeof tbItems / sizeof *tbItems))
 static RECT tbRc[NTB];
@@ -2062,6 +2664,9 @@ static int tb_on(int cmd)
     if (cmd >= CM_TSEL && cmd <= CM_TPAINT) return tool == cmd - CM_TSEL;
     if (cmd >= CM_MOBJ && cmd <= CM_MMULTI) return mode == cmd - CM_MOBJ;
     if (cmd == CM_WIRE || cmd == CM_SHADED) return wire == (cmd == CM_WIRE);
+    if (cmd == CM_WIRETOG) return wire;
+    if (cmd == CM_SNAPGRID) return snapGrid;
+    if (cmd == CM_SNAPPOINT) return snapPoint;
     return 0;
 }
 
@@ -2069,7 +2674,7 @@ static int tb_on(int cmd)
 static int tb_layout(int W)
 {
     HDC dc = GetDC(hMain);
-    int pad = (int)(4 * ds), gap = (int)(10 * ds), bh = (int)(36 * ds), x = pad, y = pad;
+    int pad = (int)(4 * ds), gap = (int)(7 * ds), bh = (int)(36 * ds), x = pad, y = pad;
     for (int i = 0; i < NTB; i++) {
         if (!tbItems[i].label) { x += gap; SetRectEmpty(&tbRc[i]); continue; }
         SIZE a, b;
@@ -2077,7 +2682,7 @@ static int tb_layout(int W)
         GetTextExtentPoint32A(dc, tbItems[i].label, (int)strlen(tbItems[i].label), &a);
         SelectObject(dc, hSmall);
         GetTextExtentPoint32A(dc, tbItems[i].hotkey, (int)strlen(tbItems[i].hotkey), &b);
-        int w = (a.cx > b.cx ? a.cx : b.cx) + (int)(16 * ds);
+        int w = (a.cx > b.cx ? a.cx : b.cx) + (int)(11 * ds);
         if (x + w > W - pad && x > pad) { x = pad; y += bh + pad; }
         SetRect(&tbRc[i], x, y, x + w, y + bh);
         x += w + 2;
@@ -2150,6 +2755,7 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         int i = tb_hit(x, y);
         if (i != tbHover) {
             tbHover = i;
+            status_text();
             InvalidateRect(h, NULL, FALSE);
             TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
             TrackMouseEvent(&tme);
@@ -2158,6 +2764,7 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     }
     case WM_MOUSELEAVE:
         tbHover = -1;
+        status_text();
         InvalidateRect(h, NULL, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
@@ -2180,23 +2787,51 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
 /* ================================================================ status / refresh */
 
-static void status_update(void)
+/* The status line: mode, tool, selection, then the most useful hint for right now: the toolbar
+   button under the mouse, the live drag amount, what a click would pick, the last message, or how
+   to use the current tool. */
+static void status_text(void)
 {
     static const char *mn[] = { "Object mode", "Vertex mode", "Edge mode", "Face mode", "Multi mode" };
-    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint Vertex Color tool" };
-    int nsel = 0, ncomp = 0, tv = 0, tf = 0;
+    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool" };
+    static const char *hint[] = {
+        "Click to select, drag for a box. Shift: toggle, Ctrl: remove, Ctrl+Shift: add. Alt+drag: orbit/pan/zoom",
+        "Drag a handle to move. Hold X: grid snap, V: point snap, Ctrl+handle: other two axes, Esc: cancel",
+        "Drag a ring to rotate. Hold J: 15 degree steps. Esc cancels the drag",
+        "Drag a handle to scale. Drag components past the center to flatten them. Esc cancels",
+        "Drag over a mesh to paint. B+drag: brush size. Color, opacity and radius are in the side panel",
+    };
+    int nsel = 0, ncomp = 0;
     for (int i = 0; i < nob; i++) {
         nsel += mode == M_OBJ ? ob[i].sel : ob[i].hil;
         if (mode != M_OBJ && ob[i].hil) ncomp += comp_count(&ob[i]);
-        tv += ob[i].m.nv;
-        tf += ob[i].m.nf;
     }
-    char s[400], c[64] = "";
-    if (mode != M_OBJ) snprintf(c, sizeof c, ", %d component(s) selected", ncomp);
-    snprintf(s, sizeof s, "  %s  |  %s  |  %d object(s), %d %s%s  |  %d verts, %d faces%s%s",
-             mn[mode], tn[tool], nob, nsel, mode == M_OBJ ? "selected" : "hilited", c, tv, tf,
-             g_msg[0] ? "  |  " : "", g_msg);
+    char s[600], c[64] = "", h[300] = "";
+    if (mode != M_OBJ) snprintf(c, sizeof c, ", %d component(s)", ncomp);
+    if (tbHover >= 0) {
+        snprintf(h, sizeof h, "%s", tbItems[tbHover].desc);
+    } else if (dk == D_MANIP || (g_msg[0] && GetTickCount() - msgT < 5000)) {
+        snprintf(h, sizeof h, "%s", g_msg);
+    } else if (hvObj >= 0 && hvObj < nob) {
+        static const char *kn[] = { "", "vertex", "edge", "face" };
+        if (hvKind) snprintf(h, sizeof h, "%s  %s %d - click to select it%s", ob[hvObj].name, kn[hvKind], hvIdx,
+                             hvKind == M_EDGE ? ", double-click for its loop" : "");
+        else snprintf(h, sizeof h, "%s - click to %s", ob[hvObj].name, mode == M_OBJ ? "select it" : "edit its components");
+    } else if (mode != M_OBJ && !nsel) {
+        static const char *kn[] = { "", "vertices", "edges", "faces", "components" };
+        snprintf(h, sizeof h, "Click an object to start editing its %s", kn[mode]);
+    } else {
+        snprintf(h, sizeof h, "%s", hint[tool]);
+    }
+    snprintf(s, sizeof s, "  %s  |  %s  |  %d %s%s  |  %s", mn[mode], tn[tool], nsel,
+             mode == M_OBJ ? "selected" : "hilited", c, h);
     SetWindowTextA(hStatus, s);
+}
+
+static void status_update(void)
+{
+    char s[400];
+    status_text();
     const char *fn = g_path[0] ? g_path : "untitled";
     for (const char *c = g_path; *c; c++)
         if (*c == '\\' || *c == '/') fn = c + 1;
@@ -2207,6 +2842,14 @@ static void status_update(void)
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_PANEL, MF_BYCOMMAND | (panelOn ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_HUD, MF_BYCOMMAND | (hudOn ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_SNAPGRID, MF_BYCOMMAND | (snapGrid ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_SNAPPOINT, MF_BYCOMMAND | (snapPoint ? MF_CHECKED : MF_UNCHECKED));
+    char u[64];
+    snprintf(u, sizeof u, nundo ? "&Undo %s\tZ" : "&Undo\tZ", nundo ? undo_s[nundo - 1].what : "");
+    ModifyMenuA(hMenu, CM_UNDO, MF_BYCOMMAND | MF_STRING | (nundo ? 0 : MF_GRAYED), CM_UNDO, u);
+    snprintf(u, sizeof u, nredo ? "&Redo %s\tShift+Z" : "&Redo\tShift+Z", nredo ? redo_s[nredo - 1].what : "");
+    ModifyMenuA(hMenu, CM_REDO, MF_BYCOMMAND | MF_STRING | (nredo ? 0 : MF_GRAYED), CM_REDO, u);
     InvalidateRect(hBar, NULL, FALSE);
     CheckMenuRadioItem(hThemeMenu, CM_THEME, CM_THEME + NTHEME - 1, CM_THEME + themeIdx, MF_BYCOMMAND);
 }
@@ -2238,6 +2881,22 @@ static void draw_grid(void)
     glEnd();
 }
 
+static int gizmoHover = -1;
+
+/* axis label of the corner gizmo under the mouse (0 X, 1 Y, 2 Z) or -1 */
+static int gizmo_hit(int mx, int my)
+{
+    float s = 28 * ds, cx = 42 * ds, cy = vh - 42 * ds;
+    int best = -1;
+    float bd = 10 * ds;
+    for (int i = 0; i < 3; i++) {
+        V3 a = v3(i == 0, i == 1, i == 2);
+        float d = hypotf(cx + v3dot(a, camR) * s * 1.35f - mx, cy - v3dot(a, camU) * s * 1.35f - my);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
 static void draw_axis_gizmo(void)
 {
     static const float col[3][3] = { { .9f, .2f, .2f }, { .3f, .9f, .3f }, { .35f, .5f, 1 } };
@@ -2248,12 +2907,22 @@ static void draw_axis_gizmo(void)
     };
     float s = 28 * ds, cx = 42 * ds, cy = vh - 42 * ds, gs = 4 * ds;
     glLineWidth(1.5f * ds);
+    if (gizmoHover >= 0) {
+        /* clickable: ring the axis label under the cursor */
+        V3 a = v3(gizmoHover == 0, gizmoHover == 1, gizmoHover == 2);
+        float lx = cx + v3dot(a, camR) * s * 1.35f, ly = cy - v3dot(a, camU) * s * 1.35f;
+        glColor3f(1, 1, 0);
+        glBegin(GL_LINE_LOOP);
+        for (int k = 0; k < 20; k++) glVertex2f(lx + 8 * ds * cosf(2 * PI_F * k / 20), ly + 8 * ds * sinf(2 * PI_F * k / 20));
+        glEnd();
+    }
     glBegin(GL_LINES);
     for (int i = 0; i < 3; i++) {
         V3 a = v3(i == 0, i == 1, i == 2);
         float x = cx + v3dot(a, camR) * s, y = cy - v3dot(a, camU) * s;
         float lx = cx + v3dot(a, camR) * s * 1.35f, ly = cy - v3dot(a, camU) * s * 1.35f;
-        glColor3fv(col[i]);
+        if (i == gizmoHover) glColor3f(1, 1, 0);
+        else glColor3fv(col[i]);
         glVertex2f(cx, cy); glVertex2f(x, y);
         for (int k = 0; k < 2; k++) {
             glVertex2f(lx + glyph[i][4 * k] * gs, ly - glyph[i][4 * k + 1] * gs);
@@ -2266,9 +2935,6 @@ static void draw_axis_gizmo(void)
     glLineWidth(1);
 }
 
-static int dk, dkBtn, mx0, my0, curx = -1000, cury = -1000, selMod;
-static float rad0;
-enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH };
 
 /* ---- preselection highlight: what a click would pick, drawn in red like Maya */
 
@@ -2331,8 +2997,139 @@ static void hover_update(int x, int y)
         hvObj = o;
         hvKind = k;
         hvIdx = i;
+        status_text();
         redraw();
     }
+}
+
+/* ---- heads-up text, drawn from GDI font bitmaps (wglUseFontBitmaps) */
+
+static GLuint fontBase;
+static int hudAsc;
+static const float WHITE3[3] = { 1, 1, 1 }, GREY3[3] = { .78f, .78f, .78f }, GOLD3[3] = { 1, .82f, .3f };
+
+static int text_w(const char *s)
+{
+    SIZE z;
+    GetTextExtentPoint32A(hdc, s, (int)strlen(s), &z);
+    return z.cx;
+}
+
+static int textOnBox;   /* drawing over a dark shade_box: keep light text */
+
+/* y is the top of the line; a drop shadow keeps it readable on any background */
+static void text_at(float x, float y, const char *s, const float *rgb, float a)
+{
+    float by = y + hudAsc;
+    if (!fontBase || x < 0 || x > vw - 2 || by < 1 || by > vh - 2) return;
+    int n = (int)strlen(s);
+    /* light viewport backgrounds (Light theme) get dark text with a light shadow */
+    int light = th.bgTop[1] + th.bgBot[1] > 1.1f && !textOnBox;
+    glColor4f(light, light, light, a * (light ? .5f : .7f));
+    glRasterPos2f(x + 1, by + 1);
+    glCallLists(n, GL_UNSIGNED_BYTE, s);
+    if (light) glColor4f(.9f - rgb[0] * .85f, .9f - rgb[1] * .85f, .9f - rgb[2] * .85f, a);
+    else glColor4f(rgb[0], rgb[1], rgb[2], a);
+    glRasterPos2f(x, by);
+    glCallLists(n, GL_UNSIGNED_BYTE, s);
+}
+
+static void shade_box(float x0, float y0, float x1, float y1, float a)
+{
+    glColor4f(0, 0, 0, a);
+    glBegin(GL_QUADS);
+    glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1);
+    glEnd();
+}
+
+static void fmt_int(char *b, int v)
+{
+    char t[24];
+    int n = sprintf(t, "%d", v), o = 0;
+    for (int i = 0; i < n; i++) {
+        if (i && (n - i) % 3 == 0) b[o++] = ',';
+        b[o++] = t[i];
+    }
+    b[o] = 0;
+}
+
+/* scene totals and selected counts, recounted only after a change */
+static struct { unsigned gen; int tot[5], sel[5]; } hc;
+
+static void hud_counts(void)
+{
+    if (hc.gen == geoGen) return;
+    memset(&hc, 0, sizeof hc);
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        Mesh *m = &o->m;
+        if (o->hidden) continue;
+        hc.tot[0] += m->nv; hc.tot[1] += m->ne; hc.tot[2] += m->nf; hc.tot[3] += cache_get(i)->ntri; hc.tot[4]++;
+        hc.sel[4] += active(o);
+        if (mode == M_OBJ || !o->hil) continue;
+        for (int v = 0; v < m->nv && shows(M_VERT); v++) hc.sel[0] += m->vs[v] != 0;
+        for (int e = 0; e < m->ne && shows(M_EDGE); e++) hc.sel[1] += m->es[e] != 0;
+        for (int f = 0; f < m->nf && shows(M_FACE); f++) hc.sel[2] += m->fs[f] != 0;
+    }
+    hc.gen = geoGen;
+}
+
+static void draw_hud(void)
+{
+    static const char *lab[5] = { "Verts", "Edges", "Faces", "Tris", "Objects" };
+    char b[32];
+    hud_counts();
+    float x = 10 * ds, y = 8 * ds, lh = hudAsc * 1.35f, c2 = x + text_w("Objects") + text_w("0,000,000") + 12 * ds;
+    for (int i = 0; i < 5; i++, y += lh) {
+        text_at(x, y, lab[i], GREY3, .9f);
+        fmt_int(b, hc.tot[i]);
+        text_at(c2 - text_w(b), y, b, WHITE3, .95f);
+        int sel = i == 3 ? 0 : hc.sel[i];
+        if (sel) {
+            fmt_int(b, sel);
+            text_at(c2 + 10 * ds, y, b, GOLD3, 1);
+        }
+    }
+}
+
+/* centered tips while the scene is empty */
+static void draw_empty_hint(void)
+{
+    static const char *lines[] = {
+        "Empty scene",
+        "Make something with Cube, Cylinder, Sphere or Plane in the toolbar,",
+        "or drop an .obj file here (Ctrl+O opens one).",
+        "",
+        "Alt + left drag: orbit     Alt + middle drag: pan     Alt + right drag / wheel: zoom",
+        "F1: every hotkey",
+    };
+    float lh = hudAsc * 1.5f, y = vh * 0.5f - lh * 3;
+    for (int i = 0; i < 6; i++, y += lh)
+        text_at((vw - text_w(lines[i])) * 0.5f, y, lines[i], i ? GREY3 : WHITE3, i ? .85f : 1);
+}
+
+static void draw_toast(void)
+{
+    DWORD age = GetTickCount() - toastT;
+    if (!toastS[0] || age >= TOAST_MS) return;
+    float a = age < TOAST_MS - 500 ? 1 : (TOAST_MS - age) / 500.0f;
+    float w = (float)text_w(toastS), x = (vw - w) * 0.5f, y = vh - 70 * ds, p = 8 * ds;
+    shade_box(x - p * 1.5f, y - p, x + w + p * 1.5f, y + hudAsc + p, .6f * a);
+    textOnBox = 1;
+    text_at(x, y, toastS, WHITE3, a);
+    textOnBox = 0;
+}
+
+/* live move/rotate/scale amount beside the cursor */
+static void draw_drag_label(void)
+{
+    if (dk != D_MANIP || !g_msg[0]) return;
+    float x = curx + 18 * ds, y = cury + 18 * ds, w = (float)text_w(g_msg), p = 4 * ds;
+    if (x + w + p > vw) x = curx - 18 * ds - w;
+    shade_box(x - p, y - p, x + w + p, y + hudAsc + p, .55f);
+    textOnBox = 1;
+    text_at(x, y, g_msg, WHITE3, 1);
+    textOnBox = 0;
 }
 
 static HCURSOR view_cursor(void)
@@ -2342,6 +3139,7 @@ static HCURSOR view_cursor(void)
     else if (dk == D_PAN) c = IDC_HAND;
     else if (dk == D_DOLLY) c = IDC_SIZENS;
     else if (dk == D_MARQ || tool == T_PAINT) c = IDC_CROSS;
+    else if (gizmoHover >= 0) c = IDC_HAND;
     return LoadCursor(NULL, c);
 }
 
@@ -2381,6 +3179,7 @@ static void render(void)
         Mesh *m = &o->m;
         M4 M = obj_mat(o);
         int hil = mode != M_OBJ && o->hil;
+        if (o->hidden) continue;
         glPushMatrix();
         glMultMatrixf(M.m);
         if (!wire) {
@@ -2485,6 +3284,24 @@ static void render(void)
         for (int k = 0; k < 48; k++) glVertex2f(cx + r * cosf(2 * PI_F * k / 48), cy + r * sinf(2 * PI_F * k / 48));
         glEnd();
     }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (dk == D_MANIP && snapOn && tool == T_MOVE) {
+        float sx, sy, r = 7 * ds;
+        if (proj(snapAt, &sx, &sy, NULL)) {
+            glColor3f(1, 1, 0);
+            glLineWidth(2);
+            glBegin(GL_LINE_LOOP);
+            glVertex2f(sx - r, sy - r); glVertex2f(sx + r, sy - r); glVertex2f(sx + r, sy + r); glVertex2f(sx - r, sy + r);
+            glEnd();
+            glLineWidth(1);
+        }
+    }
+    if (hudOn) draw_hud();
+    if (!nob) draw_empty_hint();
+    draw_drag_label();
+    draw_toast();
+    glDisable(GL_BLEND);
     draw_axis_gizmo();
     SwapBuffers(hdc);
 }
@@ -2536,6 +3353,32 @@ static void end_drag(int cancel)
     SetCursor(view_cursor());
 }
 
+/* Esc while dragging: put everything back as it was when the drag started */
+static void cancel_drag(void)
+{
+    if ((dk == D_MANIP && dg.dirty) || (dk == D_PAINT && ps.dirty)) {
+        snap_restore(&undo_s[--nundo]);
+        dg.dirty = ps.dirty = 0;
+    }
+    end_drag(1);
+    msg("Cancelled");
+}
+
+/* double-click an edge: select its edge loop. Returns 0 when it was not on an edge. */
+static int dbl_click(int x, int y)
+{
+    if (!shows(M_EDGE) || key(VK_MENU) || tool == T_PAINT) return 0;
+    int o, k, i;
+    cam_update();
+    if (!pick_comp(x, y, &o, &k, &i) || k != M_EDGE) return 0;
+    if (!key(VK_SHIFT) && !key(VK_CONTROL)) clear_sel();
+    char b[64];
+    snprintf(b, sizeof b, "Edge loop: %d edges", mesh_edge_loop(&ob[o].m, i));
+    msg(b);
+    refresh_all();
+    return 1;
+}
+
 static void handle_key(WPARAM wp)
 {
     int ctrl = key(VK_CONTROL), shift = key(VK_SHIFT), id = 0;
@@ -2550,21 +3393,30 @@ static void handle_key(WPARAM wp)
     case '4': id = CM_WIRE; break;
     case '5': id = CM_SHADED; break;
     case VK_F8: id = mode == M_OBJ ? CM_MOBJ + lastComp : CM_MOBJ; break;
-    case VK_F9: id = CM_MVERT; break;
-    case VK_F10: id = CM_MEDGE; break;
-    case VK_F11: id = CM_MFACE; break;
+    case VK_F9: id = ctrl ? CM_TOVERT : CM_MVERT; break;
+    case VK_F10: id = ctrl ? CM_TOEDGE : CM_MEDGE; break;
+    case VK_F11: id = ctrl ? CM_TOFACE : CM_MFACE; break;
     case VK_F7: id = CM_MMULTI; break;
     case 'Z': id = shift ? CM_REDO : CM_UNDO; break;
     case 'Y': if (ctrl) id = CM_REDO; break;
     case 'D': if (ctrl) id = CM_DUP; break;
     case 'N': if (ctrl) id = CM_NEW; break;
-    case 'O': if (ctrl) id = CM_IMPORT; break;
+    case 'O': if (ctrl) id = shift ? CM_IMPORT : CM_OPEN; break;
+    case 'H': if (ctrl) id = shift ? CM_SHOWALL : CM_HIDE; break;
+    case VK_OEM_PERIOD: id = CM_GROW; break;
+    case VK_OEM_COMMA: id = CM_SHRINK; break;
+    case VK_HOME: id = CM_VHOME; break;
     case 'S': if (ctrl) id = shift ? CM_EXPORT_AS : CM_EXPORT; break;
     case 'G': id = CM_REPEAT; break;
     case VK_F1: id = CM_HELP; break;
     case VK_DELETE: case VK_BACK: id = CM_DELETE; break;
-    case VK_OEM_PLUS: case VK_ADD: manipSize *= 1.15f; redraw(); break;
-    case VK_OEM_MINUS: case VK_SUBTRACT: manipSize /= 1.15f; redraw(); break;
+    case VK_OEM_PLUS: case VK_ADD: case VK_OEM_MINUS: case VK_SUBTRACT: {
+        char b[48];
+        manipSize *= wp == VK_OEM_PLUS || wp == VK_ADD ? 1.15f : 1 / 1.15f;
+        snprintf(b, sizeof b, "Manipulator size %d%%", (int)(manipSize * 100 + .5f));
+        toast(b);
+        break;
+    }
     }
     if (id) do_cmd(id);
 }
@@ -2586,8 +3438,19 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         hdc = GetDC(h);
         SetPixelFormat(hdc, ChoosePixelFormat(hdc, &pfd), &pfd);
         wglMakeCurrent(hdc, wglCreateContext(hdc));
+        TEXTMETRICA tm;
+        SelectObject(hdc, hHud);
+        GetTextMetricsA(hdc, &tm);
+        hudAsc = tm.tmAscent;
+        fontBase = glGenLists(96);
+        if (!wglUseFontBitmapsA(hdc, 32, 96, fontBase) && !wglUseFontBitmapsA(hdc, 32, 96, fontBase)) fontBase = 0;
+        glListBase(fontBase - 32);
         return 0;
     }
+    case WM_TIMER:
+        if (!anim_step()) { KillTimer(h, 1); animOn = 0; }
+        redraw();
+        return 0;
     case WM_SIZE:
         vw = LOWORD(lp) > 0 ? LOWORD(lp) : 1;
         vh = HIWORD(lp) > 0 ? HIWORD(lp) : 1;
@@ -2602,12 +3465,24 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         EndPaint(h, &p);
         return 0;
     }
-    case WM_LBUTTONDOWN: case WM_MBUTTONDOWN: case WM_RBUTTONDOWN: {
+    case WM_LBUTTONDBLCLK:
+        if (dk == D_NONE && dbl_click(x, y)) return 0;   /* otherwise it is just another click */
+        /* fall through */
+    case WM_LBUTTONDOWN: case WM_MBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDBLCLK: case WM_RBUTTONDBLCLK: {
         SetFocus(h);
         if (dk != D_NONE) return 0;
-        int btn = m == WM_LBUTTONDOWN ? 0 : m == WM_MBUTTONDOWN ? 1 : 2;
+        int btn = m == WM_LBUTTONDOWN || m == WM_LBUTTONDBLCLK ? 0 : m == WM_MBUTTONDOWN || m == WM_MBUTTONDBLCLK ? 1 : 2;
         mx0 = curx = x;
         my0 = cury = y;
+        cam_update();
+        if (btn == 0 && !key(VK_MENU) && gizmo_hit(x, y) >= 0) {
+            /* corner gizmo: look down that axis; click again for the opposite side */
+            int a = gizmo_hit(x, y);
+            V3 ax = v3(a == 0, a == 1, a == 2);
+            view_axis(a, v3dot(camF, ax) < -0.99f);
+            return 0;
+        }
+        tween.on = 0;
         if (key(VK_MENU)) {
             dk = btn == 0 ? D_TUMBLE : btn == 1 ? D_PAN : D_DOLLY;
         } else if (btn == 2) {
@@ -2665,7 +3540,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         case D_PEND:
             if (abs(x - mx0) > 3 || abs(y - my0) > 3) { dk = D_MARQ; SetCursor(view_cursor()); }
             break;
-        case D_MANIP: drag_move(x, y); panel_sync(); status_update(); break;
+        case D_MANIP: drag_move(x, y); panel_sync(); status_text(); break;
         case D_PAINT: paint_dab(x, y); break;
         case D_BRUSH:
             paintRad = rad0 + (x - mx0) / ds;
@@ -2681,7 +3556,10 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
                 int hh = manip_hit(x, y);
                 if (hh != hover) { hover = hh; redraw(); }
             }
-            hover_update(x, y);
+            cam_update();
+            int gh = gizmo_hit(x, y);
+            if (gh != gizmoHover) { gizmoHover = gh; SetCursor(view_cursor()); redraw(); }
+            hover_update(gh >= 0 ? -10000 : x, y);
             if (tool == T_PAINT) redraw();
             return 0;
         }
@@ -2698,6 +3576,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_MOUSELEAVE:
         tracking = 0;
+        gizmoHover = -1;
         curx = cury = -1000;
         hover_update(-10000, 0);
         if (tool == T_PAINT) redraw();
@@ -2706,10 +3585,12 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         if (LOWORD(lp) == HTCLIENT) { SetCursor(view_cursor()); return TRUE; }
         break;
     case WM_MOUSEWHEEL:
+        tween.on = 0;
         dist *= powf(0.88f, (short)HIWORD(wp) / 120.0f);
         redraw();
         return 0;
     case WM_KEYDOWN:
+        if (wp == VK_ESCAPE && dk != D_NONE) { cancel_drag(); return 0; }
         if (!(lp & (1 << 30)) && dk == D_NONE) handle_key(wp);
         return 0;
     case WM_SYSKEYDOWN:
@@ -2733,7 +3614,10 @@ static HMENU build_menu(void)
     HMENU bar = CreateMenu(), m;
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_NEW, "&New Scene\tCtrl+N");
-    AppendMenuA(m, MF_STRING, CM_IMPORT, "&Import OBJ...\tCtrl+O");
+    AppendMenuA(m, MF_STRING, CM_OPEN, "&Open OBJ...\tCtrl+O");
+    hRecentMenu = CreatePopupMenu();
+    AppendMenuA(m, MF_POPUP, (UINT_PTR)hRecentMenu, "Open &Recent");
+    AppendMenuA(m, MF_STRING, CM_IMPORT, "&Import OBJ (add to scene)...\tCtrl+Shift+O");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_EXPORT, "&Export OBJ\tCtrl+S");
     AppendMenuA(m, MF_STRING, CM_EXPORT_AS, "Export OBJ &As...\tCtrl+Shift+S");
@@ -2748,6 +3632,9 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_DELETE, "&Delete\tDel");
     AppendMenuA(m, MF_STRING, CM_DUP, "Dupli&cate\tCtrl+D");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_HIDE, "&Hide Selected\tCtrl+H");
+    AppendMenuA(m, MF_STRING, CM_SHOWALL, "Sh&ow All\tCtrl+Shift+H");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Edit");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_CUBE, "Polygon &Cube");
@@ -2764,11 +3651,26 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_SELALL, "Select &All\tCtrl+Shift+A");
     AppendMenuA(m, MF_STRING, CM_SELINV, "&Invert Selection\tCtrl+Shift+I");
+    AppendMenuA(m, MF_STRING, CM_GROW, "&Grow Selection\t>");
+    AppendMenuA(m, MF_STRING, CM_SHRINK, "S&hrink Selection\t<");
+    AppendMenuA(m, MF_STRING, CM_LOOP, "Edge &Loop\tdouble-click edge");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_TOVERT, "Convert to Ve&rtices\tCtrl+F9");
+    AppendMenuA(m, MF_STRING, CM_TOEDGE, "Convert to E&dges\tCtrl+F10");
+    AppendMenuA(m, MF_STRING, CM_TOFACE, "Convert to Fa&ces\tCtrl+F11");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Select");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_EXTRUDE, "&Extrude\tCtrl+E");
     AppendMenuA(m, MF_STRING, CM_MERGE, "&Merge to Center");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Mesh");
+    m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING, CM_FREEZE, "&Freeze Transformations");
+    AppendMenuA(m, MF_STRING, CM_CENTERPIV, "&Center Pivot");
+    AppendMenuA(m, MF_STRING, CM_RESETXF, "&Reset Transformations");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_SNAPGRID, "Snap to &Grid\thold X");
+    AppendMenuA(m, MF_STRING, CM_SNAPPOINT, "Snap to &Point\thold V");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "Mo&dify");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_TSEL, "&Select Tool\tQ");
     AppendMenuA(m, MF_STRING, CM_TMOVE, "&Move Tool\tW");
@@ -2787,6 +3689,12 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_FRAMESEL, "&Frame Selected\tF");
     AppendMenuA(m, MF_STRING, CM_FRAMEALL, "Frame &All\tA");
     AppendMenuA(m, MF_STRING, CM_PANEL, "Side &Panel\tCtrl+A");
+    AppendMenuA(m, MF_STRING, CM_HUD, "&Heads-Up Display (poly count)");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_VHOME, "&Home View\tHome");
+    AppendMenuA(m, MF_STRING, CM_VFRONT, "Fr&ont View");
+    AppendMenuA(m, MF_STRING, CM_VSIDE, "S&ide View");
+    AppendMenuA(m, MF_STRING, CM_VTOP, "&Top View");
     hThemeMenu = CreatePopupMenu();
     for (int i = 0; i < NTHEME; i++) AppendMenuA(hThemeMenu, MF_STRING, CM_THEME + i, themes[i].name);
     AppendMenuA(m, MF_POPUP, (UINT_PTR)hThemeMenu, "&Theme");
@@ -2844,12 +3752,48 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         if (!th.sys) menubar_line(h);
         return r;
     }
+    case WM_DROPFILES: {
+        /* drop an .obj: open it (hold Shift to add it to the scene instead) */
+        char p[MAX_PATH];
+        HDROP hd = (HDROP)wp;
+        UINT n = DragQueryFileA(hd, 0xFFFFFFFF, NULL, 0);
+        int add = key(VK_SHIFT);
+        for (UINT i = 0; i < n; i++)
+            if (DragQueryFileA(hd, i, p, sizeof p)) {
+                load_file(p, !add && i == 0);
+                if (!add && i == 0) add = 1;    /* more files join the first one */
+            }
+        DragFinish(hd);
+        SetForegroundWindow(h);
+        refresh_all();
+        return 0;
+    }
+    case WM_TIMER:
+        if (wp == 2) autosave_tick();
+        return 0;
+    case WM_APP: {
+        const char *arg = (const char *)lp;
+        if (arg[0]) load_file(arg, 1);
+        else autosave_recover();
+        refresh_all();
+        return 0;
+    }
     case WM_CLOSE:
         if (!confirm_discard()) return 0;
         break;
-    case WM_DESTROY:
+    case WM_DESTROY: {
+        /* remember the window and display settings for next time */
+        WINDOWPLACEMENT pl;
+        pl.length = sizeof pl;
+        if (GetWindowPlacement(h, &pl)) reg_set("Window", REG_BINARY, &pl, sizeof pl);
+        reg_set_int("Panel", panelOn);
+        reg_set_int("Hud", hudOn);
+        reg_set_int("Wire", wire);
+        reg_set_int("ManipSize", (int)(manipSize * 1000));
+        autosave_remove();
         PostQuitMessage(0);
         return 0;
+    }
     }
     return DefWindowProc(h, m, wp, lp);
 }
@@ -2857,16 +3801,22 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 {
     (void)prev;
-    (void)cmd;
     SetProcessDPIAware();
     HDC sdc = GetDC(NULL);
     ds = GetDeviceCaps(sdc, LOGPIXELSY) / 96.0f;
     ReleaseDC(NULL, sdc);
     if (ds < 1) ds = 1;
     for (int t = 0; t < PRIM_COUNT; t++) prim_defaults(&defPrim[t], t);
-    theme_load(theme_saved());
+    theme_load(reg_int("Theme", 0));
+    panelOn = reg_int("Panel", 1);
+    hudOn = reg_int("Hud", 1);
+    wire = reg_int("Wire", 0);
+    manipSize = reg_int("ManipSize", 1000) / 1000.0f;
+    if (manipSize < .05f || manipSize > 50) manipSize = 1;
+    recent_load();
 
     hFont = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    hHud = CreateFontA(-(int)(13 * ds), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Segoe UI");
     hSmall = CreateFontA(-(int)(11 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     hBold = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
 
@@ -2887,7 +3837,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpfnWndProc = BarProc;
     wc.lpszClassName = "Tuff3DBar";
     RegisterClassExA(&wc);
-    wc.style = CS_OWNDC;
+    wc.style = CS_OWNDC | CS_DBLCLKS;
     wc.lpfnWndProc = ViewProc;
     wc.hbrBackground = NULL;
     wc.lpszClassName = "Tuff3DView";
@@ -2904,13 +3854,32 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     SendMessage(hStatus, WM_SETFONT, (WPARAM)hFont, 0);
     panel_create(inst);
     theme_window(hMain);
+    recent_menu();
+    DragAcceptFiles(hMain, TRUE);
+    SetTimer(hMain, 2, 60 * 1000, NULL);
 
-    ShowWindow(hMain, show);
+    WINDOWPLACEMENT pl;
+    if (reg_get("Window", REG_BINARY, &pl, sizeof pl) && pl.length == sizeof pl) {
+        if (pl.showCmd != SW_SHOWMAXIMIZED) pl.showCmd = SW_SHOWNORMAL;
+        SetWindowPlacement(hMain, &pl);
+    } else {
+        ShowWindow(hMain, show);
+    }
     RECT rc;
     GetClientRect(hMain, &rc);
     SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
     SetFocus(hView);
     refresh_all();
+    UpdateWindow(hMain);
+
+    /* a file passed on the command line (Open With, or dropped on the exe), opened once the
+       window has painted, like the crash recovery question */
+    static char arg[MAX_PATH];
+    snprintf(arg, sizeof arg, "%s", cmd[0] == '"' ? cmd + 1 : cmd);
+    char *q = strchr(arg, '"');
+    if (q) *q = 0;
+    for (size_t l = strlen(arg); l && (arg[l - 1] == ' ' || arg[l - 1] == '\t'); ) arg[--l] = 0;
+    PostMessage(hMain, WM_APP, 0, (LPARAM)arg);
 
     MSG msgq;
     while (GetMessage(&msgq, NULL, 0, 0) > 0) {

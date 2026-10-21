@@ -66,6 +66,12 @@ int mesh_merge(Mesh *m, const unsigned char *mask);
 int mesh_delete_faces(Mesh *m);
 int mesh_raycast(const Mesh *m, V3 o, V3 d, float *t);
 
+/* selection helpers; comp is COMP_VERT/EDGE/FACE */
+int mesh_edge_loop(Mesh *m, int e);                 /* adds the loop through edge e, returns its length */
+void mesh_grow(Mesh *m, int comp, int shrink);      /* grow/shrink by one ring of vertex neighbors */
+void mesh_convert(Mesh *m, int from, int to);       /* selection of kind 'from' becomes kind 'to' */
+void mesh_flip(Mesh *m);                            /* reverse every face's winding */
+
 int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names);
 int obj_load(const char *path, Mesh **ms, char (**names)[32]);
 

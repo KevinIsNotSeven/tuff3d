@@ -161,6 +161,69 @@ int main(void)
     }
     mesh_free(&m);
 
+    /* edge loops: middle ring of a 2-high cylinder, a vertical column, a plane border */
+    prim_defaults(&p, PRIM_CYL);
+    p.csides = 12; p.chseg = 3;
+    m = mesh_prim(&p);
+    {
+        int ring = -1, vert = -1;
+        for (int e = 0; e < m.ne; e++) {
+            V3 a = m.p[m.ev[2 * e]], b = m.p[m.ev[2 * e + 1]];
+            if (fabsf(a.y - b.y) < 1e-4f && fabsf(a.y - (-1.0f / 3)) < 1e-3f && ring < 0) ring = e;
+            if (fabsf(a.x - b.x) < 1e-4f && fabsf(a.z - b.z) < 1e-4f && vert < 0) vert = e;
+        }
+        CHECK(ring >= 0 && vert >= 0);
+        CHECK(mesh_edge_loop(&m, ring) == 12);
+        memset(m.es, 0, m.ne);
+        CHECK(mesh_edge_loop(&m, vert) == 3);   /* stops at the 3-valent cap rings */
+        int n = 0;
+        for (int e = 0; e < m.ne; e++) n += m.es[e];
+        CHECK(n == 3);
+    }
+    mesh_free(&m);
+    prim_defaults(&p, PRIM_PLANE);
+    p.psw = p.psd = 3;
+    m = mesh_prim(&p);
+    {
+        int border = -1;
+        for (int e = 0; e < m.ne && border < 0; e++)
+            if (m.ef[2 * e + 1] < 0 && fabsf(m.p[m.ev[2 * e]].x - 0.5f) < 1e-4f && fabsf(m.p[m.ev[2 * e + 1]].x - 0.5f) < 1e-4f) border = e;
+        CHECK(border >= 0 && mesh_edge_loop(&m, border) == 3);
+    }
+    mesh_free(&m);
+
+    /* grow / shrink / convert on a cube */
+    prim_defaults(&p, PRIM_CUBE);
+    m = mesh_prim(&p);
+    {
+        int n = 0;
+        m.vs[0] = 1;
+        mesh_grow(&m, COMP_VERT, 0);
+        for (int v = 0; v < 8; v++) n += m.vs[v];
+        CHECK(n == 4);
+        mesh_grow(&m, COMP_VERT, 1);
+        n = 0;
+        for (int v = 0; v < 8; v++) n += m.vs[v];
+        CHECK(n == 1 && m.vs[0]);
+        mesh_convert(&m, COMP_VERT, COMP_FACE);
+        n = 0;
+        for (int f = 0; f < 6; f++) n += m.fs[f];
+        CHECK(n == 3 && !m.vs[0]);
+        memset(m.fs, 0, 6);
+        m.fs[0] = 1;
+        mesh_convert(&m, COMP_FACE, COMP_EDGE);
+        n = 0;
+        for (int e = 0; e < 12; e++) n += m.es[e];
+        CHECK(n == 4);
+        mesh_convert(&m, COMP_EDGE, COMP_FACE);
+        n = 0;
+        for (int f = 0; f < 6; f++) n += m.fs[f];
+        CHECK(n == 5);   /* the face and its 4 neighbors */
+        mesh_flip(&m);
+        CHECK(closed_oriented(&m) && volume(&m) < -0.99f);
+    }
+    mesh_free(&m);
+
     /* plane: grid of up-facing quads, open border, extrudable */
     prim_defaults(&p, PRIM_PLANE);
     p.psw = 3; p.psd = 2;

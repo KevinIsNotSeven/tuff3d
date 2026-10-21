@@ -565,6 +565,158 @@ int mesh_raycast(const Mesh *m, V3 o, V3 d, float *tout)
     return best;
 }
 
+/* ---------------------------------------------------------------- selection helpers */
+
+/* vertex -> incident edges, CSR layout: edges of v are ve[off[v] .. off[v+1]-1] */
+static void vert_edges(const Mesh *m, int **off, int **ve)
+{
+    int *o = xrealloc(NULL, (m->nv + 1) * sizeof(int)), *e = xrealloc(NULL, (2 * m->ne + 1) * sizeof(int));
+    memset(o, 0, (m->nv + 1) * sizeof(int));
+    for (int i = 0; i < 2 * m->ne; i++) o[m->ev[i] + 1]++;
+    for (int v = 0; v < m->nv; v++) o[v + 1] += o[v];
+    int *fill = xrealloc(NULL, (m->nv + 1) * sizeof(int));
+    memcpy(fill, o, (m->nv + 1) * sizeof(int));
+    for (int i = 0; i < 2 * m->ne; i++) e[fill[m->ev[i]]++] = i / 2;
+    free(fill);
+    *off = o;
+    *ve = e;
+}
+
+static int shares_face(const Mesh *m, int a, int b)
+{
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            if (m->ef[2 * a + i] >= 0 && m->ef[2 * a + i] == m->ef[2 * b + j]) return 1;
+    return 0;
+}
+
+/* the edge continuing a loop from edge ce through vertex v, or -1: straight across a 4-valent
+   vertex, or along an open border */
+static int loop_next(const Mesh *m, const int *off, const int *ve, int ce, int v)
+{
+    int border = m->ef[2 * ce + 1] < 0, cand = -1, n = 0;
+    if (!border && off[v + 1] - off[v] != 4) return -1;
+    for (int k = off[v]; k < off[v + 1]; k++) {
+        int x = ve[k];
+        if (x == ce || shares_face(m, x, ce)) continue;
+        if (border && m->ef[2 * x + 1] >= 0) continue;
+        cand = x;
+        n++;
+    }
+    return n == 1 ? cand : -1;
+}
+
+int mesh_edge_loop(Mesh *m, int e)
+{
+    if (e < 0 || e >= m->ne) return 0;
+    int *off, *ve, n = 1;
+    unsigned char *seen = xrealloc(NULL, m->ne + 1);
+    vert_edges(m, &off, &ve);
+    memset(seen, 0, m->ne + 1);
+    seen[e] = 1;
+    for (int side = 0; side < 2; side++) {
+        int ce = e, v = m->ev[2 * e + side];
+        for (;;) {
+            int nx = loop_next(m, off, ve, ce, v);
+            if (nx < 0 || seen[nx]) break;
+            seen[nx] = 1;
+            n++;
+            v = m->ev[2 * nx] == v ? m->ev[2 * nx + 1] : m->ev[2 * nx];
+            ce = nx;
+        }
+    }
+    for (int i = 0; i < m->ne; i++) if (seen[i]) m->es[i] = 1;
+    free(seen);
+    free(off);
+    free(ve);
+    return n;
+}
+
+void mesh_grow(Mesh *m, int comp, int shrink)
+{
+    unsigned char *vm = xrealloc(NULL, m->nv + 1);
+    memset(vm, 0, m->nv + 1);
+    if (!shrink) {
+        mesh_vmask(m, comp, vm);
+        if (comp == COMP_VERT) {
+            for (int e = 0; e < m->ne; e++) {
+                int a = m->ev[2 * e], b = m->ev[2 * e + 1];
+                if (vm[a] || vm[b]) m->vs[a] = m->vs[b] = 1;
+            }
+        } else if (comp == COMP_EDGE) {
+            for (int e = 0; e < m->ne; e++) if (vm[m->ev[2 * e]] || vm[m->ev[2 * e + 1]]) m->es[e] = 1;
+        } else {
+            for (int f = 0; f < m->nf; f++)
+                for (int k = m->fo[f]; k < m->fo[f + 1]; k++) if (vm[m->fi[k]]) m->fs[f] = 1;
+        }
+    } else {
+        /* vm = vertices touched by something unselected; selected parts touching them go */
+        if (comp == COMP_VERT) {
+            for (int e = 0; e < m->ne; e++) {
+                int a = m->ev[2 * e], b = m->ev[2 * e + 1];
+                if (!m->vs[a]) vm[b] = 1;
+                if (!m->vs[b]) vm[a] = 1;
+            }
+            for (int v = 0; v < m->nv; v++) if (vm[v]) m->vs[v] = 0;
+        } else if (comp == COMP_EDGE) {
+            for (int e = 0; e < m->ne; e++) if (!m->es[e]) vm[m->ev[2 * e]] = vm[m->ev[2 * e + 1]] = 1;
+            for (int e = 0; e < m->ne; e++) if (vm[m->ev[2 * e]] || vm[m->ev[2 * e + 1]]) m->es[e] = 0;
+        } else {
+            for (int f = 0; f < m->nf; f++)
+                if (!m->fs[f]) for (int k = m->fo[f]; k < m->fo[f + 1]; k++) vm[m->fi[k]] = 1;
+            for (int f = 0; f < m->nf; f++)
+                for (int k = m->fo[f]; k < m->fo[f + 1]; k++) if (vm[m->fi[k]]) m->fs[f] = 0;
+        }
+    }
+    free(vm);
+}
+
+/* Like Maya: going down (faces to edges/verts, edges to verts) keeps the parts of the selection;
+   going up selects everything touching it (edges to their faces, verts to touching edges/faces). */
+void mesh_convert(Mesh *m, int from, int to)
+{
+    if (from == to) return;
+    unsigned char *vm = xrealloc(NULL, m->nv + 1);
+    mesh_vmask(m, from, vm);
+    if (to == COMP_VERT) {
+        memcpy(m->vs, vm, m->nv);
+    } else if (to == COMP_EDGE) {
+        for (int e = 0; e < m->ne; e++) {
+            int a = vm[m->ev[2 * e]], b = vm[m->ev[2 * e + 1]];
+            if (from == COMP_FACE) {
+                int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1];
+                m->es[e] = (f0 >= 0 && m->fs[f0]) || (f1 >= 0 && m->fs[f1]);
+            } else {
+                m->es[e] = a || b;
+            }
+        }
+    } else {
+        memset(m->fs, 0, m->nf);
+        if (from == COMP_EDGE) {
+            for (int e = 0; e < m->ne; e++)
+                if (m->es[e])
+                    for (int i = 0; i < 2; i++) if (m->ef[2 * e + i] >= 0) m->fs[m->ef[2 * e + i]] = 1;
+        } else {
+            for (int f = 0; f < m->nf; f++)
+                for (int k = m->fo[f]; k < m->fo[f + 1]; k++) if (vm[m->fi[k]]) m->fs[f] = 1;
+        }
+    }
+    if (from == COMP_VERT) memset(m->vs, 0, m->nv);
+    if (from == COMP_EDGE) memset(m->es, 0, m->ne);
+    if (from == COMP_FACE) memset(m->fs, 0, m->nf);
+    free(vm);
+}
+
+void mesh_flip(Mesh *m)
+{
+    for (int f = 0; f < m->nf; f++)
+        for (int a = m->fo[f], b = m->fo[f + 1] - 1; a < b; a++, b--) {
+            int t = m->fi[a];
+            m->fi[a] = m->fi[b];
+            m->fi[b] = t;
+        }
+}
+
 /* ---------------------------------------------------------------- primitives */
 
 void prim_defaults(Prim *p, int type)
