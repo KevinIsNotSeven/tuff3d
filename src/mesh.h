@@ -78,4 +78,11 @@ int mesh_fill_holes(Mesh *m, const unsigned char *touch);
 int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names);
 int obj_load(const char *path, Mesh **ms, char (**names)[32]);
 
+/* build a mesh from plain arrays (face f uses fi[fo[f] .. fo[f+1]-1]); c may be NULL for white */
+Mesh mesh_from_arrays(int nv, const V3 *p, const V3 *c, int nf, const int *fo, const int *fi);
+
+/* Maya LT scene (.mlt): rebuilds each visible mesh from its construction history, in world space.
+   report (optional) receives a short summary of what was rebuilt or skipped. Returns -1 on error. */
+int mlt_load(const char *path, Mesh **ms, char (**names)[32], char *report, int report_size);
+
 #endif

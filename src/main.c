@@ -1720,7 +1720,8 @@ static int file_dlg(int save, char *path)
     memset(&of, 0, sizeof of);
     of.lStructSize = sizeof of;
     of.hwndOwner = hMain;
-    of.lpstrFilter = "Wavefront OBJ (*.obj)\0*.obj\0All files\0*.*\0";
+    of.lpstrFilter = save ? "Wavefront OBJ (*.obj)\0*.obj\0All files\0*.*\0"
+                          : "3D models (*.obj, *.mlt)\0*.obj;*.mlt\0Wavefront OBJ (*.obj)\0*.obj\0Maya LT scene (*.mlt)\0*.mlt\0All files\0*.*\0";
     of.lpstrFile = path;
     of.nMaxFile = MAX_PATH;
     of.lpstrDefExt = "obj";
@@ -1749,11 +1750,13 @@ static int save_scene(const char *path, int selOnly)
     return ok ? n : -1;
 }
 
+static char g_suggest[MAX_PATH];   /* default export name for a scene that has no OBJ path yet */
+
 static void cmd_export(int ask, int selOnly)
 {
     char path[MAX_PATH], b[MAX_PATH + 64];
-    strcpy(path, g_path);
-    if ((ask || !path[0]) && !file_dlg(1, path)) return;
+    strcpy(path, g_path[0] ? g_path : g_suggest);
+    if ((ask || !g_path[0]) && !file_dlg(1, path)) return;
     int n = save_scene(path, selOnly);
     if (n < 0) { MessageBoxA(hMain, "Could not write the file.", APP_NAME, MB_ICONERROR); return; }
     if (!selOnly) { strcpy(g_path, path); modified = 0; recent_add(path); }
@@ -1781,22 +1784,24 @@ static void load_file(const char *path, int replace)
     if (path) snprintf(p, sizeof p, "%s", path);
     else if (!file_dlg(0, p)) return;
     const char *ext = strrchr(p, '.');
-    if (ext && (!lstrcmpiA(ext, ".mlt") || !lstrcmpiA(ext, ".mb") || !lstrcmpiA(ext, ".ma"))) {
-        /* Maya scenes keep construction history instead of the final mesh, so only Maya can rebuild them */
-        MessageBoxA(hMain,
-                    "tuff3d can't open Maya scene files (.mlt, .mb, .ma) directly: they store the steps that "
-                    "build each model, and only Maya can replay those.\n\n"
-                    "To convert them, run tools\\mlt_convert.py from the tuff3d repository in Maya 2023 or newer "
-                    "(the free trial works). It turns a whole folder of .mlt files into .obj files with their "
-                    "vertex colors, which tuff3d opens.",
+    if (ext && (!lstrcmpiA(ext, ".mb") || !lstrcmpiA(ext, ".ma"))) {
+        MessageBoxA(hMain, "tuff3d reads Maya LT scenes (.mlt) and OBJ files, but not full Maya scenes (.mb, .ma) yet.",
                     APP_NAME, MB_ICONINFORMATION);
         return;
     }
+    /* Maya LT scenes are rebuilt from their construction history */
+    int mlt = ext && !lstrcmpiA(ext, ".mlt");
+    char report[600] = "";
     Mesh *ms;
     char (*names)[32];
-    int n = obj_load(p, &ms, &names);
-    if (n < 0) {
-        snprintf(b, sizeof b, "Could not read %s", p);
+    int n = mlt ? mlt_load(p, &ms, &names, report, sizeof report) : obj_load(p, &ms, &names);
+    if (n <= 0) {
+        if (n == 0) free(ms), free(names);
+        snprintf(b, sizeof b, n < 0 ? "Could not read %s" : "Nothing in %s could be rebuilt yet", p);
+        if (mlt && report[0]) {
+            size_t l = strlen(b);
+            snprintf(b + l, sizeof b - l, "\n\n(%s)\n\nIf you send this file to the tuff3d developer, support for it can be added.", report);
+        }
         MessageBoxA(hMain, b, APP_NAME, MB_ICONERROR);
         return;
     }
@@ -1816,8 +1821,10 @@ static void load_file(const char *path, int replace)
     free(ms);
     free(names);
     if (replace) {
-        snprintf(g_path, sizeof g_path, "%s", p);
-        modified = 0;
+        /* an .mlt opens as an unsaved OBJ scene: Export must never write over the .mlt itself */
+        snprintf(g_path, sizeof g_path, "%s", mlt ? "" : p);
+        snprintf(g_suggest, sizeof g_suggest, "%.*s.obj", ext ? (int)(ext - p) : (int)strlen(p), p);
+        modified = mlt;
         recent_add(p);
         geo_changed();
         frame(1);
@@ -1825,6 +1832,11 @@ static void load_file(const char *path, int replace)
     const char *fn = strrchr(p, '\\') ? strrchr(p, '\\') + 1 : p;
     snprintf(b, sizeof b, "%s %d object(s) from %s", replace ? "Opened" : "Imported", n, fn);
     msg(b);
+    if (mlt && strstr(report, "not supported")) {
+        snprintf(b, sizeof b, "Rebuilt %s from its Maya LT history.\n\n%s\n\nThose steps were skipped, so parts of the model "
+                 "may differ from Maya. If you send this file to the tuff3d developer, support can be added.", fn, report);
+        MessageBoxA(hMain, b, APP_NAME, MB_ICONWARNING);
+    }
 }
 
 /* ---- recent files (File > Open Recent), kept in the registry as Recent0..4 */
@@ -2127,7 +2139,7 @@ static const char *HELP_TEXT =
     "  Ctrl+Shift+O\tImport OBJ into the scene\n"
     "  Ctrl+A\tToggle side panel\n\n"
     "Side panel: drag a label left/right to scrub its value (Shift fast, Ctrl fine).\n"
-    "Drop .obj files on the window to open them (Shift adds them).";
+    "Drop .obj or Maya LT .mlt files on the window to open them (Shift adds them).";
 
 static void do_cmd(int id)
 {
@@ -3149,7 +3161,7 @@ static void draw_empty_hint(void)
     static const char *lines[] = {
         "Empty scene",
         "Make something with Cube, Cylinder, Sphere or Plane in the toolbar,",
-        "or drop an .obj file here (Ctrl+O opens one).",
+        "or drop an .obj or .mlt file here (Ctrl+O opens one).",
         "",
         "Alt + left drag: orbit     Alt + middle drag: pan     Alt + right drag / wheel: zoom",
         "F1: every hotkey",

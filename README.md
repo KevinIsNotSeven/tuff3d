@@ -100,12 +100,32 @@ where they have no default hotkey.
 
 ## Maya LT scenes (.mlt)
 
-Maya LT is discontinued and nothing else reads its `.mlt` scenes. They are Maya's binary scene
-format with scrambled chunk sizes and names, and they store construction history (the steps that
-build a model) rather than the finished mesh, so only Maya can rebuild them. Full Maya 2023 or newer,
-including the free 30-day trial, can load them, and [`tools/mlt_convert.py`](tools/mlt_convert.py)
-converts a whole folder in one go. For every `.mlt` (subfolders included) it writes into a
-`converted` folder:
+Maya LT is discontinued and nothing else reads its `.mlt` scenes, so tuff3d opens them itself:
+File > Open, drag and drop, or `tuff3d.exe "apple c.mlt"`. They are Maya's binary scene format
+with scrambled chunk sizes and names, and they store construction history (the steps that build a
+model) rather than the finished mesh, so tuff3d replays that history to rebuild every visible mesh
+in world space, with its vertex colors. Save (Ctrl+S) then writes an `.obj` next to it; the `.mlt`
+itself is never written to.
+
+Supported history steps: polyCube, polySphere, polyCylinder, polyPlane, Smooth, Extract (chip off),
+Separate, Extrude (faces and edges), tweaks (moved vertices), Delete faces, Combine (unite), Merge
+Vertices and Paint Vertex Color, plus object transforms. UV, normal and soft-edge steps are skipped
+since tuff3d doesn't use them. Limits:
+
+- Steps tuff3d doesn't know yet are skipped, and a warning names them, so the shape may be missing
+  that edit.
+- Meshes saved without history (after Edit > Delete by Type > History) store their points
+  differently and aren't read yet.
+- Smoothing and extrusion number vertices a little differently from Maya, so later moved vertices
+  are matched by position and can land slightly off on complex models.
+
+If a file doesn't open or looks wrong, send it in so support can be added.
+
+### Converting with full Maya
+
+With full Maya 2023 or newer (the free 30-day trial works), [`tools/mlt_convert.py`](tools/mlt_convert.py)
+gives an exact conversion of a whole folder in one go. For every `.mlt` (subfolders included) it
+writes into a `converted` folder:
 
 - `name.obj`: every visible mesh in world space, with vertex colors as `v x y z r g b` (tuff3d reads
   these; Maya's own OBJ exporter drops vertex colors)

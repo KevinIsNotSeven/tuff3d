@@ -565,6 +565,15 @@ int mesh_raycast(const Mesh *m, V3 o, V3 d, float *tout)
     return best;
 }
 
+Mesh mesh_from_arrays(int nv, const V3 *p, const V3 *c, int nf, const int *fo, const int *fi)
+{
+    MB b;
+    mb_init(&b);
+    for (int v = 0; v < nv; v++) mb_vert(&b, p[v], c ? c[v] : v3(1, 1, 1));
+    for (int f = 0; f < nf; f++) mb_face(&b, fi + fo[f], fo[f + 1] - fo[f], 0);
+    return mb_finish(&b);
+}
+
 /* ---------------------------------------------------------------- selection helpers */
 
 /* vertex -> incident edges, CSR layout: edges of v are ve[off[v] .. off[v+1]-1] */
