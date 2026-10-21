@@ -200,6 +200,121 @@ int main(void)
     remove("test_out.obj");
     mesh_free(&m);
 
+    /* multi mask: union of selected verts, edges and faces */
+    prim_defaults(&p, PRIM_CUBE);
+    m = mesh_prim(&p);
+    {
+        unsigned char mask[8];
+        m.vs[0] = 1;
+        m.es[0] = 1;
+        CHECK(mesh_vmask(&m, COMP_MULTI, mask) == 1 + (m.ev[0] != 0) + (m.ev[1] != 0));   /* {0} + edge 0's ends */
+        m.fs[0] = 1;
+        CHECK(mesh_vmask(&m, COMP_MULTI, mask) >= 4);
+        CHECK(mesh_vmask(&m, COMP_FACE, mask) == 4);
+    }
+    mesh_free(&m);
+
+    /* edge loops: middle ring of a 2-high cylinder, a vertical column, a plane border */
+    prim_defaults(&p, PRIM_CYL);
+    p.csides = 12; p.chseg = 3;
+    m = mesh_prim(&p);
+    {
+        int ring = -1, vert = -1;
+        for (int e = 0; e < m.ne; e++) {
+            V3 a = m.p[m.ev[2 * e]], b = m.p[m.ev[2 * e + 1]];
+            if (fabsf(a.y - b.y) < 1e-4f && fabsf(a.y - (-1.0f / 3)) < 1e-3f && ring < 0) ring = e;
+            if (fabsf(a.x - b.x) < 1e-4f && fabsf(a.z - b.z) < 1e-4f && vert < 0) vert = e;
+        }
+        CHECK(ring >= 0 && vert >= 0);
+        CHECK(mesh_edge_loop(&m, ring) == 12);
+        memset(m.es, 0, m.ne);
+        CHECK(mesh_edge_loop(&m, vert) == 3);   /* stops at the 3-valent cap rings */
+        int n = 0;
+        for (int e = 0; e < m.ne; e++) n += m.es[e];
+        CHECK(n == 3);
+    }
+    mesh_free(&m);
+    prim_defaults(&p, PRIM_PLANE);
+    p.psw = p.psd = 3;
+    m = mesh_prim(&p);
+    {
+        int border = -1;
+        for (int e = 0; e < m.ne && border < 0; e++)
+            if (m.ef[2 * e + 1] < 0 && fabsf(m.p[m.ev[2 * e]].x - 0.5f) < 1e-4f && fabsf(m.p[m.ev[2 * e + 1]].x - 0.5f) < 1e-4f) border = e;
+        CHECK(border >= 0 && mesh_edge_loop(&m, border) == 3);
+    }
+    mesh_free(&m);
+
+    /* grow / shrink / convert on a cube */
+    prim_defaults(&p, PRIM_CUBE);
+    m = mesh_prim(&p);
+    {
+        int n = 0;
+        m.vs[0] = 1;
+        mesh_grow(&m, COMP_VERT, 0);
+        for (int v = 0; v < 8; v++) n += m.vs[v];
+        CHECK(n == 4);
+        mesh_grow(&m, COMP_VERT, 1);
+        n = 0;
+        for (int v = 0; v < 8; v++) n += m.vs[v];
+        CHECK(n == 1 && m.vs[0]);
+        mesh_convert(&m, COMP_VERT, COMP_FACE);
+        n = 0;
+        for (int f = 0; f < 6; f++) n += m.fs[f];
+        CHECK(n == 3 && !m.vs[0]);
+        memset(m.fs, 0, 6);
+        m.fs[0] = 1;
+        mesh_convert(&m, COMP_FACE, COMP_EDGE);
+        n = 0;
+        for (int e = 0; e < 12; e++) n += m.es[e];
+        CHECK(n == 4);
+        mesh_convert(&m, COMP_EDGE, COMP_FACE);
+        n = 0;
+        for (int f = 0; f < 6; f++) n += m.fs[f];
+        CHECK(n == 5);   /* the face and its 4 neighbors */
+        mesh_flip(&m);
+        CHECK(closed_oriented(&m) && volume(&m) < -0.99f);
+    }
+    mesh_free(&m);
+
+    /* fill hole: delete a cube face, fill it back, closed again */
+    prim_defaults(&p, PRIM_CUBE);
+    m = mesh_prim(&p);
+    m.fs[2] = 1;
+    mesh_delete_faces(&m);
+    CHECK(m.nf == 5 && !closed_oriented(&m));
+    {
+        unsigned char touch[8] = { 0 };
+        CHECK(mesh_fill_holes(&m, touch) == 0 && m.nf == 5);   /* selection not on the hole */
+        int bv = -1;
+        for (int e = 0; e < m.ne; e++) if (m.ef[2 * e + 1] < 0) bv = m.ev[2 * e];
+        touch[bv] = 1;
+        CHECK(mesh_fill_holes(&m, touch) == 1);
+    }
+    CHECK(m.nf == 6 && closed_oriented(&m) && fabsf(volume(&m) - 1) < 1e-4f);
+    {
+        int sel = 0;
+        for (int f = 0; f < m.nf; f++) sel += m.fs[f];
+        CHECK(sel == 1);
+    }
+    mesh_free(&m);
+    /* a cylinder without caps has two holes */
+    prim_defaults(&p, PRIM_CYL);
+    p.ctop = p.cbot = 0;
+    m = mesh_prim(&p);
+    CHECK(mesh_fill_holes(&m, NULL) == 2 && closed_oriented(&m) && volume(&m) > 0);
+    mesh_free(&m);
+
+    /* plane: grid of up-facing quads, open border, extrudable */
+    prim_defaults(&p, PRIM_PLANE);
+    p.psw = 3; p.psd = 2;
+    m = mesh_prim(&p);
+    CHECK(m.nv == 4 * 3 && m.nf == 6 && m.ne == 3 * 3 + 4 * 2);
+    for (int f = 0; f < m.nf; f++) CHECK(mesh_fnormal(&m, f).y > 0.99f);
+    m.fs[0] = 1;
+    CHECK(mesh_extrude_faces(&m) && m.nf == 6 + 4);
+    mesh_free(&m);
+
     printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
     return fails != 0;
 }
