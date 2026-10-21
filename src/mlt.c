@@ -1122,7 +1122,7 @@ static void g_delete_faces(G *g, const Comps *c)
     free(keep);
 }
 
-/* delete edges: the two faces on each edge become one (the lower numbered face keeps it);
+/* delete edges: the two faces on each edge become one, in the higher numbered face's place;
    clean also removes vertices left with only two edges */
 static void g_delete_edges(G *g, const Comps *c, int clean)
 {
@@ -1146,8 +1146,8 @@ static void g_delete_edges(G *g, const Comps *c, int clean)
         for (int k = 0; k < g->nv; k++) g_vert(&out, g->p[k]);
         for (int k = 0; k < g->ne; k++) g_add_edge(&out, g->ea[k], g->eb[k]);
         for (int f = 0; f < g->nf; f++) {
-            if (f == f1) continue;
-            if (f == f0) g_face(&out, v, ee, n, g->fc[f]);
+            if (f == f0) continue;
+            if (f == f1) g_face(&out, v, ee, n, g->fc[f]);
             else g_face(&out, g->fi + g->fo[f], g->fe + g->fo[f], g_fn(g, f), g->fc[f]);
         }
         free(v); free(ee);
@@ -1895,7 +1895,7 @@ static void repair_selection(Ctx *x, const Node *nd, const G *g, Comps *c, int b
     if (!attr(nd, "cbn") || !attr(nd, "cbx") || !c->n) return;
     M4 ix = attr_m4(nd, "ix");
     V3 lo = attr_v3(nd, "cbn", v3(0, 0, 0)), hi = attr_v3(nd, "cbx", v3(0, 0, 0));
-    float tol = v3len(v3sub(hi, lo)) * 1e-3f + 1e-5f;
+    float tol = v3len(v3sub(hi, lo)) * 0.02f + 1e-5f;   /* only clear misses: positions can drift a little */
     int n = c->type == 'F' ? g->nf : c->type == 'E' ? g->ne : 0;
     if (!n) return;
     int *ef = c->type == 'E' ? g_edge_faces(g) : NULL;
