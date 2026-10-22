@@ -2493,10 +2493,57 @@ static void cmd_combine(void)
     msg(b);
 }
 
-/* Mesh > Separate: each selected object splits into one object per connected piece */
+/* the selected faces leave their object and become a new object of their own (Maya's Extract) */
+static void extract_faces(void)
+{
+    int made = 0, n0 = nob;
+    undo_push("Separate Faces");
+    for (int i = 0; i < n0; i++) {
+        Mesh *m = &ob[i].m;
+        int k = 0;
+        if (!ob[i].hil) continue;
+        for (int f = 0; f < m->nf; f++) k += m->fs[f] != 0;
+        if (!k || k == m->nf) continue;   /* nothing, or the whole object: nothing to split off */
+        unsigned char *keep = malloc(m->nf + 1);
+        for (int f = 0; f < m->nf; f++) keep[f] = !m->fs[f];
+        Mesh part = mesh_subset(m, m->fs), rest = mesh_subset(m, keep);
+        free(keep);
+        mesh_free(m);
+        ob[i].m = rest;
+        ob[i].prim.type = PRIM_NONE;
+        memset(part.fs, 0, part.nf);
+        memset(ob[i].m.fs, 0, ob[i].m.nf);
+        Obj src = ob[i];
+        Obj *o = obj_new(src.name);   /* may move ob */
+        char nm[32];
+        memcpy(nm, o->name, 32);
+        *o = src;
+        memcpy(o->name, nm, 32);
+        o->m = part;
+        o->hil = 1;   /* becomes the selection when we go back to object mode */
+        o->sel = 0;
+        o->order = ++stamp;
+        made++;
+    }
+    if (!made) { undo_drop(); msg("Separate: select some (not all) of an object's faces"); return; }
+    set_mode(M_OBJ);
+    for (int i = 0; i < n0; i++) ob[i].sel = 0;
+    char b[96];
+    snprintf(b, sizeof b, made == 1 ? "Separated the faces into a new object" : "Separated faces into %d new objects", made);
+    msg(b);
+}
+
+/* Mesh > Separate: in face mode the selected faces become their own object; in object mode each
+   selected object splits into one object per connected piece */
 static void cmd_separate(void)
 {
-    if (mode != M_OBJ || !has_sel()) { msg("Separate: select objects (object mode)"); return; }
+    if (mode != M_OBJ && shows(M_FACE)) {
+        int any = 0;
+        for (int i = 0; i < nob; i++)
+            for (int f = 0; ob[i].hil && f < ob[i].m.nf && !any; f++) any = ob[i].m.fs[f];
+        if (any) { extract_faces(); return; }
+    }
+    if (mode != M_OBJ || !has_sel()) { msg("Separate: select objects, or faces to split off (face mode)"); return; }
     int made = 0, *sh = NULL, pushed = 0;
     for (int i = nob - 1; i >= 0; i--) {
         if (!ob[i].sel) continue;
@@ -4671,6 +4718,8 @@ static const Tool tbItems[] = {
     { "Multi-Cut", "", CM_TCUT, "Multi-Cut tool: click points on edges to cut faces; Enter finishes" },
     { "Merge", "", CM_MERGE, "Merge the selected vertices to their center" },
     { "Fill Hole", "", CM_FILLHOLE, "Cap the hole the selection is on (an object: all its holes)" },
+    { "Combine", "", CM_COMBINE, "Combine the selected objects into one" },
+    { "Separate", "", CM_SEPARATE, "Split objects into their loose pieces, or selected faces into a new object" },
     { "Duplicate", "Ctrl+D", CM_DUP, "Duplicate the selected objects" },
     { "Delete", "Del", CM_DELETE, "Delete the selected objects or faces" }, { 0 },
     { "Grid Snap", "X", CM_SNAPGRID, "Toggle snapping moves to the grid (or hold X while dragging)" },
@@ -5779,7 +5828,7 @@ static HMENU build_menu(void)
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Select");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_COMBINE, "&Combine");
-    AppendMenuA(m, MF_STRING, CM_SEPARATE, "&Separate");
+    AppendMenuA(m, MF_STRING, CM_SEPARATE, "&Separate (pieces, or selected faces)");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_MERGEDIST, "&Merge Vertices (by distance)");
     AppendMenuA(m, MF_STRING, CM_FILLHOLE, "&Fill Hole");
