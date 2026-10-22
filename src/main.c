@@ -28,7 +28,7 @@ typedef struct {
 } Obj;
 
 enum { M_OBJ, M_VERT, M_EDGE, M_FACE, M_MULTI };   /* component modes match COMP_* */
-enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT };
+enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, NTOOL };
 enum { H_NONE, H_X, H_Y, H_Z, H_YZ, H_XZ, H_XY, H_C, H_VIEW };
 
 static Obj *ob;
@@ -40,6 +40,7 @@ static int normalFrame;
 static M4 nframe;
 static float manipSize = 1;
 static float defAngle;          /* normal angle for new objects: the last shading picked */
+static float mergeDist = 0.01f;     /* Mesh > Merge Vertices */
 static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
 static char g_path[MAX_PATH];
@@ -49,7 +50,7 @@ static unsigned editStamp;
 static int hvObj = -1, hvKind, hvIdx, tracking, hudOn = 1;
 static int dk, dkBtn, mx0, my0, curx = -1000, cury = -1000, selMod;
 static float rad0;
-enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH };   /* preselection highlight (hvKind 0 = whole object) */
+enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD };   /* preselection highlight (hvKind 0 = whole object) */
 
 static HWND hMain, hView, hPanel, hStatus, hBar;
 static HDC hdc;
@@ -61,6 +62,8 @@ static float ds = 1;
 
 static void refresh_all(void);
 static void status_text(void);
+static int delete_ev(void);
+static void draw_weld(void);
 static void redraw(void) { InvalidateRect(hView, NULL, FALSE); }
 static int key(int vk) { return GetKeyState(vk) < 0; }
 static void toast(const char *s);
@@ -492,6 +495,12 @@ static void undo_push(const char *what)
     editStamp++;
     stack_push(undo_s, &nundo, s);
     while (nredo) snap_free(&redo_s[--nredo]);
+}
+
+/* the step just pushed changed nothing after all: forget it */
+static void undo_drop(void)
+{
+    if (nundo) snap_free(&undo_s[--nundo]);
 }
 
 static void do_undo(void)
@@ -1089,6 +1098,7 @@ static void set_tool(int t)
     if (t != tool) lastHandle = H_NONE;
     tool = t;
     normalFrame = 0;
+    if (t == T_WELD && mode != M_VERT && mode != M_MULTI) set_mode(M_VERT);
 }
 
 /* ================================================================ manipulator */
@@ -1605,13 +1615,14 @@ enum {
     CM_EXTRUDE, CM_MERGE,
     CM_APPLYCOL, CM_SETCOL,
     CM_WIRE, CM_SHADED, CM_HARD, CM_SMOOTH, CM_AUTOSMOOTH, CM_FRAMESEL, CM_FRAMEALL, CM_PANEL,
-    CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT,
+    CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT, CM_TWELD,   /* CM_TSEL + T_* */
     CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE, CM_MMULTI,
     CM_SELALL, CM_SELINV,
     CM_OPEN, CM_GROW, CM_SHRINK, CM_LOOP, CM_TOVERT, CM_TOEDGE, CM_TOFACE,
     CM_HIDE, CM_SHOWALL, CM_FREEZE, CM_CENTERPIV, CM_RESETXF, CM_FILLHOLE,
     CM_VFRONT, CM_VSIDE, CM_VTOP, CM_VHOME, CM_HUD, CM_SNAPGRID, CM_SNAPPOINT, CM_WIRETOG,
     CM_HELP, CM_THEMEPICK, CM_THEMENEXT, CM_THEMEPREV, CM_THEMERAND,
+    CM_REVERSE, CM_TRIANG, CM_QUAD, CM_COMBINE, CM_SEPARATE, CM_MERGEDIST, CM_DELEV,
     CM_RECENT = 300,             /* + recent file index */
     CM_THEME = 200               /* + theme index */
 };
@@ -1767,8 +1778,8 @@ static void cmd_delete(void)
         for (int i = 0; i < nob; i++)
             if (ob[i].hil && mesh_delete_faces(&ob[i].m)) ob[i].prim.type = PRIM_NONE;
         msg("Deleted faces");
-    } else {
-        msg("Delete: select objects or faces");
+    } else if (!delete_ev()) {
+        msg("Delete: select objects, faces, edges or vertices");
     }
 }
 
@@ -1793,6 +1804,166 @@ static void cmd_dup(void)
     msg("Duplicated");
 }
 
+/* Mesh > Combine: the selected objects become one object, in world space */
+static void cmd_combine(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) n += ob[i].sel;
+    if (mode != M_OBJ || n < 2) { msg("Combine: select two or more objects (object mode)"); return; }
+    undo_push("Combine");
+    static const int fo0 = 0;
+    Mesh acc = mesh_from_arrays(0, NULL, NULL, 0, &fo0, NULL);
+    float ang = lead()->nangle;
+    for (int i = 0; i < nob; i++) {
+        if (!ob[i].sel) continue;
+        M4 M = obj_mat(&ob[i]);
+        mesh_append(&acc, &ob[i].m, &M);
+    }
+    for (int i = nob - 1; i >= 0; i--) if (ob[i].sel) obj_remove(i);
+    memset(acc.vs, 0, acc.nv);
+    memset(acc.es, 0, acc.ne);
+    memset(acc.fs, 0, acc.nf);
+    Obj *o = obj_new("polySurface");
+    o->m = acc;
+    o->nangle = ang;
+    o->sel = 1;
+    o->order = ++stamp;
+    char b[64];
+    snprintf(b, sizeof b, "Combined %d objects into %s", n, o->name);
+    msg(b);
+}
+
+/* Mesh > Separate: each selected object splits into one object per connected piece */
+static void cmd_separate(void)
+{
+    if (mode != M_OBJ || !has_sel()) { msg("Separate: select objects (object mode)"); return; }
+    int made = 0, *sh = NULL, pushed = 0;
+    for (int i = nob - 1; i >= 0; i--) {
+        if (!ob[i].sel) continue;
+        sh = realloc(sh, (ob[i].m.nf + 1) * sizeof(int));
+        int k = mesh_shells(&ob[i].m, sh);
+        if (k < 2) continue;
+        if (!pushed) { undo_push("Separate"); pushed = 1; }
+        Obj src = ob[i];
+        unsigned char *fm = malloc(src.m.nf + 1);
+        for (int s = 0; s < k; s++) {
+            for (int f = 0; f < src.m.nf; f++) fm[f] = sh[f] == s;
+            Mesh part = mesh_subset(&src.m, fm);
+            Obj *o = obj_new(src.name);
+            char nm[32];
+            memcpy(nm, o->name, 32);
+            *o = src;
+            memcpy(o->name, nm, 32);
+            o->m = part;
+            o->prim.type = PRIM_NONE;
+            o->order = ++stamp;
+            made++;
+        }
+        free(fm);
+        obj_remove(i);   /* the pieces were added after it, so i still names the original */
+    }
+    free(sh);
+    char b[64];
+    snprintf(b, sizeof b, "Separated into %d objects", made);
+    msg(made ? b : "Separate: the selection is already in one piece each");
+}
+
+/* faces an op works on: all of an object in object mode, else the selected faces, or the faces
+   whose vertices are all selected. NULL with *all = 1 means every face; NULL with 0: none. */
+static unsigned char *op_faces(Obj *o, int *all)
+{
+    Mesh *m = &o->m;
+    *all = mode == M_OBJ;
+    if (*all) return NULL;
+    unsigned char *fm = calloc(m->nf + 1, 1), *vm = malloc(m->nv + 1);
+    int n = 0;
+    if (shows(M_FACE)) for (int f = 0; f < m->nf; f++) n += fm[f] = m->fs[f] != 0;
+    if (!n && mesh_vmask(m, mode, vm))
+        for (int f = 0; f < m->nf; f++) {
+            int in = 1;
+            for (int c = m->fo[f]; c < m->fo[f + 1] && in; c++) in = vm[m->fi[c]];
+            n += fm[f] = (unsigned char)in;
+        }
+    free(vm);
+    if (!n) { free(fm); return NULL; }
+    return fm;
+}
+
+static int quad30(Mesh *m, const unsigned char *fm) { return mesh_quadrangulate(m, fm, 30); }
+
+/* Reverse / Triangulate / Quadrangulate on the selected objects or faces */
+static void cmd_face_op(int (*fn)(Mesh *, const unsigned char *), const char *what, const char *done)
+{
+    int n = 0;
+    undo_push(what);
+    for (int i = 0; i < nob; i++) {
+        if (!active(&ob[i])) continue;
+        int all;
+        unsigned char *fm = op_faces(&ob[i], &all);
+        if (!fm && !all) continue;
+        int k = fn(&ob[i].m, fm);
+        free(fm);
+        if (k) { n += k; ob[i].prim.type = PRIM_NONE; }
+    }
+    char b[96];
+    if (!n) {
+        undo_drop();
+        snprintf(b, sizeof b, "%s: nothing to change (select objects or faces)", what);
+    } else {
+        snprintf(b, sizeof b, done, n);
+    }
+    msg(b);
+}
+
+/* Mesh > Merge Vertices: everything within Merge Distance (side panel) of each other */
+static void cmd_merge_dist(void)
+{
+    int n = 0;
+    undo_push("Merge Vertices");
+    for (int i = 0; i < nob; i++) {
+        if (!active(&ob[i])) continue;
+        unsigned char *vm = NULL;
+        if (mode != M_OBJ) {
+            vm = malloc(ob[i].m.nv + 1);
+            if (!mesh_vmask(&ob[i].m, mode, vm)) { free(vm); continue; }
+        }
+        int k = mesh_merge_dist(&ob[i].m, vm, mergeDist);
+        free(vm);
+        if (k) { n += k; ob[i].prim.type = PRIM_NONE; }
+    }
+    char b[96];
+    if (!n) {
+        undo_drop();
+        snprintf(b, sizeof b, "Merge Vertices: nothing closer than %g (Merge Distance, side panel)", mergeDist);
+    } else {
+        snprintf(b, sizeof b, "Merged away %d vertices", n);
+    }
+    msg(b);
+}
+
+/* Delete Edge/Vertex: removes the selected edges or vertices and joins the faces around them */
+static int delete_ev(void)
+{
+    int edges = 0, verts = 0;
+    for (int i = 0; i < nob; i++) {
+        if (!ob[i].hil) continue;
+        Mesh *m = &ob[i].m;
+        for (int e = 0; e < m->ne && shows(M_EDGE); e++) edges |= m->es[e];
+        for (int v = 0; v < m->nv && shows(M_VERT); v++) verts |= m->vs[v];
+    }
+    if (!edges && !verts) return 0;
+    undo_push(edges ? "Delete Edges" : "Delete Vertices");
+    int n = 0;
+    for (int i = 0; i < nob; i++) {
+        if (!ob[i].hil) continue;
+        int k = edges ? mesh_delete_edges(&ob[i].m, ob[i].m.es, 1) : mesh_delete_verts(&ob[i].m, ob[i].m.vs);
+        if (k) { n += k; ob[i].prim.type = PRIM_NONE; }
+    }
+    if (!n) { undo_drop(); msg("Delete: those can't be removed without leaving a hole (try deleting faces)"); return 1; }
+    msg(edges ? "Deleted edges" : "Deleted vertices");
+    return 1;
+}
+
 /* Hard / smooth / auto smooth shading on the selected (or hilited) objects.
    The choice also becomes the default for new objects. */
 static void cmd_shade(float angle, const char *what)
@@ -1804,11 +1975,17 @@ static void cmd_shade(float angle, const char *what)
     }
     defAngle = angle;
     int n = 0;
-    for (int i = 0; i < nob; i++) n += active(&ob[i]) && ob[i].nangle != angle;
+    for (int i = 0; i < nob; i++) {
+        if (!active(&ob[i])) continue;
+        int over = 0;
+        for (int e = 0; e < ob[i].m.ne && !over; e++) over = ob[i].m.eh[e];
+        n += ob[i].nangle != angle || over;
+    }
     if (n) {
+        /* an object-wide choice also drops per edge Harden / Soften overrides */
         undo_push(what);
         for (int i = 0; i < nob; i++)
-            if (active(&ob[i])) ob[i].nangle = angle;
+            if (active(&ob[i])) { ob[i].nangle = angle; memset(ob[i].m.eh, 0, ob[i].m.ne); }
     }
     char b[96];
     snprintf(b, sizeof b, "%s%s", what, lead() ? "" : " (for new objects)");
@@ -2571,7 +2748,8 @@ static const char *HELP_TEXT =
     "Edit\n"
     "  Ctrl+E\tExtrude faces / edges\n"
     "  Mesh > Fill Hole\tCap the hole the selection touches (toolbar too)\n"
-    "  Ctrl+D / Delete\tDuplicate / delete\n"
+    "  Ctrl+D / Delete\tDuplicate / delete (edges and vertices: their faces join)\n"
+    "  Ctrl+Delete\tDelete Edge/Vertex\n"
     "  Ctrl+H / Ctrl+Shift+H\tHide selected / show all\n"
     "  Z, Ctrl+Z / Shift+Z, Ctrl+Y\tUndo / redo\n"
     "  G\tRepeat last command\n"
@@ -2676,8 +2854,17 @@ static void do_cmd(int id)
         SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
         break;
     }
-    case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT:
+    case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT: case CM_TWELD:
         set_tool(id - CM_TSEL);
+        break;
+    case CM_REVERSE: cmd_face_op(mesh_reverse, "Reverse Normals", "Reversed %d face(s)"); break;
+    case CM_TRIANG: cmd_face_op(mesh_triangulate, "Triangulate", "Triangulated %d face(s)"); break;
+    case CM_QUAD: cmd_face_op(quad30, "Quadrangulate", "Joined %d triangle pair(s) into quads"); break;
+    case CM_COMBINE: cmd_combine(); break;
+    case CM_SEPARATE: cmd_separate(); break;
+    case CM_MERGEDIST: cmd_merge_dist(); break;
+    case CM_DELEV:
+        if (mode == M_OBJ || !delete_ev()) msg("Delete Edge/Vertex: select edges or vertices");
         break;
     case CM_MOBJ: case CM_MVERT: case CM_MEDGE: case CM_MFACE: case CM_MMULTI:
         set_mode(id - CM_MOBJ);
@@ -2696,7 +2883,7 @@ static void do_cmd(int id)
     }
     }
     if ((id >= CM_DELETE && id <= CM_MERGE) || id == CM_APPLYCOL || id == CM_GROW || id == CM_SHRINK ||
-        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE)
+        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE || (id >= CM_REVERSE && id <= CM_DELEV))
         lastCmd = id;
     refresh_all();
 }
@@ -2710,10 +2897,11 @@ enum {
     PF_SR, PF_SCOLS, PF_SROWS,
     PF_NANGLE,
     PF_PW, PF_PD, PF_PSW, PF_PSD,
-    PF_OPA, PF_RAD, PF_COLOR, PF_APPLY
+    PF_OPA, PF_RAD, PF_COLOR, PF_APPLY,
+    PF_MERGED
 };
 enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP };
-#define NROW 32
+#define NROW 64
 typedef struct { int kind, id; char label[40]; } Row;
 static Row rows[NROW];
 static int nrows, panelObj = -1, building;
@@ -2725,6 +2913,7 @@ static float *fld_f(int id)
     Obj *o = panelObj >= 0 && panelObj < nob ? &ob[panelObj] : NULL;
     if (id == PF_OPA) return &paintOpa;
     if (id == PF_RAD) return &paintRad;
+    if (id == PF_MERGED) return &mergeDist;
     if (!o) return NULL;
     if (id >= PF_TX && id <= PF_TZ) return &o->t.x + (id - PF_TX);
     if (id >= PF_RX && id <= PF_RZ) return &o->r.x + (id - PF_RX);
@@ -2852,6 +3041,8 @@ static void panel_build(void)
     add_row(RK_FLOAT, PF_OPA, "Opacity");
     add_row(RK_FLOAT, PF_RAD, "Brush Radius");
     add_row(RK_BUTTON, PF_APPLY, "Apply Color to Selection");
+    add_row(RK_HEAD, 0, "Mesh Tools");
+    add_row(RK_FLOAT, PF_MERGED, "Merge Distance");
 
     RECT rc;
     GetClientRect(hPanel, &rc);
@@ -2916,6 +3107,7 @@ static void panel_set(int r, double v)
     if (rows[r].kind == RK_FLOAT) {
         if (id == PF_OPA) { paintOpa = (float)(v < 0 ? 0 : v > 1 ? 1 : v); return; }
         if (id == PF_RAD) { paintRad = (float)(v < 1 ? 1 : v > 2000 ? 2000 : v); return; }
+        if (id == PF_MERGED) { mergeDist = (float)(v < 0 ? 0 : v > 1e4 ? 1e4 : v); return; }
         if (id <= PF_SZ) {
             /* channel edits apply to every selected object */
             for (int i = 0; i < nob; i++)
@@ -2935,7 +3127,8 @@ static void panel_set(int r, double v)
     prim_rebuild(&ob[panelObj]);
 }
 
-static int panel_undoable(int r) { return rows[r].id != PF_OPA && rows[r].id != PF_RAD; }
+/* tool settings are not part of the scene, so changing them is not an undo step */
+static int panel_undoable(int r) { return rows[r].id != PF_OPA && rows[r].id != PF_RAD && rows[r].id < PF_MERGED; }
 
 static void panel_commit(int r, double v)
 {
@@ -2999,7 +3192,7 @@ static void scrub_move(int x)
 {
     int id = rows[scrub.row].id, dx = x - scrub.x0;
     float mul = key(VK_SHIFT) ? 10 : key(VK_CONTROL) ? 0.1f : 1;
-    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : 0.01;
+    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : id == PF_MERGED ? 0.001 : 0.01;
     double v = rows[scrub.row].kind == RK_INT ? scrub.v0 + (int)(dx * mul / 6) : scrub.v0 + dx * step * mul;
     double cur;
     if (rows[scrub.row].kind == RK_FLOAT) v = round(v * 1000) / 1000;
@@ -3176,6 +3369,9 @@ static const Tool tbItems[] = {
     { "Grid Snap", "X", CM_SNAPGRID, "Toggle snapping moves to the grid (or hold X while dragging)" },
     { "Point Snap", "V", CM_SNAPPOINT, "Toggle snapping moves onto vertices (or hold V while dragging)" }, { 0 },
     { "Wire", "4 / 5", CM_WIRETOG, "Toggle wireframe (4) and shaded (5) display" },
+    { "Hard", "", CM_HARD, "Hard Shade: every edge looks sharp (faceted)" },
+    { "Smooth", "", CM_SMOOTH, "Smooth Shade: every edge looks soft" },
+    { "Auto", "", CM_AUTOSMOOTH, "Auto Smooth: edges sharper than the Normal Angle (side panel) stay hard" },
     { "Frame", "F", CM_FRAMESEL, "Frame the selection (A frames everything, Home resets the view)" }, { 0 },
     { "Undo", "Z", CM_UNDO, "Undo the last change" },
     { "Redo", "Shift+Z", CM_REDO, "Redo" },
@@ -3186,7 +3382,12 @@ static int tbHover = -1, tbDown = -1;
 
 static int tb_on(int cmd)
 {
-    if (cmd >= CM_TSEL && cmd <= CM_TPAINT) return tool == cmd - CM_TSEL;
+    if (cmd >= CM_TSEL && cmd < CM_TSEL + NTOOL) return tool == cmd - CM_TSEL;
+    if (cmd >= CM_HARD && cmd <= CM_AUTOSMOOTH) {
+        Obj *l = lead();
+        float a = l ? l->nangle : defAngle;
+        return cmd == (a <= 0 ? CM_HARD : a >= 180 ? CM_SMOOTH : CM_AUTOSMOOTH);
+    }
     if (cmd >= CM_MOBJ && cmd <= CM_MMULTI) return mode == cmd - CM_MOBJ;
     if (cmd == CM_WIRE || cmd == CM_SHADED) return wire == (cmd == CM_WIRE);
     if (cmd == CM_WIRETOG) return wire;
@@ -3318,13 +3519,14 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 static void status_text(void)
 {
     static const char *mn[] = { "Object mode", "Vertex mode", "Edge mode", "Face mode", "Multi mode" };
-    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool" };
+    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld" };
     static const char *hint[] = {
         "Click to select, drag for a box. Shift: toggle, Ctrl: remove, Ctrl+Shift: add. Alt+drag: orbit/pan/zoom",
         "Drag a handle to move. Hold X: grid snap, V: point snap, Ctrl+handle: other two axes, Esc: cancel",
         "Drag a ring to rotate. Hold J: 15 degree steps. Esc cancels the drag",
         "Drag a handle to scale. Drag components past the center to flatten them. Esc cancels",
         "Drag over a mesh to paint. B+drag: brush size. Color, opacity and radius are in the side panel",
+        "Drag from one vertex onto another to weld them together (the first one moves). Esc cancels",
     };
     int nsel = 0, ncomp = 0;
     for (int i = 0; i < nob; i++) {
@@ -3362,7 +3564,7 @@ static void status_update(void)
         if (*c == '\\' || *c == '/') fn = c + 1;
     snprintf(s, sizeof s, "%s%s - " APP_NAME, fn, modified ? "*" : "");
     SetWindowTextA(hMain, s);
-    for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_TSEL + i, MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
+    for (int i = 0; i < NTOOL; i++) CheckMenuItem(hMenu, CM_TSEL + i, MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
     for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_MOBJ + i, MF_BYCOMMAND | (mode == i ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
@@ -3666,7 +3868,7 @@ static HCURSOR view_cursor(void)
     if (dk == D_TUMBLE) c = IDC_SIZEALL;
     else if (dk == D_PAN) c = IDC_HAND;
     else if (dk == D_DOLLY) c = IDC_SIZENS;
-    else if (dk == D_MARQ || tool == T_PAINT) c = IDC_CROSS;
+    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD) c = IDC_CROSS;
     else if (gizmoHover >= 0) c = IDC_HAND;
     return LoadCursor(NULL, c);
 }
@@ -3825,6 +4027,7 @@ static void render(void)
             glLineWidth(1);
         }
     }
+    draw_weld();
     if (hudOn) draw_hud();
     if (!nob) draw_empty_hint();
     draw_drag_label();
@@ -3835,6 +4038,53 @@ static void render(void)
 }
 
 /* ================================================================ viewport window */
+
+/* ---- Target Weld: press on a vertex, release on another one of the same object */
+
+static struct { int obj, v, tgt; } wd = { -1, -1, -1 };
+
+static int weld_pick(int x, int y, int obj)
+{
+    int o, k, i;
+    cam_update();
+    if (!pick_comp(x, y, &o, &k, &i) || k != M_VERT || (obj >= 0 && o != obj)) return -1;
+    if (obj < 0) wd.obj = o;
+    return i;
+}
+
+static void draw_weld(void)
+{
+    if (dk != D_WELD || wd.obj < 0 || wd.obj >= nob) return;
+    M4 M = obj_mat(&ob[wd.obj]);
+    float sx, sy, tx = (float)curx, ty = (float)cury, r = 7 * ds;
+    if (!proj(m4_pt(M, ob[wd.obj].m.p[wd.v]), &sx, &sy, NULL)) return;
+    if (wd.tgt >= 0) proj(m4_pt(M, ob[wd.obj].m.p[wd.tgt]), &tx, &ty, NULL);
+    glColor3f(1, 1, 0);
+    glLineWidth(2 * ds);
+    glBegin(GL_LINES);
+    glVertex2f(sx, sy); glVertex2f(tx, ty);
+    glEnd();
+    if (wd.tgt >= 0) {
+        glBegin(GL_LINE_LOOP);
+        for (int k = 0; k < 20; k++) glVertex2f(tx + r * cosf(2 * PI_F * k / 20), ty + r * sinf(2 * PI_F * k / 20));
+        glEnd();
+    }
+    glLineWidth(1);
+}
+
+static void weld_end(int cancel)
+{
+    if (!cancel && wd.obj >= 0 && wd.obj < nob && wd.tgt >= 0) {
+        undo_push("Target Weld");
+        if (mesh_weld(&ob[wd.obj].m, wd.v, wd.tgt)) {
+            ob[wd.obj].prim.type = PRIM_NONE;
+            msg("Welded");
+        } else {
+            undo_drop();
+        }
+    }
+    wd.obj = wd.v = wd.tgt = -1;
+}
 
 static void marking_menu(int x, int y)
 {
@@ -3873,6 +4123,7 @@ static void end_drag(int cancel)
     else if (k == D_MARQ && !cancel) select_rect(mx0, my0, curx, cury, selMod);
     else if (k == D_MANIP) drag_end();
     else if (k == D_PAINT) paint_end();
+    else if (k == D_WELD) weld_end(cancel);
     if (k == D_PEND || k == D_MARQ) normalFrame = 0;
     if (GetCapture() == hView) ReleaseCapture();
     refresh_all();
@@ -3938,7 +4189,7 @@ static void handle_key(WPARAM wp)
     case 'S': if (ctrl) id = shift ? CM_EXPORT_AS : CM_EXPORT; break;
     case 'G': id = CM_REPEAT; break;
     case VK_F1: id = CM_HELP; break;
-    case VK_DELETE: case VK_BACK: id = CM_DELETE; break;
+    case VK_DELETE: case VK_BACK: id = ctrl ? CM_DELEV : CM_DELETE; break;
     case VK_OEM_PLUS: case VK_ADD: case VK_OEM_MINUS: case VK_SUBTRACT: {
         char b[48];
         manipSize *= wp == VK_OEM_PLUS || wp == VK_ADD ? 1.15f : 1 / 1.15f;
@@ -4021,6 +4272,9 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (!manip_vis()) return 0;
             drag_begin(lastHandle, x, y);
             dk = D_MANIP;
+        } else if (tool == T_WELD && (wd.v = weld_pick(x, y, -1)) >= 0) {
+            wd.tgt = -1;
+            dk = D_WELD;
         } else if (tool == T_PAINT) {
             dk = key('B') ? D_BRUSH : D_PAINT;
             rad0 = paintRad;
@@ -4071,6 +4325,11 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             break;
         case D_MANIP: drag_move(x, y); panel_sync(); status_text(); break;
         case D_PAINT: paint_dab(x, y); break;
+        case D_WELD: {
+            int t = weld_pick(x, y, wd.obj);
+            wd.tgt = t == wd.v ? -1 : t;
+            break;
+        }
         case D_BRUSH:
             paintRad = rad0 + (x - mx0) / ds;
             if (paintRad < 1) paintRad = 1;
@@ -4189,10 +4448,23 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_TOFACE, "Convert to Fa&ces\tCtrl+F11");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Select");
     m = CreatePopupMenu();
-    AppendMenuA(m, MF_STRING, CM_EXTRUDE, "&Extrude\tCtrl+E");
-    AppendMenuA(m, MF_STRING, CM_MERGE, "&Merge to Center");
+    AppendMenuA(m, MF_STRING, CM_COMBINE, "&Combine");
+    AppendMenuA(m, MF_STRING, CM_SEPARATE, "&Separate");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_MERGEDIST, "&Merge Vertices (by distance)");
     AppendMenuA(m, MF_STRING, CM_FILLHOLE, "&Fill Hole");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_TRIANG, "&Triangulate");
+    AppendMenuA(m, MF_STRING, CM_QUAD, "&Quadrangulate");
+    AppendMenuA(m, MF_STRING, CM_REVERSE, "&Reverse Normals");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Mesh");
+    m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING, CM_EXTRUDE, "&Extrude\tCtrl+E");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_MERGE, "&Merge to Center");
+    AppendMenuA(m, MF_STRING, CM_TWELD, "&Target Weld Tool");
+    AppendMenuA(m, MF_STRING, CM_DELEV, "&Delete Edge/Vertex\tCtrl+Del");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "Edit Mes&h");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_FREEZE, "&Freeze Transformations");
     AppendMenuA(m, MF_STRING, CM_CENTERPIV, "&Center Pivot");
@@ -4207,6 +4479,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_TROT, "&Rotate Tool\tE");
     AppendMenuA(m, MF_STRING, CM_TSCALE, "S&cale Tool\tR");
     AppendMenuA(m, MF_STRING, CM_TPAINT, "&Paint Vertex Color Tool");
+    AppendMenuA(m, MF_STRING, CM_TWELD, "Target &Weld Tool");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Tools");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_SETCOL, "&Set Paint Color...");
@@ -4331,6 +4604,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         reg_set_int("Wire", wire);
         reg_set_int("NormalAngle", (int)(defAngle * 100));
         reg_set_int("ManipSize", (int)(manipSize * 1000));
+        reg_set_int("MergeDist", (int)(mergeDist * 1e5f));
         autosave_remove();
         PostQuitMessage(0);
         return 0;
@@ -4357,6 +4631,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     if (defAngle < 0 || defAngle > 180) defAngle = 0;
     manipSize = reg_int("ManipSize", 1000) / 1000.0f;
     if (manipSize < .05f || manipSize > 50) manipSize = 1;
+    mergeDist = reg_int("MergeDist", 1000) / 1e5f;
     recent_load();
 
     hFont = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
