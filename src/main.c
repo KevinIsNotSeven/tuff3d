@@ -66,6 +66,7 @@ static float ds = 1;
 static void refresh_all(void);
 static void status_text(void);
 static int delete_ev(void);
+static void status_update(void);
 static void set_mode(int m);
 static void draw_weld(void);
 static void redraw(void) { InvalidateRect(hView, NULL, FALSE); }
@@ -2121,10 +2122,170 @@ enum {
     CM_HELP, CM_THEMEPICK, CM_THEMENEXT, CM_THEMEPREV, CM_THEMERAND,
     CM_REVERSE, CM_TRIANG, CM_QUAD, CM_COMBINE, CM_SEPARATE, CM_MERGEDIST, CM_DELEV,
     CM_BEVEL, CM_BRIDGE, CM_HARDEN, CM_SOFTEN,
-    CM_ORTHO, CM_IMGFRONT, CM_IMGSIDE, CM_IMGTOP, CM_IMGCLEAR,
+    CM_ORTHO, CM_IMGFRONT, CM_IMGSIDE, CM_IMGTOP, CM_IMGCLEAR, CM_EXPORT_OBJ,
+    CM_MANIPUP, CM_MANIPDOWN, CM_COMPTOG, CM_HOTKEYS,
     CM_RECENT = 300,             /* + recent file index */
     CM_THEME = 200               /* + theme index */
 };
+
+/* ---- hotkeys: each command can have two keys. The defaults are Maya's; Help > Hotkey Editor
+   changes them, and the menus and toolbar show whatever is set. A key is its virtual key code plus
+   KC_CTRL / KC_SHIFT. (Held keys like X, V, J and B while dragging are not commands.) */
+
+#define KC_CTRL 0x10000
+#define KC_SHIFT 0x20000
+
+typedef struct { int cmd; const char *group, *name; int def[2], key[2]; } Bind;
+static Bind binds[] = {
+    { CM_TSEL, "Tools", "Select Tool", { 'Q' }, { 0 } },
+    { CM_TMOVE, "Tools", "Move Tool", { 'W' }, { 0 } },
+    { CM_TROT, "Tools", "Rotate Tool", { 'E' }, { 0 } },
+    { CM_TSCALE, "Tools", "Scale Tool", { 'R' }, { 0 } },
+    { CM_TPAINT, "Tools", "Paint Vertex Color Tool", { 0 }, { 0 } },
+    { CM_TWELD, "Tools", "Target Weld Tool", { 0 }, { 0 } },
+    { CM_TLOOP, "Tools", "Insert Edge Loop Tool", { 0 }, { 0 } },
+    { CM_TCUT, "Tools", "Multi-Cut Tool", { 0 }, { 0 } },
+    { CM_MANIPUP, "Tools", "Bigger Manipulator", { VK_OEM_PLUS, VK_ADD }, { 0 } },
+    { CM_MANIPDOWN, "Tools", "Smaller Manipulator", { VK_OEM_MINUS, VK_SUBTRACT }, { 0 } },
+    { CM_COMPTOG, "Selection", "Object / Component Mode", { VK_F8 }, { 0 } },
+    { CM_MVERT, "Selection", "Vertex Mode", { VK_F9 }, { 0 } },
+    { CM_MEDGE, "Selection", "Edge Mode", { VK_F10 }, { 0 } },
+    { CM_MFACE, "Selection", "Face Mode", { VK_F11 }, { 0 } },
+    { CM_MMULTI, "Selection", "Multi Mode", { VK_F7 }, { 0 } },
+    { CM_TOVERT, "Selection", "Convert to Vertices", { KC_CTRL | VK_F9 }, { 0 } },
+    { CM_TOEDGE, "Selection", "Convert to Edges", { KC_CTRL | VK_F10 }, { 0 } },
+    { CM_TOFACE, "Selection", "Convert to Faces", { KC_CTRL | VK_F11 }, { 0 } },
+    { CM_SELALL, "Selection", "Select All", { KC_CTRL | KC_SHIFT | 'A' }, { 0 } },
+    { CM_SELINV, "Selection", "Invert Selection", { KC_CTRL | KC_SHIFT | 'I' }, { 0 } },
+    { CM_GROW, "Selection", "Grow Selection", { VK_OEM_PERIOD }, { 0 } },
+    { CM_SHRINK, "Selection", "Shrink Selection", { VK_OEM_COMMA }, { 0 } },
+    { CM_LOOP, "Selection", "Select Edge Loop", { 0 }, { 0 } },
+    { CM_UNDO, "Edit", "Undo", { 'Z', KC_CTRL | 'Z' }, { 0 } },
+    { CM_REDO, "Edit", "Redo", { KC_SHIFT | 'Z', KC_CTRL | 'Y' }, { 0 } },
+    { CM_REPEAT, "Edit", "Repeat Last", { 'G' }, { 0 } },
+    { CM_DELETE, "Edit", "Delete", { VK_DELETE, VK_BACK }, { 0 } },
+    { CM_DELEV, "Edit", "Delete Edge/Vertex", { KC_CTRL | VK_DELETE, KC_CTRL | VK_BACK }, { 0 } },
+    { CM_DUP, "Edit", "Duplicate", { KC_CTRL | 'D' }, { 0 } },
+    { CM_HIDE, "Edit", "Hide Selected", { KC_CTRL | 'H' }, { 0 } },
+    { CM_SHOWALL, "Edit", "Show All", { KC_CTRL | KC_SHIFT | 'H' }, { 0 } },
+    { CM_EXTRUDE, "Mesh", "Extrude", { KC_CTRL | 'E' }, { 0 } },
+    { CM_BEVEL, "Mesh", "Bevel", { KC_CTRL | 'B' }, { 0 } },
+    { CM_BRIDGE, "Mesh", "Bridge", { 0 }, { 0 } },
+    { CM_MERGE, "Mesh", "Merge to Center", { 0 }, { 0 } },
+    { CM_MERGEDIST, "Mesh", "Merge Vertices", { 0 }, { 0 } },
+    { CM_FILLHOLE, "Mesh", "Fill Hole", { 0 }, { 0 } },
+    { CM_COMBINE, "Mesh", "Combine", { 0 }, { 0 } },
+    { CM_SEPARATE, "Mesh", "Separate", { 0 }, { 0 } },
+    { CM_TRIANG, "Mesh", "Triangulate", { 0 }, { 0 } },
+    { CM_QUAD, "Mesh", "Quadrangulate", { 0 }, { 0 } },
+    { CM_REVERSE, "Mesh", "Reverse Normals", { 0 }, { 0 } },
+    { CM_FREEZE, "Modify", "Freeze Transformations", { 0 }, { 0 } },
+    { CM_CENTERPIV, "Modify", "Center Pivot", { 0 }, { 0 } },
+    { CM_RESETXF, "Modify", "Reset Transformations", { 0 }, { 0 } },
+    { CM_SNAPGRID, "Modify", "Grid Snap On/Off", { 0 }, { 0 } },
+    { CM_SNAPPOINT, "Modify", "Point Snap On/Off", { 0 }, { 0 } },
+    { CM_WIRE, "Display", "Wireframe", { '4' }, { 0 } },
+    { CM_SHADED, "Display", "Shaded", { '5' }, { 0 } },
+    { CM_HARD, "Display", "Hard Shade", { 0 }, { 0 } },
+    { CM_SMOOTH, "Display", "Smooth Shade", { 0 }, { 0 } },
+    { CM_AUTOSMOOTH, "Display", "Auto Smooth", { 0 }, { 0 } },
+    { CM_HARDEN, "Display", "Harden Edge", { 0 }, { 0 } },
+    { CM_SOFTEN, "Display", "Soften Edge", { 0 }, { 0 } },
+    { CM_FRAMESEL, "Display", "Frame Selected", { 'F' }, { 0 } },
+    { CM_FRAMEALL, "Display", "Frame All", { 'A' }, { 0 } },
+    { CM_VHOME, "Display", "Home View", { VK_HOME }, { 0 } },
+    { CM_VFRONT, "Display", "Front View", { 0 }, { 0 } },
+    { CM_VSIDE, "Display", "Side View", { 0 }, { 0 } },
+    { CM_VTOP, "Display", "Top View", { 0 }, { 0 } },
+    { CM_ORTHO, "Display", "Orthographic On/Off", { 0 }, { 0 } },
+    { CM_PANEL, "Display", "Side Panel", { KC_CTRL | 'A' }, { 0 } },
+    { CM_HUD, "Display", "Heads-Up Display", { 0 }, { 0 } },
+    { CM_THEMEPICK, "Display", "Theme Picker", { KC_CTRL | 'T' }, { 0 } },
+    { CM_THEMENEXT, "Display", "Next Theme", { KC_CTRL | KC_SHIFT | 'T' }, { 0 } },
+    { CM_NEW, "File", "New Scene", { KC_CTRL | 'N' }, { 0 } },
+    { CM_OPEN, "File", "Open", { KC_CTRL | 'O' }, { 0 } },
+    { CM_IMPORT, "File", "Import", { KC_CTRL | KC_SHIFT | 'O' }, { 0 } },
+    { CM_EXPORT, "File", "Save", { KC_CTRL | 'S' }, { 0 } },
+    { CM_EXPORT_AS, "File", "Save As", { KC_CTRL | KC_SHIFT | 'S' }, { 0 } },
+    { CM_EXPORT_OBJ, "File", "Export OBJ", { 0 }, { 0 } },
+    { CM_HELP, "Help", "Hotkey List", { VK_F1 }, { 0 } },
+    { CM_HOTKEYS, "Help", "Hotkey Editor", { 0 }, { 0 } },
+};
+#define NBIND ((int)(sizeof binds / sizeof *binds))
+
+static void key_text(int code, char *out, int n)
+{
+    int vk = code & 0xFFFF;
+    char name[32] = "";
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) snprintf(name, sizeof name, "%c", vk);
+    else if (vk >= VK_F1 && vk <= VK_F24) snprintf(name, sizeof name, "F%d", vk - VK_F1 + 1);
+    else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) snprintf(name, sizeof name, "Num %d", vk - VK_NUMPAD0);
+    else {
+        static const struct { int vk; const char *s; } nm[] = {
+            { VK_DELETE, "Del" }, { VK_BACK, "Backspace" }, { VK_HOME, "Home" }, { VK_END, "End" }, { VK_INSERT, "Ins" },
+            { VK_PRIOR, "PgUp" }, { VK_NEXT, "PgDn" }, { VK_LEFT, "Left" }, { VK_RIGHT, "Right" }, { VK_UP, "Up" },
+            { VK_DOWN, "Down" }, { VK_OEM_PERIOD, "." }, { VK_OEM_COMMA, "," }, { VK_OEM_PLUS, "+" }, { VK_OEM_MINUS, "-" },
+            { VK_ADD, "Num +" }, { VK_SUBTRACT, "Num -" }, { VK_MULTIPLY, "Num *" }, { VK_DIVIDE, "Num /" },
+            { VK_DECIMAL, "Num ." }, { VK_RETURN, "Enter" }, { VK_SPACE, "Space" }, { VK_TAB, "Tab" },
+        };
+        for (size_t i = 0; i < sizeof nm / sizeof *nm && !name[0]; i++) if (nm[i].vk == vk) snprintf(name, sizeof name, "%s", nm[i].s);
+        if (!name[0] && !GetKeyNameTextA((LONG)MapVirtualKeyA(vk, 0) << 16, name, sizeof name)) snprintf(name, sizeof name, "Key %d", vk);
+    }
+    snprintf(out, n, "%s%s%s", code & KC_CTRL ? "Ctrl+" : "", code & KC_SHIFT ? "Shift+" : "", name);
+}
+
+static Bind *bind_of(int cmd)
+{
+    for (int i = 0; i < NBIND; i++) if (binds[i].cmd == cmd) return &binds[i];
+    return NULL;
+}
+
+/* the first key of a command as text ("" if it has none); NULL if it can't have keys */
+static const char *cmd_key(int cmd, char *buf, int n)
+{
+    Bind *b = bind_of(cmd);
+    if (!b) return NULL;
+    buf[0] = 0;
+    if (b->key[0] || b->key[1]) key_text(b->key[0] ? b->key[0] : b->key[1], buf, n);
+    return buf;
+}
+
+static void binds_save(void)
+{
+    int v[3 * NBIND];
+    for (int i = 0; i < NBIND; i++) { v[3 * i] = binds[i].cmd; v[3 * i + 1] = binds[i].key[0]; v[3 * i + 2] = binds[i].key[1]; }
+    reg_set("Hotkeys", REG_BINARY, v, sizeof v);
+}
+
+static void binds_load(void)
+{
+    int v[3 * 200];
+    for (int i = 0; i < NBIND; i++) { binds[i].key[0] = binds[i].def[0]; binds[i].key[1] = binds[i].def[1]; }
+    DWORD n = sizeof v;
+    if (RegGetValueA(HKEY_CURRENT_USER, REG_KEY, "Hotkeys", RRF_RT_REG_BINARY, NULL, v, &n) != ERROR_SUCCESS) return;
+    for (DWORD i = 0; i + 3 <= n / sizeof(int); i += 3) {
+        Bind *b = bind_of(v[i]);
+        if (b) { b->key[0] = v[i + 1]; b->key[1] = v[i + 2]; }
+    }
+}
+
+/* menu items show the current key after a tab */
+static void menu_keys(void)
+{
+    for (int i = 0; i < NBIND; i++) {
+        Bind *b = &binds[i];
+        char t[160], k[48];
+        if (!b->def[0] && !b->key[0] && !b->key[1]) continue;   /* leave hints like "double-click edge" alone */
+        if (!GetMenuStringA(hMenu, b->cmd, t, sizeof t - 50, MF_BYCOMMAND)) continue;
+        char *tab = strchr(t, '\t');
+        if (tab) *tab = 0;
+        cmd_key(b->cmd, k, sizeof k);
+        if (k[0]) { strcat(t, "\t"); strcat(t, k); }
+        UINT st = GetMenuState(hMenu, b->cmd, MF_BYCOMMAND);
+        ModifyMenuA(hMenu, b->cmd, MF_BYCOMMAND | MF_STRING | (st & (MF_CHECKED | MF_GRAYED)), b->cmd, t);
+    }
+}
+
 
 static void cmd_create(int type)
 {
@@ -2611,26 +2772,194 @@ static void cmd_apply_color(void)
     msg("Applied color");
 }
 
+static int has_ext(const char *p, const char *ext)
+{
+    const char *e = strrchr(p, '.');
+    return e && !lstrcmpiA(e, ext);
+}
+
+/* save: 1 = scene or OBJ (picked by the type list), 2 = OBJ only */
 static int file_dlg(int save, char *path)
 {
     OPENFILENAMEA of;
     memset(&of, 0, sizeof of);
     of.lStructSize = sizeof of;
     of.hwndOwner = hMain;
-    of.lpstrFilter = save ? "Wavefront OBJ (*.obj)\0*.obj\0All files\0*.*\0"
-                          : "3D models (*.obj, *.mlt)\0*.obj;*.mlt\0Wavefront OBJ (*.obj)\0*.obj\0Maya LT scene (*.mlt)\0*.mlt\0All files\0*.*\0";
+    of.lpstrFilter = save == 2 ? "Wavefront OBJ (*.obj)\0*.obj\0All files\0*.*\0"
+                   : save ? "tuff3d scene (*.tuff)\0*.tuff\0Wavefront OBJ (*.obj)\0*.obj\0"
+                   : "3D files (*.tuff, *.obj, *.mlt)\0*.tuff;*.obj;*.mlt\0tuff3d scene (*.tuff)\0*.tuff\0"
+                     "Wavefront OBJ (*.obj)\0*.obj\0Maya LT scene (*.mlt)\0*.mlt\0All files\0*.*\0";
     of.lpstrFile = path;
     of.nMaxFile = MAX_PATH;
-    of.lpstrDefExt = "obj";
+    of.lpstrDefExt = save == 2 ? "obj" : "tuff";
+    of.nFilterIndex = save == 1 && has_ext(path, ".obj") ? 2 : 1;
     of.Flags = save ? OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST : OFN_FILEMUSTEXIST;
-    return save ? GetSaveFileNameA(&of) : GetOpenFileNameA(&of);
+    if (!(save ? GetSaveFileNameA(&of) : GetOpenFileNameA(&of))) return 0;
+    if (save == 1 && !has_ext(path, ".tuff") && !has_ext(path, ".obj")) {
+        size_t l = strlen(path);
+        if (l + 6 < MAX_PATH) strcat(path, of.nFilterIndex == 2 ? ".obj" : ".tuff");
+    }
+    return 1;
 }
+
+/* ---- tuff3d scene files (.tuff): plain text that keeps everything tuff3d knows about a scene:
+   objects with their transforms, shading, hidden state, primitive settings, vertex colors and
+   edge overrides, plus the camera and the image planes. Lines:
+     tuff3d scene 1
+     camera cx cy cz yaw pitch dist ortho
+     image slot size ox oy opacity path
+     object name / xform t r s / shade angle / hidden 0|1 / prim type and its settings
+     v x y z r g b / f i j k ... (0 based) / e a b override / end */
+
+static int tuff_save(const char *path, int selOnly)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    int n = 0;
+    fprintf(f, "tuff3d scene 1\n");
+    fprintf(f, "camera %.9g %.9g %.9g %.9g %.9g %.9g %d\n", coi.x, coi.y, coi.z, yaw, pitch, dist, ortho);
+    for (int i = 0; i < 3; i++)
+        if (img[i].tex) fprintf(f, "image %d %.9g %.9g %.9g %.9g %s\n", i, img[i].size, img[i].ox, img[i].oy, img[i].opa, img[i].path);
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        Mesh *m = &o->m;
+        const Prim *q = &o->prim;
+        if (selOnly && !active(o)) continue;
+        fprintf(f, "object %s\n", o->name);
+        fprintf(f, "xform %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n", o->t.x, o->t.y, o->t.z, o->r.x, o->r.y, o->r.z, o->s.x, o->s.y, o->s.z);
+        fprintf(f, "shade %.9g\nhidden %d\n", o->nangle, o->hidden);
+        fprintf(f, "prim %d %.9g %.9g %.9g %d %d %d %.9g %.9g %d %d %d %d %d %.9g %d %d %.9g %.9g %d %d\n", q->type,
+                q->w, q->h, q->d, q->sw, q->sh, q->sd, q->cr, q->ch, q->csides, q->chseg, q->ccap, q->ctop, q->cbot,
+                q->sr, q->scols, q->srows, q->pw, q->pd, q->psw, q->psd);
+        for (int v = 0; v < m->nv; v++)
+            fprintf(f, "v %.9g %.9g %.9g %.6g %.6g %.6g\n", m->p[v].x, m->p[v].y, m->p[v].z, m->c[v].x, m->c[v].y, m->c[v].z);
+        for (int fc = 0; fc < m->nf; fc++) {
+            fputc('f', f);
+            for (int k = m->fo[fc]; k < m->fo[fc + 1]; k++) fprintf(f, " %d", m->fi[k]);
+            fputc('\n', f);
+        }
+        for (int e = 0; e < m->ne; e++)
+            if (m->eh[e]) fprintf(f, "e %d %d %d\n", m->ev[2 * e], m->ev[2 * e + 1], m->eh[e]);
+        fprintf(f, "end\n");
+        n++;
+    }
+    int ok = !ferror(f);
+    if (fclose(f)) ok = 0;
+    return ok ? n : -1;
+}
+
+typedef struct { Obj o; int nv, nf, ni, ne, cv, cf, ci, ce; V3 *p, *c; int *fo, *fi, *eh; } TObj;
+
+static void tobj_free(TObj *t) { free(t->p); free(t->c); free(t->fo); free(t->fi); free(t->eh); }
+
+/* reads a scene's objects into the scene; returns how many, or -1. camera / images: take those too */
+static int tuff_load(const char *path, int camera, int images)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    static char line[1 << 16];
+    if (!fgets(line, sizeof line, f) || strncmp(line, "tuff3d scene", 12)) { fclose(f); return -1; }
+    TObj *t = NULL;
+    int nt = 0, bad = 0;
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        TObj *c = nt ? &t[nt - 1] : NULL;
+        if (!strncmp(line, "object ", 7)) {
+            t = realloc(t, (nt + 1) * sizeof *t);
+            c = &t[nt++];
+            memset(c, 0, sizeof *c);
+            snprintf(c->o.name, sizeof c->o.name, "%s", line + 7);
+            c->o.s = v3(1, 1, 1);
+            c->o.nangle = defAngle;
+            c->fo = malloc(sizeof(int));
+            c->fo[0] = 0;
+            c->cf = 1;
+        } else if (!strncmp(line, "camera ", 7)) {
+            V3 cc;
+            float y, pt, d;
+            int orth;
+            if (camera && sscanf(line + 7, "%f %f %f %f %f %f %d", &cc.x, &cc.y, &cc.z, &y, &pt, &d, &orth) == 7 && d > 0) {
+                coi = cc; yaw = y; pitch = pt; dist = d; ortho = orth != 0;
+            }
+        } else if (!strncmp(line, "image ", 6)) {
+            int slot, pos = 0;
+            float sz, ox, oy, op;
+            if (images && sscanf(line + 6, "%d %f %f %f %f %n", &slot, &sz, &ox, &oy, &op, &pos) == 5 && slot >= 0 && slot < 3 && pos)
+                if (!img_set(slot, line + 6 + pos, sz, ox, oy, op)) bad |= 2;
+        } else if (!c) {
+            continue;
+        } else if (!strncmp(line, "xform ", 6)) {
+            Obj *o = &c->o;
+            sscanf(line + 6, "%f %f %f %f %f %f %f %f %f", &o->t.x, &o->t.y, &o->t.z, &o->r.x, &o->r.y, &o->r.z, &o->s.x, &o->s.y, &o->s.z);
+        } else if (!strncmp(line, "shade ", 6)) {
+            c->o.nangle = (float)atof(line + 6);
+        } else if (!strncmp(line, "hidden ", 7)) {
+            c->o.hidden = atoi(line + 7) != 0;
+        } else if (!strncmp(line, "prim ", 5)) {
+            Prim *q = &c->o.prim;
+            int k = sscanf(line + 5, "%d %f %f %f %d %d %d %f %f %d %d %d %d %d %f %d %d %f %f %d %d", &q->type,
+                           &q->w, &q->h, &q->d, &q->sw, &q->sh, &q->sd, &q->cr, &q->ch, &q->csides, &q->chseg, &q->ccap,
+                           &q->ctop, &q->cbot, &q->sr, &q->scols, &q->srows, &q->pw, &q->pd, &q->psw, &q->psd);
+            if (k != 21 || q->type < 0 || q->type >= PRIM_COUNT) q->type = PRIM_NONE;
+            else prim_clamp(q);
+        } else if (line[0] == 'v' && line[1] == ' ') {
+            if (c->nv == c->cv) { c->cv = c->cv * 2 + 64; c->p = realloc(c->p, c->cv * sizeof(V3)); c->c = realloc(c->c, c->cv * sizeof(V3)); }
+            V3 *p = &c->p[c->nv], *cl = &c->c[c->nv];
+            *cl = v3(1, 1, 1);
+            if (sscanf(line + 2, "%f %f %f %f %f %f", &p->x, &p->y, &p->z, &cl->x, &cl->y, &cl->z) >= 3) c->nv++;
+        } else if (line[0] == 'f' && line[1] == ' ') {
+            char *q = line + 2, *end;
+            int k = 0;
+            for (;;) {
+                long v = strtol(q, &end, 10);
+                if (end == q) break;
+                q = end;
+                if (v < 0 || v >= c->nv) { bad |= 1; k = -1; break; }
+                if (c->ni + k + 1 > c->ci) { c->ci = c->ci * 2 + 256; c->fi = realloc(c->fi, c->ci * sizeof(int)); }
+                c->fi[c->ni + k++] = (int)v;
+            }
+            if (k >= 3) {
+                if (c->nf + 2 > c->cf) { c->cf = c->cf * 2 + 64; c->fo = realloc(c->fo, c->cf * sizeof(int)); }
+                c->ni += k;
+                c->fo[++c->nf] = c->ni;
+            }
+        } else if (line[0] == 'e' && line[1] == ' ') {
+            if (c->ne == c->ce) { c->ce = c->ce * 2 + 32; c->eh = realloc(c->eh, c->ce * 3 * sizeof(int)); }
+            int *e = c->eh + 3 * c->ne;
+            if (sscanf(line + 2, "%d %d %d", &e[0], &e[1], &e[2]) == 3 && e[2] >= EH_AUTO && e[2] <= EH_SOFT) c->ne++;
+        }
+    }
+    fclose(f);
+    int n = 0;
+    for (int i = 0; i < nt; i++) {
+        TObj *c = &t[i];
+        if (!c->nf) { tobj_free(c); continue; }
+        int taken = name_used(c->o.name);
+        Obj *o = obj_new(c->o.name);
+        char nm[32];
+        memcpy(nm, o->name, 32);
+        *o = c->o;
+        memcpy(o->name, taken ? nm : c->o.name, 32);   /* keep the saved name unless it is in use */
+        o->m = mesh_from_arrays(c->nv, c->p, c->c, c->nf, c->fo, c->fi);
+        if (c->ne) mesh_set_eh(&o->m, c->eh, c->ne);
+        o->sel = o->hil = 0;
+        o->order = ++stamp;
+        tobj_free(c);
+        n++;
+    }
+    free(t);
+    if (bad & 2) msg("Some image plane pictures could not be found");
+    return n;
+}
+
 
 static void recent_add(const char *path);
 
-/* writes the scene (or the selected objects) in world space; returns the object count or -1 */
+/* writes the scene (or the selected objects): a .tuff scene, or OBJ in world space;
+   returns the object count or -1 */
 static int save_scene(const char *path, int selOnly)
 {
+    if (has_ext(path, ".tuff")) return tuff_save(path, selOnly);
     const Mesh **ms = malloc((nob + 1) * sizeof *ms);
     M4 *mats = malloc((nob + 1) * sizeof *mats);
     const char **names = malloc((nob + 1) * sizeof *names);
@@ -2651,15 +2980,20 @@ static int save_scene(const char *path, int selOnly)
 
 static char g_suggest[MAX_PATH];   /* default export name for a scene that has no OBJ path yet */
 
+/* Save (Ctrl+S) writes the current file in its own format; Save As (ask 1) asks for a scene or OBJ.
+   Export OBJ (ask 2) / Export Selection write an OBJ and leave the current file alone. */
 static void cmd_export(int ask, int selOnly)
 {
     char path[MAX_PATH], b[MAX_PATH + 64];
-    strcpy(path, g_path[0] ? g_path : g_suggest);
-    if ((ask || !g_path[0]) && !file_dlg(1, path)) return;
+    int objOnly = selOnly || ask == 2;
+    strcpy(path, g_path[0] && !objOnly ? g_path : g_suggest[0] ? g_suggest : g_path);
+    if (objOnly && has_ext(path, ".tuff")) strcpy(path + strlen(path) - 5, ".obj");
+    if (!objOnly && !g_path[0] && has_ext(path, ".obj")) strcpy(path + strlen(path) - 4, ".tuff");
+    if ((ask || !g_path[0] || objOnly) && !file_dlg(objOnly ? 2 : 1, path)) return;
     int n = save_scene(path, selOnly);
     if (n < 0) { MessageBoxA(hMain, "Could not write the file.", APP_NAME, MB_ICONERROR); return; }
-    if (!selOnly) { strcpy(g_path, path); modified = 0; recent_add(path); }
-    snprintf(b, sizeof b, "Exported %d object(s) to %s", n, path);
+    if (!objOnly || !lstrcmpiA(path, g_path)) { strcpy(g_path, path); modified = 0; recent_add(path); }
+    snprintf(b, sizeof b, "%s %d object(s) to %s", has_ext(path, ".tuff") ? "Saved" : "Exported", n, path);
     msg(b);
 }
 
@@ -2668,7 +3002,7 @@ static int confirm_discard(void)
 {
     if (!modified || !nob) return 1;
     char q[MAX_PATH + 64];
-    snprintf(q, sizeof q, "Export changes to %s?", g_path[0] ? g_path : "an OBJ file");
+    snprintf(q, sizeof q, "Save changes to %s?", g_path[0] ? g_path : "a scene file");
     int r = MessageBoxA(hMain, q, APP_NAME, MB_YESNOCANCEL | MB_ICONQUESTION);
     if (r == IDCANCEL) return 0;
     if (r == IDYES) { cmd_export(0, 0); return !modified; }
@@ -2686,6 +3020,43 @@ static void load_file(const char *path, int replace)
     if (ext && (!lstrcmpiA(ext, ".mb") || !lstrcmpiA(ext, ".ma"))) {
         MessageBoxA(hMain, "tuff3d reads Maya LT scenes (.mlt) and OBJ files, but not full Maya scenes (.mb, .ma) yet.",
                     APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    if (ext && !lstrcmpiA(ext, ".tuff")) {
+        char head[16] = "";
+        FILE *tf = fopen(p, "r");
+        if (tf) { if (!fgets(head, sizeof head, tf)) head[0] = 0; fclose(tf); }
+        if (strncmp(head, "tuff3d scene", 12)) {
+            snprintf(b, sizeof b, "Could not read %s (not a tuff3d scene?)", p);
+            MessageBoxA(hMain, b, APP_NAME, MB_ICONERROR);
+            return;
+        }
+        undo_push(replace ? "Open" : "Import");
+        if (replace) {
+            for (int i = 0; i < nob; i++) mesh_free(&ob[i].m);
+            nob = 0;
+            for (int i = 0; i < 3; i++) img_clear(i);
+        }
+        set_mode(M_OBJ);
+        clear_sel();
+        int n0 = nob, n = tuff_load(p, replace, replace);
+        if (n < 0) {
+            snap_restore(&undo_s[--nundo]);   /* put the scene back */
+            snprintf(b, sizeof b, "Could not read %s", p);
+            MessageBoxA(hMain, b, APP_NAME, MB_ICONERROR);
+            return;
+        }
+        for (int i = n0; i < nob; i++) ob[i].sel = !replace;
+        if (replace) {
+            snprintf(g_path, sizeof g_path, "%s", p);
+            snprintf(g_suggest, sizeof g_suggest, "%s", p);
+            modified = 0;
+            recent_add(p);
+        }
+        geo_changed();
+        const char *fn = strrchr(p, '\\') ? strrchr(p, '\\') + 1 : p;
+        snprintf(b, sizeof b, "%s %d object(s) from %s", replace ? "Opened" : "Imported", n, fn);
+        msg(b);
         return;
     }
     /* Maya LT scenes are rebuilt from their construction history */
@@ -2785,7 +3156,7 @@ static void recent_add(const char *path)
 }
 
 /* ---- autosave: every minute while there are unexported changes, to
-   %LOCALAPPDATA%\tuff3d\autosave-<process id>-<start time>.obj, deleted on a normal exit. A file
+   %LOCALAPPDATA%\tuff3d\autosave-<process id>-<start time>.tuff, deleted on a normal exit. A file
    left behind by a process that is no longer running means a crash, and is offered back on start.
    (The start time keeps a new process that reuses an old process id from clobbering its file.) */
 
@@ -2807,7 +3178,7 @@ static void autosave_path(char *out)
     out[0] = 0;
     static DWORD started;
     if (!started) started = GetTickCount() | 1;
-    if (autosave_dir(d)) snprintf(out, MAX_PATH, "%s\\autosave-%lu-%lu.obj", d, GetCurrentProcessId(), started);
+    if (autosave_dir(d)) snprintf(out, MAX_PATH, "%s\\autosave-%lu-%lu.tuff", d, GetCurrentProcessId(), started);
 }
 
 static void autosave_tick(void)
@@ -2831,7 +3202,7 @@ static void autosave_recover(void)
     FILETIME bt = { 0, 0 };
     WIN32_FIND_DATAA fd;
     if (!autosave_dir(d)) return;
-    snprintf(pat, sizeof pat, "%s\\autosave-*.obj", d);
+    snprintf(pat, sizeof pat, "%s\\autosave-*.*", d);   /* .tuff now; .obj from older versions */
     HANDLE f = FindFirstFileA(pat, &fd);
     if (f == INVALID_HANDLE_VALUE) return;
     do {
@@ -2852,13 +3223,13 @@ static void autosave_recover(void)
     } while (FindNextFileA(f, &fd));
     FindClose(f);
     if (!best[0]) return;
-    if (MessageBoxA(hMain, "tuff3d did not close normally last time.\n\nRecover the unexported work it autosaved?",
+    if (MessageBoxA(hMain, "tuff3d did not close normally last time.\n\nRecover the unsaved work it autosaved?",
                     APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES) {
         load_file(best, 1);
         g_path[0] = 0;          /* recovered work is untitled until exported */
         modified = 1;
         autosave_tick();        /* safe in our own autosave before the old one goes */
-        msg("Recovered autosaved work - export it to keep it");
+        msg("Recovered autosaved work - save it to keep it");
     }
     DeleteFileA(best);
 }
@@ -3322,12 +3693,292 @@ static void theme_picker(void)
     SetFocus(hPick);
 }
 
+/* ================================================================ hotkey editor
+
+   A list of every command with its two key slots. Click a slot and press the new key (Esc cancels);
+   right click a slot to clear it. A key already used elsewhere moves to the new command. */
+
+static HWND hKeys;
+static int hkScroll, hkHover = -1, hkHoverSlot, hkCap = -1, hkCapSlot, hkContent;
+static char hkNote[160];
+typedef struct { int bind; const char *head; int y; } HkRow;
+static HkRow hkRows[NBIND * 2];
+static int hkN;
+
+static int hk_rowh(void) { return (int)(24 * ds); }
+static int hk_foot(void) { return (int)(64 * ds); }
+
+static void hk_layout(void)
+{
+    const char *g = NULL;
+    int y = (int)(6 * ds), rh = hk_rowh();
+    hkN = 0;
+    for (int i = 0; i < NBIND; i++) {
+        if (!g || strcmp(g, binds[i].group)) {
+            g = binds[i].group;
+            if (hkN) y += (int)(6 * ds);
+            hkRows[hkN].bind = -1;
+            hkRows[hkN].head = g;
+            hkRows[hkN++].y = y;
+            y += rh;
+        }
+        hkRows[hkN].bind = i; hkRows[hkN].head = NULL; hkRows[hkN++].y = y;
+        y += rh;
+    }
+    hkContent = y + (int)(6 * ds);
+}
+
+/* key slot rectangle (in content coordinates) of row r */
+static RECT hk_slot(int r, int slot, int w)
+{
+    int sw = (int)(118 * ds), pad = (int)(8 * ds);
+    RECT rc;
+    rc.left = w - pad - (2 - slot) * (sw + (int)(4 * ds));
+    rc.right = rc.left + sw;
+    rc.top = hkRows[r].y + 2;
+    rc.bottom = hkRows[r].y + hk_rowh() - 2;
+    return rc;
+}
+
+static int hk_hit(int x, int y, int w, int *slot)
+{
+    y += hkScroll;
+    for (int r = 0; r < hkN; r++) {
+        if (hkRows[r].bind < 0) continue;
+        for (int s = 0; s < 2; s++) {
+            RECT rc = hk_slot(r, s, w);
+            POINT pt = { x, y };
+            if (PtInRect(&rc, pt)) { *slot = s; return r; }
+        }
+    }
+    return -1;
+}
+
+static RECT hk_button(int i, int w, int h)
+{
+    int bw = (int)(150 * ds), bh = (int)(26 * ds), pad = (int)(8 * ds);
+    RECT rc;
+    rc.right = w - pad - (1 - i) * (bw + pad);
+    rc.left = rc.right - bw;
+    rc.bottom = h - pad;
+    rc.top = rc.bottom - bh;
+    return rc;
+}
+
+static void hk_paint(HWND h)
+{
+    PAINTSTRUCT ps_;
+    RECT cr;
+    HDC wdc = BeginPaint(h, &ps_);
+    GetClientRect(h, &cr);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bm = CreateCompatibleBitmap(wdc, cr.right, cr.bottom), old = SelectObject(dc, bm);
+    FillRect(dc, &cr, brUi);
+    SetBkMode(dc, TRANSPARENT);
+    int w = cr.right, listh = cr.bottom - hk_foot(), pad = (int)(10 * ds);
+    for (int r = 0; r < hkN; r++) {
+        int y = hkRows[r].y - hkScroll;
+        if (y + hk_rowh() < 0 || y > listh) continue;
+        RECT t = { pad, y, w - pad, y + hk_rowh() };
+        if (hkRows[r].bind < 0) {
+            SelectObject(dc, hBold);
+            SetTextColor(dc, th.head);
+            DrawTextA(dc, hkRows[r].head, -1, &t, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            continue;
+        }
+        Bind *b = &binds[hkRows[r].bind];
+        SelectObject(dc, hFont);
+        SetTextColor(dc, th.text);
+        t.left += (int)(10 * ds);
+        DrawTextA(dc, b->name, -1, &t, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        for (int s = 0; s < 2; s++) {
+            RECT k = hk_slot(r, s, w);
+            OffsetRect(&k, 0, -hkScroll);
+            int cap = hkCap == r && hkCapSlot == s, hot = hkHover == r && hkHoverSlot == s;
+            FillRect(dc, &k, cap ? brHot : brField);
+            FrameRect(dc, &k, cap ? brAcc : hot ? brAcc : brLine);
+            char txt[48] = "";
+            if (cap) snprintf(txt, sizeof txt, "press a key...");
+            else if (b->key[s]) key_text(b->key[s], txt, sizeof txt);
+            SetTextColor(dc, cap || !b->key[s] ? mix(th.fieldText, th.field) : th.fieldText);
+            DrawTextA(dc, txt, -1, &k, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
+    /* footer: a note line and the two buttons */
+    RECT f = { 0, listh, w, cr.bottom };
+    FillRect(dc, &f, brUi);
+    RECT ln = { 0, listh, w, listh + 1 };
+    FillRect(dc, &ln, brLine);
+    SelectObject(dc, hFont);
+    SetTextColor(dc, mix(th.text, th.ui));
+    RECT nt = { pad, listh + (int)(4 * ds), w - pad, listh + (int)(24 * ds) };
+    DrawTextA(dc, hkNote[0] ? hkNote : "Click a key box, then press the key. Right click clears it. Esc closes.", -1, &nt,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    static const char *bl[2] = { "Reset to Defaults", "Close" };
+    for (int i = 0; i < 2; i++) {
+        RECT b = hk_button(i, w, cr.bottom);
+        FillRect(dc, &b, brHot);
+        FrameRect(dc, &b, brLine);
+        SetTextColor(dc, th.text);
+        DrawTextA(dc, bl[i], -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, old);
+    DeleteObject(bm);
+    DeleteDC(dc);
+    EndPaint(h, &ps_);
+}
+
+/* hotkeys changed: save them and refresh everything that shows them */
+static void hk_apply(void)
+{
+    binds_save();
+    menu_keys();
+    RECT rc;
+    GetClientRect(hMain, &rc);
+    SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));   /* toolbar labels may change width */
+    InvalidateRect(hBar, NULL, FALSE);
+    status_update();
+}
+
+static void hk_assign(int code)
+{
+    Bind *b = &binds[hkRows[hkCap].bind];
+    hkNote[0] = 0;
+    for (int i = 0; i < NBIND; i++)
+        for (int s = 0; s < 2; s++)
+            if (binds[i].key[s] == code && !(&binds[i] == b && s == hkCapSlot)) {
+                char k[48];
+                key_text(code, k, sizeof k);
+                snprintf(hkNote, sizeof hkNote, "%s was on %s - it is now %s", k, binds[i].name, b->name);
+                binds[i].key[s] = 0;
+            }
+    b->key[hkCapSlot] = code;
+    hkCap = -1;
+    hk_apply();
+}
+
+static void hk_clamp_scroll(HWND h)
+{
+    RECT rc;
+    GetClientRect(h, &rc);
+    int maxs = hkContent - (rc.bottom - hk_foot());
+    if (hkScroll > maxs) hkScroll = maxs;
+    if (hkScroll < 0) hkScroll = 0;
+}
+
+static LRESULT CALLBACK KeysProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    RECT cr;
+    GetClientRect(h, &cr);
+    int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+    switch (m) {
+    case WM_PAINT: hk_paint(h); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_SIZE: hk_clamp_scroll(h); InvalidateRect(h, NULL, FALSE); return 0;
+    case WM_MOUSEWHEEL:
+        hkScroll -= (short)HIWORD(wp) / 120 * hk_rowh() * 3;
+        hk_clamp_scroll(h);
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    case WM_MOUSEMOVE: {
+        int s = 0, r = y < cr.bottom - hk_foot() ? hk_hit(x, y, cr.right, &s) : -1;
+        if (r != hkHover || s != hkHoverSlot) { hkHover = r; hkHoverSlot = s; InvalidateRect(h, NULL, FALSE); }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: {
+        POINT pt = { x, y };
+        for (int i = 0; i < 2; i++) {
+            RECT b = hk_button(i, cr.right, cr.bottom);
+            if (m == WM_LBUTTONDOWN && PtInRect(&b, pt)) {
+                if (i == 0) {
+                    for (int k = 0; k < NBIND; k++) { binds[k].key[0] = binds[k].def[0]; binds[k].key[1] = binds[k].def[1]; }
+                    snprintf(hkNote, sizeof hkNote, "Every hotkey is back to its default");
+                    hkCap = -1;
+                    hk_apply();
+                    InvalidateRect(h, NULL, FALSE);
+                } else {
+                    DestroyWindow(h);
+                }
+                return 0;
+            }
+        }
+        int s = 0, r = y < cr.bottom - hk_foot() ? hk_hit(x, y, cr.right, &s) : -1;
+        if (r >= 0 && m == WM_RBUTTONDOWN) {
+            binds[hkRows[r].bind].key[s] = 0;
+            hkCap = -1;
+            hk_apply();
+        } else {
+            hkCap = r;
+            hkCapSlot = s;
+        }
+        SetFocus(h);
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    }
+    case WM_KEYDOWN: case WM_SYSKEYDOWN:
+        if (wp == VK_SHIFT || wp == VK_CONTROL || wp == VK_MENU || wp == VK_LWIN || wp == VK_RWIN) return 0;
+        if (wp == VK_ESCAPE) {
+            if (hkCap >= 0) { hkCap = -1; InvalidateRect(h, NULL, FALSE); }
+            else DestroyWindow(h);
+            return 0;
+        }
+        if (hkCap >= 0) {
+            hk_assign((int)wp | (key(VK_CONTROL) ? KC_CTRL : 0) | (key(VK_SHIFT) ? KC_SHIFT : 0));
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
+    case WM_SYSCHAR: case WM_CHAR:
+        return 0;
+    case WM_DESTROY:
+        hKeys = NULL;
+        hkCap = -1;
+        return 0;
+    }
+    return DefWindowProc(h, m, wp, lp);
+}
+
+static void hotkey_editor(void)
+{
+    if (hKeys) { SetForegroundWindow(hKeys); return; }
+    static int reg;
+    if (!reg) {
+        WNDCLASSEXA wc;
+        memset(&wc, 0, sizeof wc);
+        wc.cbSize = sizeof wc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.lpfnWndProc = KeysProc;
+        wc.lpszClassName = "Tuff3DKeys";
+        RegisterClassExA(&wc);
+        reg = 1;
+    }
+    hk_layout();
+    hkScroll = 0;
+    hkCap = hkHover = -1;
+    hkNote[0] = 0;
+    RECT wa, mr;
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    GetWindowRect(hMain, &mr);
+    int cw = (int)(520 * ds), chh = hkContent + hk_foot(), maxh = (wa.bottom - wa.top) * 85 / 100;
+    RECT r = { 0, 0, cw, chh < maxh ? chh : maxh };
+    AdjustWindowRect(&r, WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, FALSE);
+    int w = r.right - r.left, hh = r.bottom - r.top;
+    int x = (mr.left + mr.right - w) / 2, y = (mr.top + mr.bottom - hh) / 2;
+    if (y < wa.top) y = wa.top;
+    hKeys = CreateWindowExA(WS_EX_TOOLWINDOW, "Tuff3DKeys", "Hotkey Editor", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                            x, y, w, hh, hMain, NULL, GetModuleHandle(NULL), NULL);
+    theme_window(hKeys);
+    SetFocus(hKeys);
+}
+
 static const char *HELP_TEXT =
+    "Default hotkeys (Help > Hotkey Editor changes them)\n\n"
     "Navigation (Maya)\n"
-    "  Alt + LMB / MMB / RMB drag\tOrbit / pan / zoom\n"
+    "  Alt + LMB / MMB / RMB drag\tOrbit / pan / zoom (orbiting leaves an ortho view)\n"
     "  Wheel\tZoom\n"
     "  F / A / Home\tFrame selected / frame all / home view\n"
-    "  Click X, Y or Z on the corner gizmo\tLook down that axis (again: other side)\n\n"
+    "  Click X, Y or Z on the corner gizmo\tOrthographic view down that axis (again: other side)\n\n"
     "Selection\n"
     "  Click / drag\tSelect / box select (red highlight = what a click picks)\n"
     "  Shift / Ctrl / Ctrl+Shift\tToggle / remove / add\n"
@@ -3343,25 +3994,25 @@ static const char *HELP_TEXT =
     "  Ctrl + drag arrow\tMove/scale on the other two axes\n"
     "  MMB drag\tDrag the last used handle\n"
     "  hold X / V / J\tSnap to grid / to vertices / rotate in 15 deg steps\n"
-    "  Scale past the center\tFlatten components\n"
     "  Esc while dragging\tCancel the drag\n"
     "  + / -\tManipulator size\n"
-    "  B + LMB drag\tBrush radius (paint tool)\n\n"
+    "  Target Weld\tDrag one vertex onto another\n"
+    "  Insert Edge Loop\tClick an edge (yellow preview)\n"
+    "  Multi-Cut\tClick points; Enter/RMB finish, Backspace, Esc, Ctrl+click = loop\n\n"
     "Edit\n"
-    "  Ctrl+E\tExtrude faces / edges\n"
-    "  Mesh > Fill Hole\tCap the hole the selection touches (toolbar too)\n"
+    "  Ctrl+E / Ctrl+B\tExtrude / bevel (Bevel Width in the side panel)\n"
     "  Ctrl+D / Delete\tDuplicate / delete (edges and vertices: their faces join)\n"
     "  Ctrl+Delete\tDelete Edge/Vertex\n"
     "  Ctrl+H / Ctrl+Shift+H\tHide selected / show all\n"
     "  Z, Ctrl+Z / Shift+Z, Ctrl+Y\tUndo / redo\n"
     "  G\tRepeat last command\n"
     "  4 / 5\tWireframe / shaded\n"
-    "  Ctrl+N / Ctrl+O / Ctrl+S\tNew / open / export OBJ\n"
-    "  Ctrl+Shift+O\tImport OBJ into the scene\n"
+    "  Ctrl+N / Ctrl+O / Ctrl+S\tNew / open / save (.tuff scene or OBJ)\n"
+    "  Ctrl+Shift+O / Ctrl+Shift+S\tImport into the scene / save as\n"
     "  Ctrl+A\tToggle side panel\n"
     "  Ctrl+T\tTheme picker (hover to preview, click to keep)\n\n"
     "Side panel: drag a label left/right to scrub its value (Shift fast, Ctrl fine).\n"
-    "Drop .obj or Maya LT .mlt files on the window to open them (Shift adds them).";
+    "Drop .tuff, .obj or Maya LT .mlt files on the window to open them (Shift adds them).";
 
 static void do_cmd(int id)
 {
@@ -3381,8 +4032,10 @@ static void do_cmd(int id)
         if (nob) undo_push("New Scene");
         for (int i = 0; i < nob; i++) mesh_free(&ob[i].m);
         nob = 0;
+        for (int i = 0; i < 3; i++) img_clear(i);
         mode = M_OBJ;
         g_path[0] = 0;
+        g_suggest[0] = 0;
         modified = 0;
         msg("New scene");
         break;
@@ -3415,6 +4068,15 @@ static void do_cmd(int id)
         break;
     }
     case CM_HUD: hudOn = !hudOn; break;
+    case CM_COMPTOG: set_mode(mode == M_OBJ ? lastComp : M_OBJ); break;
+    case CM_HOTKEYS: hotkey_editor(); break;
+    case CM_MANIPUP: case CM_MANIPDOWN: {
+        char b[48];
+        manipSize *= id == CM_MANIPUP ? 1.15f : 1 / 1.15f;
+        snprintf(b, sizeof b, "Manipulator size %d%%", (int)(manipSize * 100 + .5f));
+        toast(b);
+        break;
+    }
     case CM_ORTHO: ortho = !ortho; toast(ortho ? "Orthographic view" : "Perspective view"); break;
     case CM_IMGFRONT: case CM_IMGSIDE: case CM_IMGTOP: cmd_image(id - CM_IMGFRONT); break;
     case CM_IMGCLEAR:
@@ -3425,6 +4087,7 @@ static void do_cmd(int id)
     case CM_SNAPPOINT: snapPoint = !snapPoint; msg(snapPoint ? "Point snap on" : "Point snap off"); break;
     case CM_EXPORT: cmd_export(0, 0); break;
     case CM_EXPORT_AS: cmd_export(1, 0); break;
+    case CM_EXPORT_OBJ: cmd_export(2, 0); break;
     case CM_EXPORT_SEL:
         if (!has_sel() && mode == M_OBJ) { msg("Export Selection: nothing selected"); break; }
         cmd_export(1, 1);
@@ -4051,7 +4714,10 @@ static int tb_layout(int W)
         SelectObject(dc, hFont);
         GetTextExtentPoint32A(dc, tbItems[i].label, (int)strlen(tbItems[i].label), &a);
         SelectObject(dc, hSmall);
-        GetTextExtentPoint32A(dc, tbItems[i].hotkey, (int)strlen(tbItems[i].hotkey), &b);
+        char hk[48];
+        const char *ht = cmd_key(tbItems[i].cmd, hk, sizeof hk);
+        if (!ht) ht = tbItems[i].hotkey;
+        GetTextExtentPoint32A(dc, ht, (int)strlen(ht), &b);
         int w = (a.cx > b.cx ? a.cx : b.cx) + (int)(9 * ds);
         if (x + w > W - pad && x > pad) { x = pad; y += bh + pad; }
         SetRect(&tbRc[i], x, y, x + w, y + bh);
@@ -4106,7 +4772,9 @@ static void tb_paint(HWND h)
         DrawTextA(dc, t->label, -1, &a, DT_CENTER | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, hSmall);
         SetTextColor(dc, mix(th.text, mix(th.text, th.ui)));
-        DrawTextA(dc, t->hotkey, -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        char hk[48];
+        const char *ht = cmd_key(t->cmd, hk, sizeof hk);
+        DrawTextA(dc, ht ? ht : t->hotkey, -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
     BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, old);
@@ -4222,10 +4890,12 @@ static void status_update(void)
     CheckMenuItem(hMenu, CM_ORTHO, MF_BYCOMMAND | (ortho ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SNAPGRID, MF_BYCOMMAND | (snapGrid ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SNAPPOINT, MF_BYCOMMAND | (snapPoint ? MF_CHECKED : MF_UNCHECKED));
-    char u[64];
-    snprintf(u, sizeof u, nundo ? "&Undo %s\tZ" : "&Undo\tZ", nundo ? undo_s[nundo - 1].what : "");
+    char u[96], k[48];
+    cmd_key(CM_UNDO, k, sizeof k);
+    snprintf(u, sizeof u, "&Undo%s%s%s%s", nundo ? " " : "", nundo ? undo_s[nundo - 1].what : "", k[0] ? "\t" : "", k);
     ModifyMenuA(hMenu, CM_UNDO, MF_BYCOMMAND | MF_STRING | (nundo ? 0 : MF_GRAYED), CM_UNDO, u);
-    snprintf(u, sizeof u, nredo ? "&Redo %s\tShift+Z" : "&Redo\tShift+Z", nredo ? redo_s[nredo - 1].what : "");
+    cmd_key(CM_REDO, k, sizeof k);
+    snprintf(u, sizeof u, "&Redo%s%s%s%s", nredo ? " " : "", nredo ? redo_s[nredo - 1].what : "", k[0] ? "\t" : "", k);
     ModifyMenuA(hMenu, CM_REDO, MF_BYCOMMAND | MF_STRING | (nredo ? 0 : MF_GRAYED), CM_REDO, u);
     InvalidateRect(hBar, NULL, FALSE);
     CheckMenuRadioItem(hThemeMenu, CM_THEME, CM_THEME + NTHEME - 1, CM_THEME + themeIdx, MF_BYCOMMAND);
@@ -4372,7 +5042,7 @@ static void draw_hover(const Obj *o)
 static void hover_update(int x, int y)
 {
     int o = -1, k = 0, i = 0;
-    if (x > -1000 && dk == D_NONE && tool != T_PAINT && !(manip_vis() && hover)) {
+    if (x > -1000 && dk == D_NONE && tool != T_PAINT && tool != T_LOOP && tool != T_CUT && !(manip_vis() && hover)) {
         cam_update();
         if (mode != M_OBJ) pick_comp(x, y, &o, &k, &i);
         if (o < 0) {
@@ -4487,7 +5157,7 @@ static void draw_empty_hint(void)
     static const char *lines[] = {
         "Empty scene",
         "Make something with Cube, Cylinder, Sphere or Plane in the toolbar,",
-        "or drop an .obj or .mlt file here (Ctrl+O opens one).",
+        "or drop a .tuff, .obj or .mlt file here (Ctrl+O opens one).",
         "",
         "Alt + left drag: orbit     Alt + middle drag: pan     Alt + right drag / wheel: zoom",
         "F1: every hotkey",
@@ -4838,44 +5508,9 @@ static void handle_key(WPARAM wp)
         refresh_all();
         return;
     }
-    switch (wp) {
-    case 'Q': id = CM_TSEL; break;
-    case 'W': id = CM_TMOVE; break;
-    case 'E': id = ctrl ? CM_EXTRUDE : CM_TROT; break;
-    case 'R': id = CM_TSCALE; break;
-    case 'B': if (ctrl) id = CM_BEVEL; break;
-    case 'F': id = CM_FRAMESEL; break;
-    case 'A': id = ctrl ? (shift ? CM_SELALL : CM_PANEL) : CM_FRAMEALL; break;
-    case 'I': if (ctrl && shift) id = CM_SELINV; break;
-    case '4': id = CM_WIRE; break;
-    case '5': id = CM_SHADED; break;
-    case VK_F8: id = mode == M_OBJ ? CM_MOBJ + lastComp : CM_MOBJ; break;
-    case VK_F9: id = ctrl ? CM_TOVERT : CM_MVERT; break;
-    case VK_F10: id = ctrl ? CM_TOEDGE : CM_MEDGE; break;
-    case VK_F11: id = ctrl ? CM_TOFACE : CM_MFACE; break;
-    case VK_F7: id = CM_MMULTI; break;
-    case 'Z': id = shift ? CM_REDO : CM_UNDO; break;
-    case 'Y': if (ctrl) id = CM_REDO; break;
-    case 'D': if (ctrl) id = CM_DUP; break;
-    case 'N': if (ctrl) id = CM_NEW; break;
-    case 'O': if (ctrl) id = shift ? CM_IMPORT : CM_OPEN; break;
-    case 'H': if (ctrl) id = shift ? CM_SHOWALL : CM_HIDE; break;
-    case 'T': if (ctrl) id = shift ? CM_THEMENEXT : CM_THEMEPICK; break;
-    case VK_OEM_PERIOD: id = CM_GROW; break;
-    case VK_OEM_COMMA: id = CM_SHRINK; break;
-    case VK_HOME: id = CM_VHOME; break;
-    case 'S': if (ctrl) id = shift ? CM_EXPORT_AS : CM_EXPORT; break;
-    case 'G': id = CM_REPEAT; break;
-    case VK_F1: id = CM_HELP; break;
-    case VK_DELETE: case VK_BACK: id = ctrl ? CM_DELEV : CM_DELETE; break;
-    case VK_OEM_PLUS: case VK_ADD: case VK_OEM_MINUS: case VK_SUBTRACT: {
-        char b[48];
-        manipSize *= wp == VK_OEM_PLUS || wp == VK_ADD ? 1.15f : 1 / 1.15f;
-        snprintf(b, sizeof b, "Manipulator size %d%%", (int)(manipSize * 100 + .5f));
-        toast(b);
-        break;
-    }
-    }
+    int code = (int)wp | (ctrl ? KC_CTRL : 0) | (shift ? KC_SHIFT : 0);
+    for (int i = 0; i < NBIND && !id; i++)
+        if (binds[i].key[0] == code || binds[i].key[1] == code) id = binds[i].cmd;
     if (id) do_cmd(id);
 }
 
@@ -5096,14 +5731,15 @@ static HMENU build_menu(void)
     HMENU bar = CreateMenu(), m;
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_NEW, "&New Scene\tCtrl+N");
-    AppendMenuA(m, MF_STRING, CM_OPEN, "&Open OBJ...\tCtrl+O");
+    AppendMenuA(m, MF_STRING, CM_OPEN, "&Open...\tCtrl+O");
     hRecentMenu = CreatePopupMenu();
     AppendMenuA(m, MF_POPUP, (UINT_PTR)hRecentMenu, "Open &Recent");
-    AppendMenuA(m, MF_STRING, CM_IMPORT, "&Import OBJ (add to scene)...\tCtrl+Shift+O");
+    AppendMenuA(m, MF_STRING, CM_IMPORT, "&Import (add to scene)...\tCtrl+Shift+O");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING, CM_EXPORT, "&Export OBJ\tCtrl+S");
-    AppendMenuA(m, MF_STRING, CM_EXPORT_AS, "Export OBJ &As...\tCtrl+Shift+S");
-    AppendMenuA(m, MF_STRING, CM_EXPORT_SEL, "Export &Selection as OBJ...");
+    AppendMenuA(m, MF_STRING, CM_EXPORT, "&Save\tCtrl+S");
+    AppendMenuA(m, MF_STRING, CM_EXPORT_AS, "Save &As...\tCtrl+Shift+S");
+    AppendMenuA(m, MF_STRING, CM_EXPORT_OBJ, "&Export OBJ...");
+    AppendMenuA(m, MF_STRING, CM_EXPORT_SEL, "Export Se&lection as OBJ...");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_EXIT, "E&xit");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&File");
@@ -5225,6 +5861,7 @@ static HMENU build_menu(void)
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Display");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_HELP, "&Hotkeys\tF1");
+    AppendMenuA(m, MF_STRING, CM_HOTKEYS, "Hotkey &Editor...");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Help");
     return bar;
 }
@@ -5347,6 +5984,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     bevelW = reg_int("BevelWidth", 10000) / 1e5f;
     if (bevelW <= 0) bevelW = 0.1f;
     recent_load();
+    binds_load();
 
     hFont = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     hHud = CreateFontA(-(int)(13 * ds), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Segoe UI");
@@ -5377,6 +6015,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     RegisterClassExA(&wc);
 
     hMenu = build_menu();
+    menu_keys();
     hMain = CreateWindowA("Tuff3DMain", APP_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                           (int)(1280 * ds), (int)(800 * ds), NULL, hMenu, inst, NULL);
     hBar = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);

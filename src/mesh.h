@@ -78,6 +78,7 @@ void mesh_grow(Mesh *m, int comp, int shrink);      /* grow/shrink by one ring o
 void mesh_convert(Mesh *m, int from, int to);       /* selection of kind 'from' becomes kind 'to' */
 void mesh_flip(Mesh *m);                            /* reverse every face's winding */
 int mesh_edge_find(const Mesh *m, int a, int b);    /* the edge joining a and b, or -1 */
+void mesh_set_eh(Mesh *m, const int *trip, int n);  /* n (a, b, eh) triples: edge overrides */
 /* the edge ring through edge e (across quads), oriented so t measured from each ring edge's
    first vertex lines up; ra/rb get the ring's vertex pairs (room for m->ne). Returns its length,
    *closed says whether it wraps around. */

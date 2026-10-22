@@ -974,6 +974,19 @@ int mesh_edge_find(const Mesh *m, int a, int b)
     return -1;
 }
 
+void mesh_set_eh(Mesh *m, const int *trip, int n)
+{
+    HMap h;
+    edge_map(&h, m);
+    for (int i = 0; i < n; i++) {
+        int a = trip[3 * i], b = trip[3 * i + 1];
+        if (a < 0 || b < 0 || a >= m->nv || b >= m->nv) continue;
+        int e = edge_at(&h, a, b);
+        if (e >= 0) m->eh[e] = (unsigned char)trip[3 * i + 2];
+    }
+    hm_free(&h);
+}
+
 int mesh_reverse(Mesh *m, const unsigned char *fmask)
 {
     int n = 0;
