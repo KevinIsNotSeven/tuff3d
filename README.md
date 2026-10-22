@@ -30,7 +30,9 @@ Modeling
   an edge inserts an edge loop)
 - Target Weld tool (drag one vertex onto another), Merge Vertices by distance (Merge Distance in the
   side panel), Delete Edge/Vertex (Delete or Ctrl+Delete on edges or vertices joins their faces)
-- Combine / Separate objects, Triangulate, Quadrangulate, Reverse Normals
+- Combine / Separate (Mesh menu and toolbar): Separate splits each selected object into its loose
+  pieces (handy for an OBJ exported as one mesh), or, in face mode, turns the selected faces into a
+  new object. Triangulate, Quadrangulate, Reverse Normals
 - Fill Hole: caps the open border your selected vertices, edges or faces touch (or every hole of the
   selected objects in object mode); the new face is left selected, ready to extrude
 - Modify menu: Freeze Transformations, Center Pivot, Reset Transformations
