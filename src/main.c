@@ -28,7 +28,7 @@ typedef struct {
 } Obj;
 
 enum { M_OBJ, M_VERT, M_EDGE, M_FACE, M_MULTI };   /* component modes match COMP_* */
-enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, NTOOL };
+enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, T_LOOP, NTOOL };
 enum { H_NONE, H_X, H_Y, H_Z, H_YZ, H_XZ, H_XY, H_C, H_VIEW };
 
 static Obj *ob;
@@ -41,6 +41,9 @@ static M4 nframe;
 static float manipSize = 1;
 static float defAngle;          /* normal angle for new objects: the last shading picked */
 static float mergeDist = 0.01f;     /* Mesh > Merge Vertices */
+static float bevelW = 0.1f;         /* Edit Mesh > Bevel */
+static int bridgeDivs;              /* Edit Mesh > Bridge */
+static int liveCmd;                 /* the last step was this op: its settings redo it live */
 static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
 static char g_path[MAX_PATH];
@@ -63,6 +66,7 @@ static float ds = 1;
 static void refresh_all(void);
 static void status_text(void);
 static int delete_ev(void);
+static void set_mode(int m);
 static void draw_weld(void);
 static void redraw(void) { InvalidateRect(hView, NULL, FALSE); }
 static int key(int vk) { return GetKeyState(vk) < 0; }
@@ -489,6 +493,7 @@ static void stack_push(Snap *st, int *n, Snap s)
 
 static void undo_push(const char *what)
 {
+    liveCmd = 0;
     Snap s = snap_take();
     snprintf(s.what, sizeof s.what, "%s", what);
     modified = 1;
@@ -505,6 +510,7 @@ static void undo_drop(void)
 
 static void do_undo(void)
 {
+    liveCmd = 0;
     if (!nundo) { msg("Nothing to undo"); return; }
     Snap s = snap_take();
     memcpy(s.what, undo_s[nundo - 1].what, sizeof s.what);
@@ -518,6 +524,7 @@ static void do_undo(void)
 
 static void do_redo(void)
 {
+    liveCmd = 0;
     if (!nredo) { msg("Nothing to redo"); return; }
     Snap s = snap_take();
     memcpy(s.what, redo_s[nredo - 1].what, sizeof s.what);
@@ -962,6 +969,98 @@ static void select_rect(int x0, int y0, int x1, int y1, int mod)
 #undef INSIDE
 }
 
+/* nearest visible edge of any shown object (within a few pixels); u: where along it (ev order) */
+static int edge_pick(int mx, int my, int *obj, int *edge, float *u)
+{
+    int R = (int)(14 * ds);
+    float best = (float)R;
+    *obj = -1;
+    depth_capture(mx - R - 4, my - R - 4, mx + R + 4, my + R + 4);
+    for (int i = 0; i < nob; i++) {
+        if (ob[i].hidden) continue;
+        Mesh *m = &ob[i].m;
+        M4 M = obj_mat(&ob[i]);
+        for (int e = 0; e < m->ne; e++) {
+            V3 a = m4_pt(M, m->p[m->ev[2 * e]]), b = m4_pt(M, m->p[m->ev[2 * e + 1]]);
+            float ax, ay, bx, by, t, x, y, z;
+            if (!proj(a, &ax, &ay, NULL) || !proj(b, &bx, &by, NULL)) continue;
+            float d = seg_dist((float)mx, (float)my, ax, ay, bx, by, &t);
+            if (d >= best || !proj(v3lerp(a, b, t), &x, &y, &z) || !visible(x, y, z)) continue;
+            best = d; *obj = i; *edge = e; *u = t;
+        }
+    }
+    return *obj >= 0;
+}
+
+/* ---- Insert Edge Loop tool: the edge under the cursor and where the new loop would run */
+
+static struct { int obj, e, n, closed; float u; V3 *pts; } elp = { -1, 0, 0, 0, 0, NULL };
+
+static void loop_hover(int x, int y)
+{
+    int o, e = 0;
+    float u = 0;
+    cam_update();
+    if (!edge_pick(x, y, &o, &e, &u)) {
+        if (elp.obj >= 0) { elp.obj = -1; redraw(); }
+        return;
+    }
+    /* the screen fraction is close enough to the edge's own for a preview; snap to the middle */
+    if (fabsf(u - 0.5f) < 0.04f) u = 0.5f;
+    if (u < 0.02f) u = 0.02f;
+    if (u > 0.98f) u = 0.98f;
+    Mesh *m = &ob[o].m;
+    int *ra = malloc((m->ne + 1) * sizeof(int)), *rb = malloc((m->ne + 1) * sizeof(int));
+    elp.n = mesh_edge_ring(m, e, ra, rb, &elp.closed);
+    elp.pts = realloc(elp.pts, (elp.n + 1) * sizeof(V3));
+    M4 M = obj_mat(&ob[o]);
+    for (int i = 0; i < elp.n; i++) elp.pts[i] = m4_pt(M, v3lerp(m->p[ra[i]], m->p[rb[i]], u));
+    free(ra); free(rb);
+    elp.obj = o; elp.e = e; elp.u = u;
+    redraw();
+}
+
+static void draw_loop_preview(void)
+{
+    if (tool != T_LOOP || elp.obj < 0 || elp.obj >= nob || dk != D_NONE) return;
+    glColor3f(1, 1, 0);
+    glLineWidth(2 * ds);
+    glBegin(elp.closed ? GL_LINE_LOOP : GL_LINE_STRIP);
+    for (int i = 0; i < elp.n; i++) {
+        float x, y;
+        if (proj(elp.pts[i], &x, &y, NULL)) glVertex2f(x, y);
+    }
+    glEnd();
+    if (elp.n == 1) {   /* a single quad: show the point on the edge */
+        float x, y;
+        glPointSize(7 * ds);
+        glBegin(GL_POINTS);
+        if (proj(elp.pts[0], &x, &y, NULL)) glVertex2f(x, y);
+        glEnd();
+    }
+    glLineWidth(1);
+}
+
+static void loop_click(void)
+{
+    if (elp.obj < 0 || elp.obj >= nob) return;
+    Obj *o = &ob[elp.obj];
+    undo_push("Insert Edge Loop");
+    if (!mesh_insert_loop(&o->m, elp.e, elp.u)) {
+        undo_drop();
+        msg("Insert Edge Loop: needs four-sided faces on at least one side of the edge");
+        return;
+    }
+    o->prim.type = PRIM_NONE;
+    if (mode != M_EDGE && mode != M_MULTI) set_mode(M_EDGE);
+    for (int i = 0; i < nob; i++)
+        if (i != elp.obj && ob[i].hil) memset(ob[i].m.es, 0, ob[i].m.ne);
+    o->hil = 1;
+    o->order = ++stamp;
+    elp.obj = -1;
+    msg("Inserted an edge loop (it is selected)");
+}
+
 /* bounding box of the selection (or of everything) in world space */
 static int sel_bbox(V3 *mn, V3 *mx, int all)
 {
@@ -1084,6 +1183,7 @@ static void view_axis(int axis, int neg)
 static void set_mode(int m)
 {
     if (m == mode) return;
+    liveCmd = 0;
     if (m != M_OBJ) lastComp = m;
     if (mode == M_OBJ)
         for (int i = 0; i < nob; i++) ob[i].hil = ob[i].sel;
@@ -1096,9 +1196,11 @@ static void set_mode(int m)
 static void set_tool(int t)
 {
     if (t != tool) lastHandle = H_NONE;
+    elp.obj = -1;
     tool = t;
     normalFrame = 0;
     if (t == T_WELD && mode != M_VERT && mode != M_MULTI) set_mode(M_VERT);
+    if (t == T_LOOP && mode != M_EDGE && mode != M_MULTI) set_mode(M_EDGE);
 }
 
 /* ================================================================ manipulator */
@@ -1615,7 +1717,7 @@ enum {
     CM_EXTRUDE, CM_MERGE,
     CM_APPLYCOL, CM_SETCOL,
     CM_WIRE, CM_SHADED, CM_HARD, CM_SMOOTH, CM_AUTOSMOOTH, CM_FRAMESEL, CM_FRAMEALL, CM_PANEL,
-    CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT, CM_TWELD,   /* CM_TSEL + T_* */
+    CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT, CM_TWELD, CM_TLOOP,   /* CM_TSEL + T_* */
     CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE, CM_MMULTI,
     CM_SELALL, CM_SELINV,
     CM_OPEN, CM_GROW, CM_SHRINK, CM_LOOP, CM_TOVERT, CM_TOEDGE, CM_TOFACE,
@@ -1623,6 +1725,7 @@ enum {
     CM_VFRONT, CM_VSIDE, CM_VTOP, CM_VHOME, CM_HUD, CM_SNAPGRID, CM_SNAPPOINT, CM_WIRETOG,
     CM_HELP, CM_THEMEPICK, CM_THEMENEXT, CM_THEMEPREV, CM_THEMERAND,
     CM_REVERSE, CM_TRIANG, CM_QUAD, CM_COMBINE, CM_SEPARATE, CM_MERGEDIST, CM_DELEV,
+    CM_BEVEL, CM_BRIDGE, CM_HARDEN, CM_SOFTEN,
     CM_RECENT = 300,             /* + recent file index */
     CM_THEME = 200               /* + theme index */
 };
@@ -1962,6 +2065,109 @@ static int delete_ev(void)
     if (!n) { undo_drop(); msg("Delete: those can't be removed without leaving a hole (try deleting faces)"); return 1; }
     msg(edges ? "Deleted edges" : "Deleted vertices");
     return 1;
+}
+
+/* edges an op works on: every edge in object mode, else the selected edges, the edges of the
+   selected faces, or edges with both ends selected. NULL: none. */
+static unsigned char *op_edges(Obj *o)
+{
+    Mesh *m = &o->m;
+    unsigned char *em = calloc(m->ne + 1, 1);
+    int n = 0;
+    if (mode == M_OBJ) { memset(em, 1, m->ne); return em; }
+    if (shows(M_EDGE)) for (int e = 0; e < m->ne; e++) n += em[e] = m->es[e] != 0;
+    if (!n && shows(M_FACE))
+        for (int e = 0; e < m->ne; e++) {
+            int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1];
+            n += em[e] = (f0 >= 0 && m->fs[f0]) || (f1 >= 0 && m->fs[f1]);
+        }
+    if (!n && shows(M_VERT))
+        for (int e = 0; e < m->ne; e++) n += em[e] = m->vs[m->ev[2 * e]] && m->vs[m->ev[2 * e + 1]];
+    if (!n) { free(em); return NULL; }
+    return em;
+}
+
+/* Edit Mesh > Bevel (Ctrl+B): Bevel Width in the side panel redoes it live until the next step */
+static void cmd_bevel(void)
+{
+    int n = 0;
+    undo_push("Bevel");
+    for (int i = 0; i < nob; i++) {
+        if (!active(&ob[i])) continue;
+        unsigned char *em = op_edges(&ob[i]);
+        if (!em) continue;
+        int k = mesh_bevel(&ob[i].m, em, bevelW);
+        free(em);
+        if (k) { n += k; ob[i].prim.type = PRIM_NONE; }
+    }
+    if (!n) { undo_drop(); msg("Bevel: select edges (or faces, or objects) that have faces on both sides"); return; }
+    char b[96];
+    snprintf(b, sizeof b, "Bevelled %d edge(s) - Bevel Width in the side panel adjusts it", n);
+    msg(b);
+    liveCmd = CM_BEVEL;
+}
+
+/* Edit Mesh > Bridge: two runs of selected border edges on one object */
+static void cmd_bridge(void)
+{
+    int objs = 0, n = 0, err = 0;
+    for (int i = 0; i < nob; i++) {
+        if (!ob[i].hil) continue;
+        int any = 0;
+        for (int e = 0; e < ob[i].m.ne && shows(M_EDGE); e++) any |= ob[i].m.es[e];
+        objs += any;
+    }
+    if (!objs) { msg("Bridge: select two open borders (edge mode; double-click an edge for its loop)"); return; }
+    if (objs > 1) { msg("Bridge: the borders are on different objects - Mesh > Combine them first"); return; }
+    undo_push("Bridge");
+    for (int i = 0; i < nob; i++) {
+        if (!ob[i].hil) continue;
+        int k = mesh_bridge(&ob[i].m, ob[i].m.es, bridgeDivs);
+        if (k > 0) { n += k; ob[i].prim.type = PRIM_NONE; }
+        else if (k < 0) err = k;
+    }
+    if (!n) {
+        undo_drop();
+        msg(err == -2 ? "Bridge: the two borders need the same number of edges"
+                      : "Bridge: select edges on exactly two open borders");
+        return;
+    }
+    char b[96];
+    snprintf(b, sizeof b, "Bridged with %d face(s) - Bridge Divisions in the side panel adjusts it", n);
+    msg(b);
+    liveCmd = CM_BRIDGE;
+}
+
+/* Harden / Soften Edge: per edge shading on the selected edges; on whole objects it is
+   the same as Hard / Smooth Shade */
+static void cmd_shade(float angle, const char *what);
+
+static void cmd_edge_shade(int hard)
+{
+    if (mode == M_OBJ) { cmd_shade(hard ? 0 : 180, hard ? "Harden Edge" : "Soften Edge"); return; }
+    int n = 0;
+    undo_push(hard ? "Harden Edge" : "Soften Edge");
+    for (int i = 0; i < nob; i++) {
+        if (!ob[i].hil) continue;
+        unsigned char *em = op_edges(&ob[i]);
+        if (!em) continue;
+        for (int e = 0; e < ob[i].m.ne; e++)
+            if (em[e]) { ob[i].m.eh[e] = hard ? EH_HARD : EH_SOFT; n++; }
+        free(em);
+    }
+    if (!n) { undo_drop(); msg("Harden / Soften Edge: select edges, faces or objects"); return; }
+    char b[64];
+    snprintf(b, sizeof b, hard ? "Hardened %d edge(s)" : "Softened %d edge(s)", n);
+    msg(b);
+}
+
+/* a tool setting changed right after its op: undo the op and run it again with the new value */
+static void live_redo(int cmd)
+{
+    if (liveCmd != cmd || !nundo) return;
+    snap_restore(&undo_s[--nundo]);
+    if (cmd == CM_BEVEL) cmd_bevel();
+    else cmd_bridge();
 }
 
 /* Hard / smooth / auto smooth shading on the selected (or hilited) objects.
@@ -2854,7 +3060,7 @@ static void do_cmd(int id)
         SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
         break;
     }
-    case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT: case CM_TWELD:
+    case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT: case CM_TWELD: case CM_TLOOP:
         set_tool(id - CM_TSEL);
         break;
     case CM_REVERSE: cmd_face_op(mesh_reverse, "Reverse Normals", "Reversed %d face(s)"); break;
@@ -2863,6 +3069,10 @@ static void do_cmd(int id)
     case CM_COMBINE: cmd_combine(); break;
     case CM_SEPARATE: cmd_separate(); break;
     case CM_MERGEDIST: cmd_merge_dist(); break;
+    case CM_BEVEL: cmd_bevel(); break;
+    case CM_BRIDGE: cmd_bridge(); break;
+    case CM_HARDEN: cmd_edge_shade(1); break;
+    case CM_SOFTEN: cmd_edge_shade(0); break;
     case CM_DELEV:
         if (mode == M_OBJ || !delete_ev()) msg("Delete Edge/Vertex: select edges or vertices");
         break;
@@ -2883,7 +3093,7 @@ static void do_cmd(int id)
     }
     }
     if ((id >= CM_DELETE && id <= CM_MERGE) || id == CM_APPLYCOL || id == CM_GROW || id == CM_SHRINK ||
-        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE || (id >= CM_REVERSE && id <= CM_DELEV))
+        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE || (id >= CM_REVERSE && id <= CM_SOFTEN))
         lastCmd = id;
     refresh_all();
 }
@@ -2898,7 +3108,7 @@ enum {
     PF_NANGLE,
     PF_PW, PF_PD, PF_PSW, PF_PSD,
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY,
-    PF_MERGED
+    PF_MERGED, PF_BEVELW, PF_BRIDGED
 };
 enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP };
 #define NROW 64
@@ -2914,6 +3124,7 @@ static float *fld_f(int id)
     if (id == PF_OPA) return &paintOpa;
     if (id == PF_RAD) return &paintRad;
     if (id == PF_MERGED) return &mergeDist;
+    if (id == PF_BEVELW) return &bevelW;
     if (!o) return NULL;
     if (id >= PF_TX && id <= PF_TZ) return &o->t.x + (id - PF_TX);
     if (id >= PF_RX && id <= PF_RZ) return &o->r.x + (id - PF_RX);
@@ -2935,6 +3146,7 @@ static float *fld_f(int id)
 static int *fld_i(int id)
 {
     Obj *o = panelObj >= 0 && panelObj < nob ? &ob[panelObj] : NULL;
+    if (id == PF_BRIDGED) return &bridgeDivs;
     if (!o) return NULL;
     switch (id) {
     case PF_CSW: return &o->prim.sw;
@@ -3043,6 +3255,8 @@ static void panel_build(void)
     add_row(RK_BUTTON, PF_APPLY, "Apply Color to Selection");
     add_row(RK_HEAD, 0, "Mesh Tools");
     add_row(RK_FLOAT, PF_MERGED, "Merge Distance");
+    add_row(RK_FLOAT, PF_BEVELW, "Bevel Width");
+    add_row(RK_INT, PF_BRIDGED, "Bridge Divisions");
 
     RECT rc;
     GetClientRect(hPanel, &rc);
@@ -3108,6 +3322,7 @@ static void panel_set(int r, double v)
         if (id == PF_OPA) { paintOpa = (float)(v < 0 ? 0 : v > 1 ? 1 : v); return; }
         if (id == PF_RAD) { paintRad = (float)(v < 1 ? 1 : v > 2000 ? 2000 : v); return; }
         if (id == PF_MERGED) { mergeDist = (float)(v < 0 ? 0 : v > 1e4 ? 1e4 : v); return; }
+        if (id == PF_BEVELW) { bevelW = (float)(v < 1e-4 ? 1e-4 : v > 1e4 ? 1e4 : v); live_redo(CM_BEVEL); return; }
         if (id <= PF_SZ) {
             /* channel edits apply to every selected object */
             for (int i = 0; i < nob; i++)
@@ -3122,6 +3337,7 @@ static void panel_set(int r, double v)
         }
         *fld_f(id) = (float)v;
     } else {
+        if (id == PF_BRIDGED) { bridgeDivs = v < 0 ? 0 : v > 50 ? 50 : (int)v; live_redo(CM_BRIDGE); return; }
         *fld_i(id) = (int)v;
     }
     prim_rebuild(&ob[panelObj]);
@@ -3192,7 +3408,7 @@ static void scrub_move(int x)
 {
     int id = rows[scrub.row].id, dx = x - scrub.x0;
     float mul = key(VK_SHIFT) ? 10 : key(VK_CONTROL) ? 0.1f : 1;
-    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : id == PF_MERGED ? 0.001 : 0.01;
+    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : id == PF_MERGED ? 0.001 : id == PF_BEVELW ? 0.002 : 0.01;
     double v = rows[scrub.row].kind == RK_INT ? scrub.v0 + (int)(dx * mul / 6) : scrub.v0 + dx * step * mul;
     double cur;
     if (rows[scrub.row].kind == RK_FLOAT) v = round(v * 1000) / 1000;
@@ -3362,6 +3578,9 @@ static const Tool tbItems[] = {
     { "Sphere", "", CM_SPHERE, "Create a polygon sphere" },
     { "Plane", "", CM_PLANE, "Create a polygon plane" }, { 0 },
     { "Extrude", "Ctrl+E", CM_EXTRUDE, "Extrude the selected faces or edges, then drag the blue handle" },
+    { "Bevel", "Ctrl+B", CM_BEVEL, "Bevel the selected edges (Bevel Width in the side panel adjusts it)" },
+    { "Bridge", "", CM_BRIDGE, "Join two selected open borders with faces" },
+    { "Edge Loop", "", CM_TLOOP, "Insert Edge Loop tool: click an edge to add a loop across it" },
     { "Merge", "", CM_MERGE, "Merge the selected vertices to their center" },
     { "Fill Hole", "", CM_FILLHOLE, "Cap the hole the selection is on (an object: all its holes)" },
     { "Duplicate", "Ctrl+D", CM_DUP, "Duplicate the selected objects" },
@@ -3519,7 +3738,7 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 static void status_text(void)
 {
     static const char *mn[] = { "Object mode", "Vertex mode", "Edge mode", "Face mode", "Multi mode" };
-    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld" };
+    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld", "Insert Edge Loop" };
     static const char *hint[] = {
         "Click to select, drag for a box. Shift: toggle, Ctrl: remove, Ctrl+Shift: add. Alt+drag: orbit/pan/zoom",
         "Drag a handle to move. Hold X: grid snap, V: point snap, Ctrl+handle: other two axes, Esc: cancel",
@@ -3527,6 +3746,7 @@ static void status_text(void)
         "Drag a handle to scale. Drag components past the center to flatten them. Esc cancels",
         "Drag over a mesh to paint. B+drag: brush size. Color, opacity and radius are in the side panel",
         "Drag from one vertex onto another to weld them together (the first one moves). Esc cancels",
+        "Click an edge to add an edge loop across it, where the yellow preview shows",
     };
     int nsel = 0, ncomp = 0;
     for (int i = 0; i < nob; i++) {
@@ -3868,7 +4088,7 @@ static HCURSOR view_cursor(void)
     if (dk == D_TUMBLE) c = IDC_SIZEALL;
     else if (dk == D_PAN) c = IDC_HAND;
     else if (dk == D_DOLLY) c = IDC_SIZENS;
-    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD) c = IDC_CROSS;
+    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP) c = IDC_CROSS;
     else if (gizmoHover >= 0) c = IDC_HAND;
     return LoadCursor(NULL, c);
 }
@@ -3930,6 +4150,14 @@ static void render(void)
         if (hil) {
             glColor3f(0.35f, 0.75f, 1.0f);
             draw_all_edges(m);
+            /* Harden Edge overrides: thicker, like Maya's hard edge display */
+            glLineWidth(2.5f * ds);
+            glColor3f(0.1f, 0.3f, 0.9f);
+            glBegin(GL_LINES);
+            for (int e = 0; e < m->ne; e++)
+                if (m->eh[e] == EH_HARD) { glVertex3fv(&m->p[m->ev[2 * e]].x); glVertex3fv(&m->p[m->ev[2 * e + 1]].x); }
+            glEnd();
+            glLineWidth(1);
             if (shows(M_EDGE)) {
                 glLineWidth(2.5f * ds);
                 glColor3f(1, 0.5f, 0.05f);
@@ -4028,6 +4256,7 @@ static void render(void)
         }
     }
     draw_weld();
+    draw_loop_preview();
     if (hudOn) draw_hud();
     if (!nob) draw_empty_hint();
     draw_drag_label();
@@ -4166,6 +4395,7 @@ static void handle_key(WPARAM wp)
     case 'W': id = CM_TMOVE; break;
     case 'E': id = ctrl ? CM_EXTRUDE : CM_TROT; break;
     case 'R': id = CM_TSCALE; break;
+    case 'B': if (ctrl) id = CM_BEVEL; break;
     case 'F': id = CM_FRAMESEL; break;
     case 'A': id = ctrl ? (shift ? CM_SELALL : CM_PANEL) : CM_FRAMEALL; break;
     case 'I': if (ctrl && shift) id = CM_SELINV; break;
@@ -4272,6 +4502,10 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (!manip_vis()) return 0;
             drag_begin(lastHandle, x, y);
             dk = D_MANIP;
+        } else if (tool == T_LOOP && elp.obj >= 0) {
+            loop_click();
+            refresh_all();
+            return 0;
         } else if (tool == T_WELD && (wd.v = weld_pick(x, y, -1)) >= 0) {
             wd.tgt = -1;
             dk = D_WELD;
@@ -4348,6 +4582,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             int gh = gizmo_hit(x, y);
             if (gh != gizmoHover) { gizmoHover = gh; SetCursor(view_cursor()); redraw(); }
             hover_update(gh >= 0 ? -10000 : x, y);
+            if (tool == T_LOOP) loop_hover(x, y);
             if (tool == T_PAINT) redraw();
             return 0;
         }
@@ -4364,6 +4599,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_MOUSELEAVE:
         tracking = 0;
+        elp.obj = -1;
         gizmoHover = -1;
         curx = cury = -1000;
         hover_update(-10000, 0);
@@ -4460,6 +4696,10 @@ static HMENU build_menu(void)
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Mesh");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_EXTRUDE, "&Extrude\tCtrl+E");
+    AppendMenuA(m, MF_STRING, CM_BEVEL, "&Bevel\tCtrl+B");
+    AppendMenuA(m, MF_STRING, CM_BRIDGE, "B&ridge");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_TLOOP, "&Insert Edge Loop Tool");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_MERGE, "&Merge to Center");
     AppendMenuA(m, MF_STRING, CM_TWELD, "&Target Weld Tool");
@@ -4480,6 +4720,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_TSCALE, "S&cale Tool\tR");
     AppendMenuA(m, MF_STRING, CM_TPAINT, "&Paint Vertex Color Tool");
     AppendMenuA(m, MF_STRING, CM_TWELD, "Target &Weld Tool");
+    AppendMenuA(m, MF_STRING, CM_TLOOP, "&Insert Edge Loop Tool");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Tools");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_SETCOL, "&Set Paint Color...");
@@ -4492,6 +4733,8 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_HARD, "Hard Shade");
     AppendMenuA(m, MF_STRING, CM_SMOOTH, "Smooth Shade");
     AppendMenuA(m, MF_STRING, CM_AUTOSMOOTH, "Auto Smooth (Normal Angle)");
+    AppendMenuA(m, MF_STRING, CM_HARDEN, "Har&den Edge");
+    AppendMenuA(m, MF_STRING, CM_SOFTEN, "S&often Edge");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_FRAMESEL, "&Frame Selected\tF");
     AppendMenuA(m, MF_STRING, CM_FRAMEALL, "Frame &All\tA");
@@ -4605,6 +4848,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         reg_set_int("NormalAngle", (int)(defAngle * 100));
         reg_set_int("ManipSize", (int)(manipSize * 1000));
         reg_set_int("MergeDist", (int)(mergeDist * 1e5f));
+        reg_set_int("BevelWidth", (int)(bevelW * 1e5f));
         autosave_remove();
         PostQuitMessage(0);
         return 0;
@@ -4632,6 +4876,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     manipSize = reg_int("ManipSize", 1000) / 1000.0f;
     if (manipSize < .05f || manipSize > 50) manipSize = 1;
     mergeDist = reg_int("MergeDist", 1000) / 1e5f;
+    bevelW = reg_int("BevelWidth", 10000) / 1e5f;
+    if (bevelW <= 0) bevelW = 0.1f;
     recent_load();
 
     hFont = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
