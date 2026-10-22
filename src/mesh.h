@@ -39,14 +39,15 @@ typedef struct Mesh {
     int ne; int *ev; int *ef; unsigned char *es;   /* ev: 2 verts (lo,hi), ef: up to 2 faces (-1) */
 } Mesh;
 
-enum { COMP_VERT = 1, COMP_EDGE = 2, COMP_FACE = 3 };
-enum { PRIM_NONE, PRIM_CUBE, PRIM_CYL, PRIM_SPHERE };
+enum { COMP_VERT = 1, COMP_EDGE = 2, COMP_FACE = 3, COMP_MULTI = 4 };   /* MULTI: union of all three */
+enum { PRIM_NONE, PRIM_CUBE, PRIM_CYL, PRIM_SPHERE, PRIM_PLANE, PRIM_COUNT };
 
 typedef struct Prim {
     int type;
     float w, h, d; int sw, sh, sd;                          /* cube */
     float cr, ch; int csides, chseg, ccap, ctop, cbot;      /* cylinder (ccap: cap rings, 0 = n-gon) */
     float sr; int scols, srows;                             /* sphere */
+    float pw, pd; int psw, psd;                             /* plane (XZ, facing +Y) */
 } Prim;
 
 void prim_defaults(Prim *p, int type);
@@ -58,6 +59,7 @@ Mesh mesh_copy(const Mesh *m);
 void mesh_edges(Mesh *m);
 V3 mesh_fnormal(const Mesh *m, int f);
 V3 mesh_fcenter(const Mesh *m, int f);
+void mesh_cnormals(const Mesh *m, float angle, V3 *out);   /* out: one per face corner, fo[nf] */
 int mesh_vmask(const Mesh *m, int comp, unsigned char *mask);
 int mesh_extrude_faces(Mesh *m);
 int mesh_extrude_edges(Mesh *m);
@@ -65,7 +67,25 @@ int mesh_merge(Mesh *m, const unsigned char *mask);
 int mesh_delete_faces(Mesh *m);
 int mesh_raycast(const Mesh *m, V3 o, V3 d, float *t);
 
-int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names);
-int obj_load(const char *path, Mesh **ms, char (**names)[32]);
+/* selection helpers; comp is COMP_VERT/EDGE/FACE */
+int mesh_edge_loop(Mesh *m, int e);                 /* adds the loop through edge e, returns its length */
+void mesh_grow(Mesh *m, int comp, int shrink);      /* grow/shrink by one ring of vertex neighbors */
+void mesh_convert(Mesh *m, int from, int to);       /* selection of kind 'from' becomes kind 'to' */
+void mesh_flip(Mesh *m);                            /* reverse every face's winding */
+/* cap open border loops with one face each: every loop touching a vertex in touch[] (all loops when
+   touch is NULL). The new faces are the only selected faces afterwards. Returns how many were made. */
+int mesh_fill_holes(Mesh *m, const unsigned char *touch);
+
+/* angles: per mesh normal angle (writes vn + s), or NULL for positions only */
+int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles);
+/* angles (may be NULL): per mesh normal angle from s lines or a tuff3d comment, -1 = not given */
+int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles);
+
+/* build a mesh from plain arrays (face f uses fi[fo[f] .. fo[f+1]-1]); c may be NULL for white */
+Mesh mesh_from_arrays(int nv, const V3 *p, const V3 *c, int nf, const int *fo, const int *fi);
+
+/* Maya LT scene (.mlt): rebuilds each visible mesh from its construction history, in world space.
+   report (optional) receives a short summary of what was rebuilt or skipped. Returns -1 on error. */
+int mlt_load(const char *path, Mesh **ms, char (**names)[32], char *report, int report_size);
 
 #endif

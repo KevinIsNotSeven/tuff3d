@@ -1,3 +1,5 @@
-test_out.obj
+__pycache__/
+*.pyc
 *.o
 a.out
+test_out.obj
