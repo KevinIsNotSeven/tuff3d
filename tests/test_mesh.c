@@ -170,7 +170,8 @@ int main(void)
     CHECK(obj_save("test_out.obj", 1, ms, mats, names, angles));
     Mesh *lm;
     char (*ln)[32];
-    int n = obj_load("test_out.obj", &lm, &ln);
+    float *la;
+    int n = obj_load("test_out.obj", &lm, &ln, &la);
     CHECK(n == 1);
     if (n == 1) {
         CHECK(lm[0].nv == 8 && lm[0].nf == 6 && !strcmp(ln[0], "pCube1"));
@@ -178,8 +179,9 @@ int main(void)
         int red = 0;
         for (int v = 0; v < 8; v++) red += lm[0].c[v].y == 0;
         CHECK(red == 1);
+        CHECK(la[0] == 30);   /* shading survives the round trip */
         mesh_free(&lm[0]);
-        free(lm); free(ln);
+        free(lm); free(ln); free(la);
     }
     {
         FILE *f = fopen("test_out.obj", "r");
@@ -190,12 +192,25 @@ int main(void)
         CHECK(vn == 6 && fslash == 6);   /* hard cube: one shared normal per face */
     }
     CHECK(obj_save("test_out.obj", 1, ms, mats, names, NULL));
-    n = obj_load("test_out.obj", &lm, &ln);
+    n = obj_load("test_out.obj", &lm, &ln, NULL);
     CHECK(n == 1);
     if (n == 1) {
         CHECK(lm[0].nv == 8 && lm[0].nf == 6);
         mesh_free(&lm[0]);
         free(lm); free(ln);
+    }
+    /* smoothing groups written by other apps */
+    {
+        FILE *f = fopen("test_out.obj", "w");
+        fputs("v 0 0 0\nv 1 0 0\nv 0 1 0\no a\ns 1\nf 1 2 3\no b\ns off\nf 1 3 2\no c\nf 1 2 3\n", f);
+        fclose(f);
+        n = obj_load("test_out.obj", &lm, &ln, &la);
+        CHECK(n == 3);
+        if (n == 3) {
+            CHECK(la[0] == 180 && la[1] == 0 && la[2] == -1);
+            for (int i = 0; i < 3; i++) mesh_free(&lm[i]);
+            free(lm); free(ln); free(la);
+        }
     }
     remove("test_out.obj");
     mesh_free(&m);

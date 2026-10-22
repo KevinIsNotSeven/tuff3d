@@ -78,7 +78,8 @@ int mesh_fill_holes(Mesh *m, const unsigned char *touch);
 
 /* angles: per mesh normal angle (writes vn + s), or NULL for positions only */
 int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles);
-int obj_load(const char *path, Mesh **ms, char (**names)[32]);
+/* angles (may be NULL): per mesh normal angle from s lines or a tuff3d comment, -1 = not given */
+int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles);
 
 /* build a mesh from plain arrays (face f uses fi[fo[f] .. fo[f+1]-1]); c may be NULL for white */
 Mesh mesh_from_arrays(int nv, const V3 *p, const V3 *c, int nf, const int *fo, const int *fi);

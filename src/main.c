@@ -1914,9 +1914,10 @@ static void load_file(const char *path, int replace)
     char report[600] = "";
     Mesh *ms;
     char (*names)[32];
-    int n = mlt ? mlt_load(p, &ms, &names, report, sizeof report) : obj_load(p, &ms, &names);
+    float *angles = NULL;
+    int n = mlt ? mlt_load(p, &ms, &names, report, sizeof report) : obj_load(p, &ms, &names, &angles);
     if (n <= 0) {
-        if (n == 0) free(ms), free(names);
+        if (n == 0) free(ms), free(names), free(angles);
         snprintf(b, sizeof b, n < 0 ? "Could not read %s" : "Nothing in %s could be rebuilt yet", p);
         if (mlt && report[0]) {
             size_t l = strlen(b);
@@ -1935,11 +1936,13 @@ static void load_file(const char *path, int replace)
     for (int i = 0; i < n; i++) {
         Obj *o = obj_new(names[i]);
         o->m = ms[i];
+        if (angles && angles[i] >= 0) o->nangle = angles[i];
         o->sel = !replace;
         o->order = ++stamp;
     }
     free(ms);
     free(names);
+    free(angles);
     if (replace) {
         /* an .mlt opens as an unsaved OBJ scene: Export must never write over the .mlt itself */
         snprintf(g_path, sizeof g_path, "%s", mlt ? "" : p);
@@ -4326,6 +4329,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         reg_set_int("Panel", panelOn);
         reg_set_int("Hud", hudOn);
         reg_set_int("Wire", wire);
+        reg_set_int("NormalAngle", (int)(defAngle * 100));
         reg_set_int("ManipSize", (int)(manipSize * 1000));
         autosave_remove();
         PostQuitMessage(0);
@@ -4349,6 +4353,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     panelOn = reg_int("Panel", 1);
     hudOn = reg_int("Hud", 1);
     wire = reg_int("Wire", 0);
+    defAngle = reg_int("NormalAngle", 0) / 100.0f;
+    if (defAngle < 0 || defAngle > 180) defAngle = 0;
     manipSize = reg_int("ManipSize", 1000) / 1000.0f;
     if (manipSize < .05f || manipSize > 50) manipSize = 1;
     recent_load();

@@ -56,7 +56,8 @@ Comfort
 - Autosave every minute while there are unexported changes; after a crash, tuff3d offers to recover
 - The title bar shows the file name with `*` for unexported changes, and New / Open / Exit ask before
   discarding them
-- Remembers the window position, side panel, wireframe, heads-up display, manipulator size and theme
+- Remembers the window position, side panel, wireframe, heads-up display, manipulator size, theme
+  and the last shading mode picked
 - 48 themes (Classic, 33 dark, 14 light), picked in the theme picker (Ctrl+T or Display > Theme):
   a tile per theme showing tuff3d in its colors; hover a tile to preview it on the whole window,
   click to keep it, arrow keys to step through, R for a random one. Ctrl+Shift+T steps to the next
@@ -65,7 +66,10 @@ Comfort
 - Hard Shade, Smooth Shade and Auto Smooth per object (Display menu). Auto Smooth keeps edges
   sharper than the Normal Angle (default 30°, editable in the side panel) hard and smooths the rest
 - Export OBJ (world space, vertex colors written as `v x y z r g b`, shading written as `vn` normals)
-  and open/import OBJ
+  and open/import OBJ. Shading comes back when you reopen the file, and smoothing groups from other
+  apps' OBJs (`s 1` / `s off`) open smooth or hard
+
+See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what could come next.
 
 ## Controls (Maya defaults)
 

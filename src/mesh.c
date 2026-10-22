@@ -1052,7 +1052,7 @@ int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, con
                     if (vfirst[v] < 0) vfirst[v] = c;
                 }
             free(cn); free(vfirst);
-            fprintf(f, "s %s\n", angles[i] > 0 ? "1" : "off");
+            fprintf(f, "# tuff3d normal angle %g\ns %s\n", angles[i], angles[i] > 0 ? "1" : "off");
         }
         for (int fc = 0; fc < m->nf; fc++) {
             int o = m->fo[fc], cnt = m->fo[fc + 1] - o;
@@ -1090,8 +1090,9 @@ static char *read_line(FILE *f, char **buf, size_t *cap)
 typedef struct {
     V3 *p, *c; int np, cp;
     int *fo, *fi; int nf, cf, ni, ci;
-    Mesh *ms; char (*names)[32]; int nm, cm;
+    Mesh *ms; char (*names)[32]; float *angles; int nm, cm;
     char name[32];
+    float angle; int exact;   /* shading of the current object: -1 unknown; exact = from our own comment */
     int *map;
 } ObjRead;
 
@@ -1118,14 +1119,16 @@ static void objr_flush(ObjRead *r)
         r->cm = r->cm ? r->cm * 2 : 8;
         r->ms = xrealloc(r->ms, r->cm * sizeof(Mesh));
         r->names = xrealloc(r->names, r->cm * sizeof(*r->names));
+        r->angles = xrealloc(r->angles, r->cm * sizeof(float));
     }
+    r->angles[r->nm] = r->angle;
     r->ms[r->nm] = mb_finish(&b);
     memcpy(r->names[r->nm], r->name, 32);
     r->nm++;
     r->nf = r->ni = 0;
 }
 
-int obj_load(const char *path, Mesh **ms, char (**names)[32])
+int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles)
 {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -1135,6 +1138,7 @@ int obj_load(const char *path, Mesh **ms, char (**names)[32])
     r.fo = xrealloc(NULL, r.cf * sizeof(int));
     r.fo[0] = 0;
     strcpy(r.name, "imported");
+    r.angle = -1;
     char *buf = NULL;
     size_t cap = 0;
     char *line;
@@ -1179,6 +1183,15 @@ int obj_load(const char *path, Mesh **ms, char (**names)[32])
             objr_flush(&r);
             char nm[32] = { 0 };
             if (sscanf(s + 2, "%31s", nm) == 1) strcpy(r.name, nm);
+            if (s[0] == 'o') r.angle = -1, r.exact = 0;
+        } else if (s[0] == 's' && (s[1] == ' ' || s[1] == '\t') && !r.exact) {
+            /* smoothing groups from other apps: off/0 = hard, any group = smooth */
+            char *q = s + 2;
+            while (*q == ' ' || *q == '\t') q++;
+            r.angle = !strncmp(q, "off", 3) || atoi(q) == 0 ? 0 : 180;
+        } else if (!strncmp(s, "# tuff3d normal angle ", 22)) {
+            r.angle = (float)atof(s + 22);
+            r.exact = 1;
         }
     }
     objr_flush(&r);
@@ -1186,5 +1199,7 @@ int obj_load(const char *path, Mesh **ms, char (**names)[32])
     free(buf); free(r.p); free(r.c); free(r.fo); free(r.fi); free(r.map);
     *ms = r.ms;
     *names = r.names;
+    if (angles) *angles = r.angles;
+    else free(r.angles);
     return r.nm;
 }
