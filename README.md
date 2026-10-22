@@ -1,8 +1,8 @@
 # tuff3d
 
 A small, minimalist polygon modeler for Windows with Autodesk Maya's navigation and hotkeys.
-It is one ~230 KB exe with no installer, and it only uses DLLs that ship with Windows
-(OpenGL 1.1, GDI, common dialogs, shell drag and drop). It redraws only when something changes, so
+It is one ~420 KB exe with no installer, and it only uses DLLs that ship with Windows
+(OpenGL 1.1, GDI, GDI+ for reference images, common dialogs, shell drag and drop). It redraws only when something changes, so
 it sits at 0% CPU when idle. Meshes are drawn from cached vertex arrays that are only rebuilt after
 an edit, so tumbling and hovering stay fast on dense meshes.
 
@@ -22,6 +22,15 @@ Modeling
 - Snapping: hold X (grid), V (onto vertices, with a marker on the target) or J (15 degree rotation);
   Grid Snap and Point Snap are also toggle buttons
 - Extrude faces (kept together, then pull along the normal) and extrude edges; Merge to Center
+- Bevel (Ctrl+B) the selected edges, the edges of selected faces, or whole objects; Bridge two open
+  borders. Bevel Width and Bridge Divisions in the side panel redo the last bevel/bridge live
+- Insert Edge Loop tool: hover an edge for a yellow preview of the loop, click to add it
+- Multi-Cut tool: click points on edges or vertices to cut faces (Enter or right click finishes,
+  Backspace drops the last point, Esc cancels, clicking the first point closes the cut, Ctrl+click
+  an edge inserts an edge loop)
+- Target Weld tool (drag one vertex onto another), Merge Vertices by distance (Merge Distance in the
+  side panel), Delete Edge/Vertex (Delete or Ctrl+Delete on edges or vertices joins their faces)
+- Combine / Separate objects, Triangulate, Quadrangulate, Reverse Normals
 - Fill Hole: caps the open border your selected vertices, edges or faces touch (or every hole of the
   selected objects in object mode); the new face is left selected, ready to extrude
 - Modify menu: Freeze Transformations, Center Pivot, Reset Transformations
@@ -63,10 +72,16 @@ Comfort
   click to keep it, arrow keys to step through, R for a random one. Ctrl+Shift+T steps to the next
   theme. Themes color the viewport, side panel, toolbar, status bar, menu bar and (Windows 10/11)
   the title bar
-- Hard Shade, Smooth Shade and Auto Smooth per object (Display menu). Auto Smooth keeps edges
-  sharper than the Normal Angle (default 30°, editable in the side panel) hard and smooths the rest
+- Hard Shade, Smooth Shade and Auto Smooth per object (Display menu and toolbar). Auto Smooth keeps
+  edges sharper than the Normal Angle (default 30°, editable in the side panel) hard and smooths the
+  rest; Harden / Soften Edge override single edges (hard ones draw thicker while editing)
+- Front / side / top views are orthographic, with the grid on the view plane; orbiting goes back to
+  perspective. Display > Image Planes puts a reference picture behind each of those views
+- Help > Hotkey Editor: change any command's keys (two per command); menus and toolbar follow
+- Save scenes as `.tuff` (File > Save): everything is kept, including hidden objects, primitive
+  settings, edge overrides, the camera and image planes. Autosave uses it too
 - Export OBJ (world space, vertex colors written as `v x y z r g b`, shading written as `vn` normals)
-  and open/import OBJ. Shading comes back when you reopen the file, and smoothing groups from other
+  and open/import OBJ; Ctrl+S on an opened OBJ saves back to it. Shading comes back when you reopen the file, and smoothing groups from other
   apps' OBJs (`s 1` / `s off`) open smooth or hard
 
 See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what could come next.
@@ -92,22 +107,22 @@ See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what c
 | hold X / V / J | Snap to grid / to vertices / rotation to 15° |
 | Esc while dragging | Cancel the drag |
 | + / - | Manipulator size |
-| Ctrl+E | Extrude |
+| Ctrl+E / Ctrl+B | Extrude / bevel |
 | Ctrl+D | Duplicate |
-| Delete | Delete objects / faces |
+| Delete / Ctrl+Delete | Delete objects or faces / delete edges or vertices (their faces join) |
 | Ctrl+H / Ctrl+Shift+H | Hide selected / show all |
 | Z or Ctrl+Z / Shift+Z or Ctrl+Y | Undo / redo |
 | G | Repeat last command |
 | 4 / 5 | Wireframe / shaded |
 | B + LMB drag | Brush radius (paint tool) |
-| Ctrl+N / Ctrl+O / Ctrl+S | New / open / export OBJ |
-| Ctrl+Shift+O / Ctrl+Shift+S | Import OBJ into the scene / export as |
+| Ctrl+N / Ctrl+O / Ctrl+S | New / open / save (.tuff scene, or back to the open OBJ) |
+| Ctrl+Shift+O / Ctrl+Shift+S | Import into the scene / save as |
 | Ctrl+A | Toggle side panel |
 | Ctrl+T / Ctrl+Shift+T | Theme picker / next theme |
 | F1 | Hotkey list |
 
-Merge to Center and the Paint Vertex Color Tool are in the Mesh and Tools menus, as in Maya,
-where they have no default hotkey.
+Tools without a Maya default hotkey (Paint, Target Weld, Insert Edge Loop, Multi-Cut, Bridge, Merge,
+...) are in the toolbar and the Mesh / Edit Mesh / Tools menus; Help > Hotkey Editor can give them keys.
 
 ## Maya LT scenes (.mlt)
 
