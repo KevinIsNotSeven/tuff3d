@@ -28,7 +28,7 @@ typedef struct {
 } Obj;
 
 enum { M_OBJ, M_VERT, M_EDGE, M_FACE, M_MULTI };   /* component modes match COMP_* */
-enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, T_LOOP, NTOOL };
+enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, T_LOOP, T_CUT, NTOOL };
 enum { H_NONE, H_X, H_Y, H_Z, H_YZ, H_XZ, H_XY, H_C, H_VIEW };
 
 static Obj *ob;
@@ -543,13 +543,25 @@ static float yaw = 0.7854f, pitch = 0.46f, dist = 10.0f;
 static const float FOVY = 0.6981f;
 static M4 Pm, Vm, VPm, iVPm;
 static V3 eye, camF, camR, camU;
+static int ortho;              /* orthographic projection (front/side/top views); orbiting leaves it */
 
 static void cam_update(void)
 {
     V3 dir = v3(cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw));
     eye = v3add(coi, v3mul(dir, dist));
-    Vm = m4_lookat(eye, coi, v3(0, 1, 0));
-    Pm = m4_persp(FOVY, (float)vw / vh, dist * 0.01f, dist * 1000.0f);
+    V3 up = v3(0, 1, 0);
+    if (fabsf(cosf(pitch)) < 1e-3f) {
+        /* straight down (top view) or up: screen up is away from where the camera came from */
+        float sg = pitch > 0 ? 1.0f : -1.0f;
+        up = v3(-sinf(yaw) * sg, 0, -cosf(yaw) * sg);
+    }
+    Vm = m4_lookat(eye, coi, up);
+    if (ortho) {
+        float hh = dist * tanf(FOVY * 0.5f), hw = hh * vw / vh;
+        Pm = m4_ortho(-hw, hw, -hh, hh, -dist * 100.0f, dist * 100.0f);
+    } else {
+        Pm = m4_persp(FOVY, (float)vw / vh, dist * 0.01f, dist * 1000.0f);
+    }
     VPm = m4_mul(Pm, Vm);
     iVPm = m4_inv(VPm);
     camF = v3mul(dir, -1);
@@ -592,9 +604,16 @@ static void mouse_ray(float sx, float sy, V3 *o, V3 *d)
 /* world units per pixel at point p */
 static float wpp(V3 p)
 {
+    if (ortho) return 2 * dist * tanf(FOVY * 0.5f) / vh;
     float depth = v3dot(v3sub(p, eye), camF);
     if (depth < 1e-4f) depth = 1e-4f;
     return 2 * depth * tanf(FOVY * 0.5f) / vh;
+}
+
+/* direction from p toward the viewer (the same everywhere in an orthographic view) */
+static V3 to_eye(V3 p)
+{
+    return ortho ? v3mul(camF, -1) : v3norm(v3sub(eye, p));
 }
 
 static int ray_plane(V3 o, V3 d, V3 p, V3 n, V3 *hit)
@@ -1061,6 +1080,183 @@ static void loop_click(void)
     msg("Inserted an edge loop (it is selected)");
 }
 
+/* ---- Multi-Cut tool: click points on edges or vertices; each one cuts across the face it shares
+   with the one before. Enter or right click finishes, Backspace takes the last point back, Esc
+   drops them all. Ctrl+click an edge inserts an edge loop instead. */
+
+static struct {
+    int obj, n, cap, hv;        /* hv: 0 nothing under the cursor, 1 a point, 2 one that can't connect */
+    const V3 *key;              /* the mesh the points belong to (dropped if it changes) */
+    CutPt *p, hp;
+    V3 *w, hw;
+} mc = { -1, 0, 0, 0, NULL, NULL, { 0, 0, 0 }, NULL, { 0, 0, 0 } };
+
+static int cut_on_face(const Mesh *m, int f, CutPt q)
+{
+    int s = m->fo[f], n = m->fo[f + 1] - s;
+    for (int k = 0; k < n; k++) {
+        int a = m->fi[s + k], b = m->fi[s + (k + 1) % n];
+        if (q.b < 0 ? a == q.a : (a == q.a && b == q.b) || (a == q.b && b == q.a)) return 1;
+    }
+    return 0;
+}
+
+static int cut_same(CutPt a, CutPt b)
+{
+    if (a.b < 0 || b.b < 0) return a.b < 0 && b.b < 0 && a.a == b.a;
+    if (a.a == b.b && a.b == b.a) b.t = 1 - b.t, b.a = a.a, b.b = a.b;
+    return a.a == b.a && a.b == b.b && fabsf(a.t - b.t) < 1e-3f;
+}
+
+/* can a cut run from a to b inside one face? */
+static int cut_link(const Mesh *m, CutPt a, CutPt b)
+{
+    if (cut_same(a, b)) return 0;
+    for (int f = 0; f < m->nf; f++)
+        if (cut_on_face(m, f, a) && cut_on_face(m, f, b)) return 1;
+    return 0;
+}
+
+static void mc_reset(void)
+{
+    mc.obj = -1;
+    mc.n = mc.hv = 0;
+}
+
+static int mc_valid(void)
+{
+    if (mc.obj < 0 || mc.obj >= nob || ob[mc.obj].m.p != mc.key) { mc_reset(); return 0; }
+    return 1;
+}
+
+static void mc_hover(int x, int y)
+{
+    int o = -1, e = 0, kind = 0, idx = 0;
+    float u = 0;
+    mc_valid();
+    if (!mc.n) mc.obj = -1;   /* before the first click any object will do */
+    cam_update();
+    mc.hv = 0;
+    /* a vertex close by wins, else a point on the nearest edge */
+    int R = (int)(10 * ds);
+    float best = (float)R;
+    depth_capture(x - 20, y - 20, x + 20, y + 20);
+    for (int i = 0; i < nob; i++) {
+        if (ob[i].hidden || (mc.obj >= 0 && i != mc.obj)) continue;
+        Mesh *m = &ob[i].m;
+        M4 M = obj_mat(&ob[i]);
+        for (int v = 0; v < m->nv; v++) {
+            float sx, sy, sz;
+            if (!proj(m4_pt(M, m->p[v]), &sx, &sy, &sz)) continue;
+            float d = hypotf(sx - x, sy - y);
+            if (d < best && visible(sx, sy, sz)) { best = d; o = i; kind = 1; idx = v; }
+        }
+    }
+    if (o < 0) {
+        int oo, ee;
+        float uu;
+        if (edge_pick(x, y, &oo, &ee, &uu) && (mc.obj < 0 || oo == mc.obj)) { o = oo; e = ee; u = uu; kind = 2; }
+    }
+    if (o < 0) { redraw(); return; }
+    Mesh *m = &ob[o].m;
+    M4 M = obj_mat(&ob[o]);
+    if (kind == 1) {
+        mc.hp.a = idx; mc.hp.b = -1; mc.hp.t = 0;
+        mc.hw = m4_pt(M, m->p[idx]);
+    } else {
+        if (fabsf(u - 0.5f) < 0.04f) u = 0.5f;   /* the middle is easy to hit */
+        mc.hp.a = m->ev[2 * e]; mc.hp.b = m->ev[2 * e + 1]; mc.hp.t = u;
+        mc.hw = m4_pt(M, v3lerp(m->p[mc.hp.a], m->p[mc.hp.b], u));
+    }
+    mc.hv = mc.n && !cut_link(m, mc.p[mc.n - 1], mc.hp) ? 2 : 1;
+    if (!mc.n) mc.obj = o;   /* provisional until the first click */
+    redraw();
+}
+
+static void mc_commit(void)
+{
+    if (!mc_valid() || mc.n < 2) { mc_reset(); return; }
+    Obj *o = &ob[mc.obj];
+    undo_push("Multi-Cut");
+    int k = mesh_cut(&o->m, mc.p, mc.n);
+    if (!k) { undo_drop(); mc_reset(); msg("Multi-Cut: nothing to cut"); return; }
+    o->prim.type = PRIM_NONE;
+    if (mode != M_EDGE && mode != M_MULTI) set_mode(M_EDGE);
+    o->hil = 1;
+    o->order = ++stamp;
+    char b[64];
+    snprintf(b, sizeof b, "Cut %d face(s) - the new edges are selected", k);
+    msg(b);
+    mc_reset();
+}
+
+/* returns 1 when the click was used */
+static int mc_click(int ctrl)
+{
+    if (!mc.hv) return mc.n > 0;
+    Mesh *m = &ob[mc.obj].m;
+    if (ctrl && mc.hp.b >= 0) {
+        /* Ctrl+click an edge: a whole edge loop through that point */
+        int e = mesh_edge_find(m, mc.hp.a, mc.hp.b), o = mc.obj;
+        float t = m->ev[2 * e] == mc.hp.a ? mc.hp.t : 1 - mc.hp.t;
+        mc_reset();
+        undo_push("Insert Edge Loop");
+        if (!mesh_insert_loop(&ob[o].m, e, t)) { undo_drop(); msg("Insert Edge Loop: needs four-sided faces beside the edge"); return 1; }
+        ob[o].prim.type = PRIM_NONE;
+        if (mode != M_EDGE && mode != M_MULTI) set_mode(M_EDGE);
+        ob[o].hil = 1;
+        msg("Inserted an edge loop");
+        return 1;
+    }
+    if (mc.hv == 2) { msg("Multi-Cut: the next point has to be on a face the last point touches"); return 1; }
+    if (mc.n >= 2 && cut_same(mc.hp, mc.p[0])) {
+        /* back on the first point: close the cut and finish */
+        if (mc.n + 1 > mc.cap) { mc.cap = mc.cap * 2 + 8; mc.p = realloc(mc.p, mc.cap * sizeof *mc.p); mc.w = realloc(mc.w, mc.cap * sizeof *mc.w); }
+        mc.p[mc.n] = mc.hp;
+        mc.w[mc.n++] = mc.hw;
+        mc_commit();
+        return 1;
+    }
+    if (mc.n + 1 > mc.cap) { mc.cap = mc.cap * 2 + 8; mc.p = realloc(mc.p, mc.cap * sizeof *mc.p); mc.w = realloc(mc.w, mc.cap * sizeof *mc.w); }
+    if (!mc.n) mc.key = m->p;
+    mc.p[mc.n] = mc.hp;
+    mc.w[mc.n++] = mc.hw;
+    mc.hv = 0;
+    return 1;
+}
+
+static void draw_cut(void)
+{
+    if (tool != T_CUT) return;
+    if (mc.n && !mc_valid()) return;
+    float x, y, px = 0, py = 0, r = 4 * ds;
+    glLineWidth(2 * ds);
+    glColor3f(1, 1, 0);
+    glBegin(GL_LINE_STRIP);
+    for (int i = 0; i < mc.n; i++) if (proj(mc.w[i], &x, &y, NULL)) glVertex2f(x, y);
+    glEnd();
+    if (mc.hv && mc.n && proj(mc.w[mc.n - 1], &px, &py, NULL) && proj(mc.hw, &x, &y, NULL)) {
+        if (mc.hv == 2) glColor3f(1, .25f, .25f);
+        glEnable(GL_LINE_STIPPLE);
+        glLineStipple(1, 0xF0F0);
+        glBegin(GL_LINES);
+        glVertex2f(px, py); glVertex2f(x, y);
+        glEnd();
+        glDisable(GL_LINE_STIPPLE);
+    }
+    glPointSize(7 * ds);
+    glBegin(GL_POINTS);
+    glColor3f(1, 1, 0);
+    for (int i = 0; i < mc.n; i++) if (proj(mc.w[i], &x, &y, NULL)) glVertex2f(x, y);
+    if (mc.hv) {
+        if (mc.hv == 2) glColor3f(1, .25f, .25f);
+        if (proj(mc.hw, &x, &y, NULL)) glVertex2f(x, y);
+    }
+    glEnd();
+    glLineWidth(1);
+    (void)r;
+}
+
 /* bounding box of the selection (or of everything) in world space */
 static int sel_bbox(V3 *mn, V3 *mx, int all)
 {
@@ -1171,7 +1367,8 @@ static void frame(int all)
 /* look along an axis (0 X, 1 Y, 2 Z; sign picks the side), keeping the current framing */
 static void view_axis(int axis, int neg)
 {
-    float yw = axis == 0 ? PI_F / 2 : 0, pt = axis == 1 ? 1.55f : 0;
+    float yw = axis == 0 ? PI_F / 2 : 0, pt = axis == 1 ? PI_F / 2 : 0;
+    ortho = 1;
     if (neg) { if (axis == 1) pt = -pt; else yw += PI_F; }
     cam_to(coi, dist, yw, pt);
     static const char *names[3][2] = { { "Side view (+X)", "Side view (-X)" }, { "Top view", "Bottom view" }, { "Front view", "Back view" } };
@@ -1197,10 +1394,11 @@ static void set_tool(int t)
 {
     if (t != tool) lastHandle = H_NONE;
     elp.obj = -1;
+    if (tool == T_CUT && t != T_CUT) mc_commit();   /* leaving Multi-Cut finishes the cut */
     tool = t;
     normalFrame = 0;
     if (t == T_WELD && mode != M_VERT && mode != M_MULTI) set_mode(M_VERT);
-    if (t == T_LOOP && mode != M_EDGE && mode != M_MULTI) set_mode(M_EDGE);
+    if ((t == T_LOOP || t == T_CUT) && mode != M_EDGE && mode != M_MULTI) set_mode(M_EDGE);
 }
 
 /* ================================================================ manipulator */
@@ -1267,7 +1465,7 @@ static V3 ring_pt(const MG *g, int i, float a)
 
 static int ring_front(const MG *g, V3 q)
 {
-    return v3dot(v3norm(v3sub(q, g->piv)), v3norm(v3sub(eye, g->piv))) > -0.02f;
+    return v3dot(v3norm(v3sub(q, g->piv)), to_eye(g->piv)) > -0.02f;
 }
 
 static void plane_corners(const MG *g, int i, V3 c[4])
@@ -1349,7 +1547,7 @@ static void drag_begin(int h, int mx, int my)
             if (!ray_plane(o, d, g.piv, dg.pn, &dg.hit0)) dg.hit0 = g.piv;
         }
     } else if (tool == T_ROTATE) {
-        V3 toEye = v3norm(v3sub(eye, g.piv));
+        V3 toEye = to_eye(g.piv);
         dg.axis = h == H_VIEW ? toEye : g.ax[h - H_X];
         dg.planeMode = fabsf(v3dot(dg.axis, toEye)) > 0.2f;
         V3 hit;
@@ -1708,6 +1906,203 @@ static void paint_end(void)
     memset(&ps, 0, sizeof ps);
 }
 
+/* ================================================================ reference image planes
+
+   One picture each for the front, side and top views, drawn behind everything, facing its axis.
+   Images load through GDI+ (gdiplus.dll ships with Windows), found at run time. */
+
+typedef struct { char path[MAX_PATH]; GLuint tex; int w, h; float size, ox, oy, opa; } ImgPlane;
+static ImgPlane img[3];
+static const char *IMG_NAME[3] = { "Front", "Side", "Top" };
+
+typedef struct { UINT32 ver; void *cb; BOOL noThread, noCodecs; } GpStartIn;
+typedef struct { UINT w, h; INT stride, fmt; void *scan0; UINT_PTR res; } GpBits;
+typedef struct { INT x, y, w, h; } GpRect;
+
+/* RGBA pixels (bottom row first, ready for OpenGL) of an image file, or NULL */
+static unsigned char *image_load(const char *path, int *w, int *h)
+{
+    static HMODULE gp;
+    static int (WINAPI *Startup)(ULONG_PTR *, const GpStartIn *, void *);
+    static int (WINAPI *FromFile)(const WCHAR *, void **);
+    static int (WINAPI *GetW)(void *, UINT *), (WINAPI *GetH)(void *, UINT *);
+    static int (WINAPI *Lock)(void *, const GpRect *, UINT, INT, GpBits *), (WINAPI *Unlock)(void *, GpBits *);
+    static int (WINAPI *Dispose)(void *);
+    if (!gp) {
+        gp = LoadLibraryA("gdiplus.dll");
+        if (!gp) return NULL;
+        Startup = (void *)GetProcAddress(gp, "GdiplusStartup");
+        FromFile = (void *)GetProcAddress(gp, "GdipCreateBitmapFromFile");
+        GetW = (void *)GetProcAddress(gp, "GdipGetImageWidth");
+        GetH = (void *)GetProcAddress(gp, "GdipGetImageHeight");
+        Lock = (void *)GetProcAddress(gp, "GdipBitmapLockBits");
+        Unlock = (void *)GetProcAddress(gp, "GdipBitmapUnlockBits");
+        Dispose = (void *)GetProcAddress(gp, "GdipDisposeImage");
+        ULONG_PTR tok;
+        GpStartIn in = { 1, NULL, FALSE, FALSE };
+        if (!Startup || !FromFile || !GetW || !GetH || !Lock || !Unlock || !Dispose || Startup(&tok, &in, NULL)) { FreeLibrary(gp); gp = NULL; return NULL; }
+    }
+    WCHAR wp[MAX_PATH];
+    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH)) return NULL;
+    void *bm = NULL;
+    UINT iw = 0, ih = 0;
+    if (FromFile(wp, &bm) || !bm) return NULL;
+    GetW(bm, &iw);
+    GetH(bm, &ih);
+    unsigned char *out = NULL;
+    GpRect r = { 0, 0, (INT)iw, (INT)ih };
+    GpBits d;
+    if (iw && ih && iw < 30000 && ih < 30000 && !Lock(bm, &r, 1 /* read */, 0x26200A /* 32bpp ARGB */, &d)) {
+        out = malloc((size_t)iw * ih * 4);
+        for (UINT y = 0; y < ih && out; y++) {
+            const unsigned char *src = (const unsigned char *)d.scan0 + (size_t)y * d.stride;
+            unsigned char *dst = out + (size_t)(ih - 1 - y) * iw * 4;
+            for (UINT x = 0; x < iw; x++) {
+                dst[4 * x] = src[4 * x + 2];
+                dst[4 * x + 1] = src[4 * x + 1];
+                dst[4 * x + 2] = src[4 * x];
+                dst[4 * x + 3] = src[4 * x + 3];
+            }
+        }
+        Unlock(bm, &d);
+    }
+    Dispose(bm);
+    *w = (int)iw;
+    *h = (int)ih;
+    return out;
+}
+
+/* OpenGL 1.1 textures must be a power of two on each side: resample (bilinear) to fit */
+static GLuint image_texture(const unsigned char *px, int w, int h)
+{
+    GLint maxs = 1024;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxs);
+    if (maxs > 2048) maxs = 2048;
+    int tw = 1, th_ = 1;
+    while (tw < w && tw < maxs) tw *= 2;
+    while (th_ < h && th_ < maxs) th_ *= 2;
+    unsigned char *t = malloc((size_t)tw * th_ * 4);
+    if (!t) return 0;
+    for (int y = 0; y < th_; y++) {
+        float fy = (y + 0.5f) * h / th_ - 0.5f;
+        int y0 = fy < 0 ? 0 : (int)fy, y1 = y0 + 1 < h ? y0 + 1 : h - 1;
+        float ay = fy - y0 < 0 ? 0 : fy - y0;
+        for (int x = 0; x < tw; x++) {
+            float fx = (x + 0.5f) * w / tw - 0.5f;
+            int x0 = fx < 0 ? 0 : (int)fx, x1 = x0 + 1 < w ? x0 + 1 : w - 1;
+            float ax = fx - x0 < 0 ? 0 : fx - x0;
+            for (int c = 0; c < 4; c++) {
+                float a = px[((size_t)y0 * w + x0) * 4 + c] * (1 - ax) + px[((size_t)y0 * w + x1) * 4 + c] * ax;
+                float b = px[((size_t)y1 * w + x0) * 4 + c] * (1 - ax) + px[((size_t)y1 * w + x1) * 4 + c] * ax;
+                t[((size_t)y * tw + x) * 4 + c] = (unsigned char)(a * (1 - ay) + b * ay + 0.5f);
+            }
+        }
+    }
+    GLuint id;
+    glGenTextures(1, &id);
+    glBindTexture(GL_TEXTURE_2D, id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th_, 0, GL_RGBA, GL_UNSIGNED_BYTE, t);
+    free(t);
+    return id;
+}
+
+static void img_clear(int i)
+{
+    if (img[i].tex) glDeleteTextures(1, &img[i].tex);
+    memset(&img[i], 0, sizeof img[i]);
+}
+
+/* load image file 'path' into slot i (keeping its size/offset/opacity when given) */
+static int img_set(int i, const char *path, float size, float ox, float oy, float opa)
+{
+    int w, h;
+    unsigned char *px = image_load(path, &w, &h);
+    if (!px) return 0;
+    img_clear(i);
+    snprintf(img[i].path, MAX_PATH, "%s", path);
+    img[i].tex = image_texture(px, w, h);
+    free(px);
+    img[i].w = w;
+    img[i].h = h;
+    img[i].size = size > 0 ? size : 10;
+    img[i].ox = ox;
+    img[i].oy = oy;
+    img[i].opa = opa >= 0 ? opa : 0.6f;
+    return img[i].tex != 0;
+}
+
+/* corner k (0..3, counter-clockwise from bottom left) of plane i in world space */
+static V3 img_corner(int i, int k)
+{
+    float hw = img[i].size * 0.5f, hh = hw * img[i].h / (img[i].w ? img[i].w : 1);
+    float u = img[i].ox + (k == 1 || k == 2 ? hw : -hw), v = img[i].oy + (k >= 2 ? hh : -hh);
+    if (i == 0) return v3(u, v, 0);        /* front: seen from +Z, X right, Y up */
+    if (i == 1) return v3(0, v, -u);       /* side: seen from +X, -Z right */
+    return v3(u, 0, -v);                   /* top: seen from +Y, -Z up */
+}
+
+static void draw_images(void)
+{
+    static const V3 axis[3] = { { 0, 0, 1 }, { 1, 0, 0 }, { 0, 1, 0 } };
+    int any = 0;
+    for (int i = 0; i < 3; i++) any |= img[i].tex != 0;
+    if (!any) return;
+    glDepthMask(GL_FALSE);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    for (int i = 0; i < 3; i++) {
+        if (!img[i].tex) continue;
+        /* only while looking along its axis; fades out as the view turns away */
+        float f = fabsf(v3dot(camF, axis[i])), a = (f - 0.9f) / 0.07f;
+        if (a <= 0) continue;
+        if (a > 1) a = 1;
+        glBindTexture(GL_TEXTURE_2D, img[i].tex);
+        glColor4f(1, 1, 1, a * img[i].opa);
+        static const float uv[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+        glBegin(GL_QUADS);
+        for (int k = 0; k < 4; k++) {
+            V3 c = img_corner(i, k);
+            glTexCoord2fv(uv[k]);
+            glVertex3fv(&c.x);
+        }
+        glEnd();
+    }
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+}
+
+static void cmd_image(int i)
+{
+    char p[MAX_PATH] = "";
+    OPENFILENAMEA of;
+    memset(&of, 0, sizeof of);
+    of.lStructSize = sizeof of;
+    of.hwndOwner = hMain;
+    of.lpstrFilter = "Images (*.png, *.jpg, *.bmp, *.gif)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff\0All files\0*.*\0";
+    of.lpstrFile = p;
+    of.nMaxFile = MAX_PATH;
+    of.Flags = OFN_FILEMUSTEXIST;
+    if (!GetOpenFileNameA(&of)) return;
+    if (!img_set(i, p, img[i].size, img[i].ox, img[i].oy, img[i].tex ? img[i].opa : -1)) {
+        MessageBoxA(hMain, "Could not read that image.", APP_NAME, MB_ICONERROR);
+        return;
+    }
+    modified = 1;
+    view_axis(i == 0 ? 2 : i == 1 ? 0 : 1, 0);
+    char b[96];
+    snprintf(b, sizeof b, "%s image plane loaded - size, offset and opacity are in the side panel", IMG_NAME[i]);
+    msg(b);
+}
+
 /* ================================================================ commands */
 
 enum {
@@ -1717,7 +2112,7 @@ enum {
     CM_EXTRUDE, CM_MERGE,
     CM_APPLYCOL, CM_SETCOL,
     CM_WIRE, CM_SHADED, CM_HARD, CM_SMOOTH, CM_AUTOSMOOTH, CM_FRAMESEL, CM_FRAMEALL, CM_PANEL,
-    CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT, CM_TWELD, CM_TLOOP,   /* CM_TSEL + T_* */
+    CM_TSEL, CM_TMOVE, CM_TROT, CM_TSCALE, CM_TPAINT, CM_TWELD, CM_TLOOP, CM_TCUT,   /* CM_TSEL + T_* */
     CM_MOBJ, CM_MVERT, CM_MEDGE, CM_MFACE, CM_MMULTI,
     CM_SELALL, CM_SELINV,
     CM_OPEN, CM_GROW, CM_SHRINK, CM_LOOP, CM_TOVERT, CM_TOEDGE, CM_TOFACE,
@@ -1726,6 +2121,7 @@ enum {
     CM_HELP, CM_THEMEPICK, CM_THEMENEXT, CM_THEMEPREV, CM_THEMERAND,
     CM_REVERSE, CM_TRIANG, CM_QUAD, CM_COMBINE, CM_SEPARATE, CM_MERGEDIST, CM_DELEV,
     CM_BEVEL, CM_BRIDGE, CM_HARDEN, CM_SOFTEN,
+    CM_ORTHO, CM_IMGFRONT, CM_IMGSIDE, CM_IMGTOP, CM_IMGCLEAR,
     CM_RECENT = 300,             /* + recent file index */
     CM_THEME = 200               /* + theme index */
 };
@@ -3013,11 +3409,18 @@ static void do_cmd(int id)
             c = v3mul(v3add(a, b), 0.5f);
             d = r / sinf(hh < half ? hh : half) * 1.1f;
         }
+        ortho = 0;
         cam_to(c, d, 0.7854f, 0.46f);
         toast("Home view");
         break;
     }
     case CM_HUD: hudOn = !hudOn; break;
+    case CM_ORTHO: ortho = !ortho; toast(ortho ? "Orthographic view" : "Perspective view"); break;
+    case CM_IMGFRONT: case CM_IMGSIDE: case CM_IMGTOP: cmd_image(id - CM_IMGFRONT); break;
+    case CM_IMGCLEAR:
+        for (int i = 0; i < 3; i++) if (img[i].tex) { img_clear(i); modified = 1; }
+        msg("Removed the image planes");
+        break;
     case CM_SNAPGRID: snapGrid = !snapGrid; msg(snapGrid ? "Grid snap on" : "Grid snap off"); break;
     case CM_SNAPPOINT: snapPoint = !snapPoint; msg(snapPoint ? "Point snap on" : "Point snap off"); break;
     case CM_EXPORT: cmd_export(0, 0); break;
@@ -3060,7 +3463,7 @@ static void do_cmd(int id)
         SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
         break;
     }
-    case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT: case CM_TWELD: case CM_TLOOP:
+    case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT: case CM_TWELD: case CM_TLOOP: case CM_TCUT:
         set_tool(id - CM_TSEL);
         break;
     case CM_REVERSE: cmd_face_op(mesh_reverse, "Reverse Normals", "Reversed %d face(s)"); break;
@@ -3108,7 +3511,8 @@ enum {
     PF_NANGLE,
     PF_PW, PF_PD, PF_PSW, PF_PSD,
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY,
-    PF_MERGED, PF_BEVELW, PF_BRIDGED
+    PF_MERGED, PF_BEVELW, PF_BRIDGED,
+    PF_IMG   /* + plane * 4 + (size, offset x, offset y, opacity) */
 };
 enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP };
 #define NROW 64
@@ -3125,6 +3529,11 @@ static float *fld_f(int id)
     if (id == PF_RAD) return &paintRad;
     if (id == PF_MERGED) return &mergeDist;
     if (id == PF_BEVELW) return &bevelW;
+    if (id >= PF_IMG && id < PF_IMG + 12) {
+        ImgPlane *q = &img[(id - PF_IMG) / 4];
+        float *f[4] = { &q->size, &q->ox, &q->oy, &q->opa };
+        return f[(id - PF_IMG) % 4];
+    }
     if (!o) return NULL;
     if (id >= PF_TX && id <= PF_TZ) return &o->t.x + (id - PF_TX);
     if (id >= PF_RX && id <= PF_RZ) return &o->r.x + (id - PF_RX);
@@ -3257,6 +3666,14 @@ static void panel_build(void)
     add_row(RK_FLOAT, PF_MERGED, "Merge Distance");
     add_row(RK_FLOAT, PF_BEVELW, "Bevel Width");
     add_row(RK_INT, PF_BRIDGED, "Bridge Divisions");
+    for (int i = 0; i < 3; i++) {
+        static const char *lab[4] = { "Size", "Offset X", "Offset Y", "Opacity" };
+        char b[40];
+        if (!img[i].tex) continue;
+        snprintf(b, sizeof b, "%s Image", IMG_NAME[i]);
+        add_row(RK_HEAD, 0, b);
+        for (int k = 0; k < 4; k++) add_row(RK_FLOAT, PF_IMG + i * 4 + k, lab[k]);
+    }
 
     RECT rc;
     GetClientRect(hPanel, &rc);
@@ -3322,6 +3739,13 @@ static void panel_set(int r, double v)
         if (id == PF_OPA) { paintOpa = (float)(v < 0 ? 0 : v > 1 ? 1 : v); return; }
         if (id == PF_RAD) { paintRad = (float)(v < 1 ? 1 : v > 2000 ? 2000 : v); return; }
         if (id == PF_MERGED) { mergeDist = (float)(v < 0 ? 0 : v > 1e4 ? 1e4 : v); return; }
+        if (id >= PF_IMG) {
+            float *f = fld_f(id);
+            int k = (id - PF_IMG) % 4;
+            *f = (float)(k == 0 ? (v < 1e-3 ? 1e-3 : v) : k == 3 ? (v < 0 ? 0 : v > 1 ? 1 : v) : v);
+            modified = 1;
+            return;
+        }
         if (id == PF_BEVELW) { bevelW = (float)(v < 1e-4 ? 1e-4 : v > 1e4 ? 1e4 : v); live_redo(CM_BEVEL); return; }
         if (id <= PF_SZ) {
             /* channel edits apply to every selected object */
@@ -3408,7 +3832,7 @@ static void scrub_move(int x)
 {
     int id = rows[scrub.row].id, dx = x - scrub.x0;
     float mul = key(VK_SHIFT) ? 10 : key(VK_CONTROL) ? 0.1f : 1;
-    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : id == PF_MERGED ? 0.001 : id == PF_BEVELW ? 0.002 : 0.01;
+    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : id == PF_MERGED ? 0.001 : id == PF_BEVELW ? 0.002 : id >= PF_IMG && (id - PF_IMG) % 4 == 3 ? 0.005 : 0.01;
     double v = rows[scrub.row].kind == RK_INT ? scrub.v0 + (int)(dx * mul / 6) : scrub.v0 + dx * step * mul;
     double cur;
     if (rows[scrub.row].kind == RK_FLOAT) v = round(v * 1000) / 1000;
@@ -3581,6 +4005,7 @@ static const Tool tbItems[] = {
     { "Bevel", "Ctrl+B", CM_BEVEL, "Bevel the selected edges (Bevel Width in the side panel adjusts it)" },
     { "Bridge", "", CM_BRIDGE, "Join two selected open borders with faces" },
     { "Edge Loop", "", CM_TLOOP, "Insert Edge Loop tool: click an edge to add a loop across it" },
+    { "Multi-Cut", "", CM_TCUT, "Multi-Cut tool: click points on edges to cut faces; Enter finishes" },
     { "Merge", "", CM_MERGE, "Merge the selected vertices to their center" },
     { "Fill Hole", "", CM_FILLHOLE, "Cap the hole the selection is on (an object: all its holes)" },
     { "Duplicate", "Ctrl+D", CM_DUP, "Duplicate the selected objects" },
@@ -3738,7 +4163,7 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 static void status_text(void)
 {
     static const char *mn[] = { "Object mode", "Vertex mode", "Edge mode", "Face mode", "Multi mode" };
-    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld", "Insert Edge Loop" };
+    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld", "Insert Edge Loop", "Multi-Cut" };
     static const char *hint[] = {
         "Click to select, drag for a box. Shift: toggle, Ctrl: remove, Ctrl+Shift: add. Alt+drag: orbit/pan/zoom",
         "Drag a handle to move. Hold X: grid snap, V: point snap, Ctrl+handle: other two axes, Esc: cancel",
@@ -3747,6 +4172,7 @@ static void status_text(void)
         "Drag over a mesh to paint. B+drag: brush size. Color, opacity and radius are in the side panel",
         "Drag from one vertex onto another to weld them together (the first one moves). Esc cancels",
         "Click an edge to add an edge loop across it, where the yellow preview shows",
+        "Click points on edges or vertices to cut. Enter/right click: finish, Backspace: undo point, Esc: drop, Ctrl+click: edge loop",
     };
     int nsel = 0, ncomp = 0;
     for (int i = 0; i < nob; i++) {
@@ -3793,6 +4219,7 @@ static void status_update(void)
     CheckMenuRadioItem(hMenu, CM_HARD, CM_AUTOSMOOTH, a <= 0 ? CM_HARD : a >= 180 ? CM_SMOOTH : CM_AUTOSMOOTH, MF_BYCOMMAND);
     CheckMenuItem(hMenu, CM_PANEL, MF_BYCOMMAND | (panelOn ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_HUD, MF_BYCOMMAND | (hudOn ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_ORTHO, MF_BYCOMMAND | (ortho ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SNAPGRID, MF_BYCOMMAND | (snapGrid ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SNAPPOINT, MF_BYCOMMAND | (snapPoint ? MF_CHECKED : MF_UNCHECKED));
     char u[64];
@@ -3815,19 +4242,31 @@ static void refresh_all(void)
 
 /* ================================================================ rendering */
 
+/* point (u, v) on the grid plane: the ground (XZ), or the view plane in a side/front ortho view */
+static void grid_vtx(int k, float u, float v)
+{
+    float p[3] = { 0, 0, 0 };
+    p[(k + 1) % 3] = u;
+    p[(k + 2) % 3] = v;
+    glVertex3fv(p);
+}
+
 static void draw_grid(void)
 {
+    int k = 1;
+    if (ortho && fabsf(camF.x) > 0.999f) k = 0;
+    if (ortho && fabsf(camF.z) > 0.999f) k = 2;
     glLineWidth(1);
     glBegin(GL_LINES);
     for (int i = -12; i <= 12; i++) {
         if (!i) continue;
         glColor3fv(i % 5 ? th.grid : th.gridMajor);
-        glVertex3f((float)i, 0, -12); glVertex3f((float)i, 0, 12);
-        glVertex3f(-12, 0, (float)i); glVertex3f(12, 0, (float)i);
+        grid_vtx(k, (float)i, -12); grid_vtx(k, (float)i, 12);
+        grid_vtx(k, -12, (float)i); grid_vtx(k, 12, (float)i);
     }
     glColor3fv(th.gridAxis);
-    glVertex3f(0, 0, -12); glVertex3f(0, 0, 12);
-    glVertex3f(-12, 0, 0); glVertex3f(12, 0, 0);
+    grid_vtx(k, 0, -12); grid_vtx(k, 0, 12);
+    grid_vtx(k, -12, 0); grid_vtx(k, 12, 0);
     glEnd();
 }
 
@@ -4088,7 +4527,7 @@ static HCURSOR view_cursor(void)
     if (dk == D_TUMBLE) c = IDC_SIZEALL;
     else if (dk == D_PAN) c = IDC_HAND;
     else if (dk == D_DOLLY) c = IDC_SIZENS;
-    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP) c = IDC_CROSS;
+    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP || tool == T_CUT) c = IDC_CROSS;
     else if (gizmoHover >= 0) c = IDC_HAND;
     return LoadCursor(NULL, c);
 }
@@ -4123,6 +4562,7 @@ static void render(void)
     glEnable(GL_NORMALIZE);
     load_view();
     draw_grid();
+    draw_images();
 
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
@@ -4257,6 +4697,7 @@ static void render(void)
     }
     draw_weld();
     draw_loop_preview();
+    draw_cut();
     if (hudOn) draw_hud();
     if (!nob) draw_empty_hint();
     draw_drag_label();
@@ -4390,6 +4831,13 @@ static int dbl_click(int x, int y)
 static void handle_key(WPARAM wp)
 {
     int ctrl = key(VK_CONTROL), shift = key(VK_SHIFT), id = 0;
+    if (tool == T_CUT && mc.n && (wp == VK_RETURN || wp == VK_ESCAPE || wp == VK_BACK)) {
+        if (wp == VK_RETURN) mc_commit();
+        else if (wp == VK_ESCAPE) { mc_reset(); msg("Multi-Cut: points dropped"); }
+        else mc.n--;
+        refresh_all();
+        return;
+    }
     switch (wp) {
     case 'Q': id = CM_TSEL; break;
     case 'W': id = CM_TMOVE; break;
@@ -4495,13 +4943,21 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         tween.on = 0;
         if (key(VK_MENU)) {
             dk = btn == 0 ? D_TUMBLE : btn == 1 ? D_PAN : D_DOLLY;
-        } else if (btn == 2) {
+        } else if (btn == 2 && !(tool == T_CUT && mc.n)) {
             marking_menu(x, y);
             return 0;
         } else if (btn == 1) {
             if (!manip_vis()) return 0;
             drag_begin(lastHandle, x, y);
             dk = D_MANIP;
+        } else if (btn == 2 && tool == T_CUT && mc.n) {
+            mc_commit();
+            refresh_all();
+            return 0;
+        } else if (btn == 0 && tool == T_CUT && (mc.hv || mc.n)) {
+            mc_click(key(VK_CONTROL));
+            refresh_all();
+            return 0;
         } else if (tool == T_LOOP && elp.obj >= 0) {
             loop_click();
             refresh_all();
@@ -4537,6 +4993,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         cury = y;
         switch (dk) {
         case D_TUMBLE:
+            if (ortho && (dx || dy)) { ortho = 0; toast("Perspective view"); }
             yaw -= dx * 0.006f;
             pitch += dy * 0.006f;
             if (pitch > 1.55f) pitch = 1.55f;
@@ -4583,6 +5040,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (gh != gizmoHover) { gizmoHover = gh; SetCursor(view_cursor()); redraw(); }
             hover_update(gh >= 0 ? -10000 : x, y);
             if (tool == T_LOOP) loop_hover(x, y);
+            if (tool == T_CUT) mc_hover(x, y);
             if (tool == T_PAINT) redraw();
             return 0;
         }
@@ -4700,6 +5158,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_BRIDGE, "B&ridge");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_TLOOP, "&Insert Edge Loop Tool");
+    AppendMenuA(m, MF_STRING, CM_TCUT, "Multi-&Cut Tool");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_MERGE, "&Merge to Center");
     AppendMenuA(m, MF_STRING, CM_TWELD, "&Target Weld Tool");
@@ -4721,6 +5180,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_TPAINT, "&Paint Vertex Color Tool");
     AppendMenuA(m, MF_STRING, CM_TWELD, "Target &Weld Tool");
     AppendMenuA(m, MF_STRING, CM_TLOOP, "&Insert Edge Loop Tool");
+    AppendMenuA(m, MF_STRING, CM_TCUT, "Multi-&Cut Tool");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Tools");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_SETCOL, "&Set Paint Color...");
@@ -4745,6 +5205,14 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_VFRONT, "Fr&ont View");
     AppendMenuA(m, MF_STRING, CM_VSIDE, "S&ide View");
     AppendMenuA(m, MF_STRING, CM_VTOP, "&Top View");
+    AppendMenuA(m, MF_STRING, CM_ORTHO, "O&rthographic");
+    HMENU im = CreatePopupMenu();
+    AppendMenuA(im, MF_STRING, CM_IMGFRONT, "&Front Image...");
+    AppendMenuA(im, MF_STRING, CM_IMGSIDE, "&Side Image...");
+    AppendMenuA(im, MF_STRING, CM_IMGTOP, "&Top Image...");
+    AppendMenuA(im, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(im, MF_STRING, CM_IMGCLEAR, "&Remove Image Planes");
+    AppendMenuA(m, MF_POPUP, (UINT_PTR)im, "&Image Planes");
     hThemeMenu = CreatePopupMenu();
     AppendMenuA(hThemeMenu, MF_STRING, CM_THEMEPICK, "Theme &Picker...\tCtrl+T");
     AppendMenuA(hThemeMenu, MF_STRING, CM_THEMENEXT, "&Next Theme\tCtrl+Shift+T");
