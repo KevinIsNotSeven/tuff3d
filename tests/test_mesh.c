@@ -37,6 +37,226 @@ static float volume(const Mesh *m)
     return v;
 }
 
+
+static Mesh cube(void)
+{
+    Prim p;
+    prim_defaults(&p, PRIM_CUBE);
+    return mesh_prim(&p);
+}
+
+static Mesh plane(int n)
+{
+    Prim p;
+    prim_defaults(&p, PRIM_PLANE);
+    p.psw = p.psd = n;
+    return mesh_prim(&p);
+}
+
+static int count(const unsigned char *f, int n)
+{
+    int c = 0;
+    for (int i = 0; i < n; i++) c += f[i] != 0;
+    return c;
+}
+
+/* the modeling ops added with the hard/soft edge work */
+static void test_ops(void)
+{
+    Mesh m = cube();
+    CHECK(mesh_reverse(&m, NULL) == 6 && volume(&m) < -0.99f);
+    mesh_reverse(&m, NULL);
+    CHECK(closed_oriented(&m) && volume(&m) > 0.99f);
+
+    /* triangulate and join back */
+    CHECK(mesh_triangulate(&m, NULL) == 6 && m.nf == 12 && closed_oriented(&m));
+    CHECK(mesh_quadrangulate(&m, NULL, 30) == 6 && m.nf == 6 && closed_oriented(&m));
+    CHECK(fabsf(volume(&m) - 1) < 1e-4f);
+    mesh_free(&m);
+    {
+        /* concave L: ear clipping keeps the area */
+        V3 pts[6] = { { 0, 0, 0 }, { 2, 0, 0 }, { 2, 0, -1 }, { 1, 0, -1 }, { 1, 0, -2 }, { 0, 0, -2 } };
+        int fo[2] = { 0, 6 }, fi[6] = { 0, 1, 2, 3, 4, 5 };
+        m = mesh_from_arrays(6, pts, NULL, 1, fo, fi);
+        CHECK(mesh_triangulate(&m, NULL) == 1 && m.nf == 4);
+        float area = 0;
+        for (int f = 0; f < m.nf; f++) {
+            V3 a = m.p[m.fi[m.fo[f]]], b = m.p[m.fi[m.fo[f] + 1]], c = m.p[m.fi[m.fo[f] + 2]];
+            V3 n = v3cross(v3sub(b, a), v3sub(c, a));
+            area += 0.5f * v3len(n);
+            CHECK(n.y > 0);
+        }
+        CHECK(fabsf(area - 3) < 1e-4f);
+        mesh_free(&m);
+    }
+
+    /* combine, shells, separate, mirrored append keeps faces outward */
+    m = cube();
+    Mesh c = cube();
+    M4 x = m4_trs(v3(3, 0, 0), v3(0, 0, 0), v3(-1, 1, 1));
+    mesh_append(&m, &c, &x);
+    CHECK(m.nv == 16 && m.nf == 12 && closed_oriented(&m) && fabsf(volume(&m) - 2) < 1e-4f);
+    int sh[32];
+    CHECK(mesh_shells(&m, sh) == 2 && sh[0] != sh[11]);
+    unsigned char fm[32] = { 0 };
+    for (int f = 0; f < m.nf; f++) fm[f] = sh[f] == sh[11];
+    Mesh part = mesh_subset(&m, fm);
+    CHECK(part.nv == 8 && part.nf == 6 && closed_oriented(&part));
+    mesh_free(&part);
+    mesh_free(&m);
+
+    /* merge by distance: two cubes sharing a face position */
+    m = cube();
+    x = m4_trs(v3(1, 0, 0), v3(0, 0, 0), v3(1, 1, 1));
+    mesh_append(&m, &c, &x);
+    CHECK(mesh_merge_dist(&m, NULL, 1e-3f) == 4 && m.nv == 12);
+    CHECK(mesh_merge_dist(&m, NULL, 1e-3f) == 0);
+    mesh_free(&m);
+
+    /* target weld: a cube corner onto its neighbor */
+    m = cube();
+    int e0 = 0, a = m.ev[0], b = m.ev[1];
+    CHECK(mesh_weld(&m, a, b) && m.nv == 7 && closed_oriented(&m));
+    (void)e0;
+    mesh_free(&m);
+
+    /* delete edge with cleanup: the cube becomes a wedge */
+    m = cube();
+    unsigned char em[64] = { 0 };
+    em[0] = 1;
+    CHECK(mesh_delete_edges(&m, em, 1) > 0);
+    CHECK(m.nf == 5 && m.nv == 6 && closed_oriented(&m));
+    mesh_free(&m);
+    /* delete the four inner edges of a 2x2 plane: one face, borders untouched */
+    m = plane(2);
+    memset(em, 0, sizeof em);
+    for (int e = 0; e < m.ne; e++) em[e] = m.ef[2 * e + 1] >= 0;
+    CHECK(count(em, m.ne) == 4);
+    CHECK(mesh_delete_edges(&m, em, 1) > 0 && m.nf == 1 && m.nv == 8);
+    mesh_free(&m);
+    /* delete the middle vertex instead: same result */
+    m = plane(2);
+    unsigned char vm[64] = { 0 };
+    for (int v = 0; v < m.nv; v++) vm[v] = fabsf(m.p[v].x) < 1e-6f && fabsf(m.p[v].z) < 1e-6f;
+    CHECK(count(vm, m.nv) == 1);
+    CHECK(mesh_delete_verts(&m, vm) > 0 && m.nf == 1 && m.nv == 8);
+    mesh_free(&m);
+
+    /* edge ring, insert edge loop, multi-cut */
+    m = cube();
+    int ra[16], rb[16], closed;
+    CHECK(mesh_edge_ring(&m, 0, ra, rb, &closed) == 4 && closed);
+    CHECK(mesh_insert_loop(&m, 0, 0.25f) == 4);
+    CHECK(m.nf == 10 && m.nv == 12 && closed_oriented(&m) && fabsf(volume(&m) - 1) < 1e-4f);
+    CHECK(count(m.es, m.ne) == 4);
+    /* the new vertices all sit a quarter of the way along their edges, on one side */
+    float lo = 1e9f, hi = -1e9f;
+    for (int v = 8; v < 12; v++) {
+        V3 q = m.p[v];
+        float k = fabsf(q.x) > 0.49f && fabsf(q.y) > 0.49f ? q.z : fabsf(q.x) > 0.49f && fabsf(q.z) > 0.49f ? q.y : q.x;
+        lo = fminf(lo, k); hi = fmaxf(hi, k);
+    }
+    CHECK(fabsf(hi - lo) < 1e-4f && fabsf(fabsf(lo) - 0.25f) < 1e-4f);
+    mesh_free(&m);
+    m = plane(2);
+    int inner = -1;
+    for (int e = 0; e < m.ne; e++) if (m.ef[2 * e + 1] >= 0) inner = e;
+    CHECK(mesh_insert_loop(&m, inner, 0.5f) == 2 && m.nf == 6);
+    mesh_free(&m);
+    m = plane(1);
+    {
+        CutPt cp[2] = { { m.ev[0], m.ev[1], 0.5f }, { 0, 0, 0 } };
+        /* the edge opposite edge 0 */
+        for (int e = 1; e < m.ne; e++)
+            if (m.ev[2 * e] != m.ev[0] && m.ev[2 * e] != m.ev[1] && m.ev[2 * e + 1] != m.ev[0] && m.ev[2 * e + 1] != m.ev[1]) {
+                cp[1].a = m.ev[2 * e]; cp[1].b = m.ev[2 * e + 1]; cp[1].t = 0.5f;
+            }
+        CHECK(mesh_cut(&m, cp, 2) == 1 && m.nf == 2 && m.nv == 6 && count(m.es, m.ne) == 1);
+    }
+    mesh_free(&m);
+
+    /* bevel: every edge of a cube, then one edge */
+    m = cube();
+    memset(em, 1, sizeof em);
+    CHECK(mesh_bevel(&m, em, 0.1f) == 12);
+    CHECK(m.nf == 26 && m.nv == 24 && closed_oriented(&m));
+    CHECK(fabsf(volume(&m) - 0.94533f) < 1e-4f);   /* 1 - 12 edge prisms - 8 corners */
+    CHECK(count(m.fs, m.nf) == 20);
+    mesh_free(&m);
+    m = cube();
+    memset(em, 0, sizeof em);
+    em[0] = 1;
+    CHECK(mesh_bevel(&m, em, 0.1f) == 1);
+    CHECK(m.nf == 7 && m.nv == 10 && closed_oriented(&m));
+    mesh_free(&m);
+    /* a loop of edges round a cube's middle (after insert loop) */
+    m = cube();
+    mesh_insert_loop(&m, 0, 0.5f);
+    CHECK(mesh_bevel(&m, m.es, 0.1f) == 4);
+    CHECK(m.nf == 14 && closed_oriented(&m) && fabsf(volume(&m) - 1) < 1e-4f);
+    mesh_free(&m);
+
+    /* bridge: a floor facing down and a lid facing up become a closed box */
+    m = plane(1);
+    mesh_reverse(&m, NULL);
+    {
+        Mesh lid = plane(1);
+        x = m4_trs(v3(0, 1, 0), v3(0, 0, 0), v3(1, 1, 1));
+        mesh_append(&m, &lid, &x);
+        mesh_free(&lid);
+    }
+    memset(em, 0, sizeof em);
+    for (int e = 0; e < m.ne; e++) em[e] = m.ef[2 * e + 1] < 0;
+    CHECK(mesh_bridge(&m, em, 0) == 4 && m.nf == 6 && closed_oriented(&m) && fabsf(volume(&m) - 1) < 1e-4f);
+    mesh_free(&m);
+    m = plane(1);
+    mesh_reverse(&m, NULL);
+    {
+        Mesh lid = plane(1);
+        x = m4_trs(v3(0, 1, 0), v3(0, 0, 0), v3(1, 1, 1));
+        mesh_append(&m, &lid, &x);
+        mesh_free(&lid);
+    }
+    memset(em, 0, sizeof em);
+    for (int e = 0; e < m.ne; e++) em[e] = m.ef[2 * e + 1] < 0;
+    CHECK(mesh_bridge(&m, em, 2) == 12 && closed_oriented(&m) && fabsf(volume(&m) - 1) < 1e-4f);
+    mesh_free(&m);
+    m = cube();
+    for (int f = 0; f < m.nf; f++) m.fs[f] = mesh_fnormal(&m, f).z > 0.9f;
+    mesh_delete_faces(&m);
+    memset(em, 0, sizeof em);
+    for (int e = 0; e < m.ne; e++) em[e] = m.ef[2 * e + 1] < 0;
+    CHECK(mesh_bridge(&m, em, 0) == -1);   /* one hole: nothing to bridge to */
+    mesh_free(&m);
+
+    /* hard / soft overrides */
+    m = cube();
+    V3 cn[24];
+    memset(m.eh, EH_SOFT, m.ne);
+    mesh_cnormals(&m, 0, cn);
+    for (int k = 0; k < 24; k++) CHECK(fabsf(fabsf(cn[k].x) - 0.57735f) < 1e-3f);
+    /* one hard edge alone can't split a corner (the faces still join round the other way); two can */
+    m.eh[0] = EH_HARD;
+    for (int e = 1; e < m.ne; e++)
+        if ((m.ev[2 * e] == m.ev[0] || m.ev[2 * e + 1] == m.ev[0]) && (m.ef[2 * e] == m.ef[1] || m.ef[2 * e + 1] == m.ef[1])) {
+            m.eh[e] = EH_HARD;
+            break;
+        }
+    mesh_cnormals(&m, 180, cn);
+    int f0 = m.ef[0], c0 = -1, c1 = -1;
+    for (int k = m.fo[f0]; k < m.fo[f0 + 1]; k++) if (m.fi[k] == m.ev[0]) c0 = k;
+    for (int k = m.fo[m.ef[1]]; k < m.fo[m.ef[1] + 1]; k++) if (m.fi[k] == m.ev[0]) c1 = k;
+    CHECK(c0 >= 0 && c1 >= 0 && v3dot(cn[c0], cn[c1]) < 0.99f);
+    /* overrides survive an op that keeps those edges */
+    m.fs[2] = 1;
+    mesh_extrude_faces(&m);
+    int hard = 0;
+    for (int e = 0; e < m.ne; e++) hard += m.eh[e] == EH_HARD;
+    CHECK(hard >= 1);
+    mesh_free(&m);
+    mesh_free(&c);
+}
+
 int main(void)
 {
     Prim p;
@@ -330,6 +550,7 @@ int main(void)
     CHECK(mesh_extrude_faces(&m) && m.nf == 6 + 4);
     mesh_free(&m);
 
+    test_ops();
     printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
     return fails != 0;
 }

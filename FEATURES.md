@@ -38,23 +38,23 @@ Files and comfort
 ## Ideas
 
 Modeling tools (the big gaps compared to Maya)
-- [ ] Insert Edge Loop (split a ring of faces through an edge)
-- [ ] Multi-Cut (click to cut new edges across faces)
-- [ ] Bevel selected edges
-- [ ] Bridge two edge borders
-- [ ] Combine / Separate objects
-- [ ] Delete Edge / Vertex that also cleans up the faces (Ctrl+Delete in Maya)
-- [ ] Merge vertices by distance and Target Weld
+- [x] Insert Edge Loop (split a ring of faces through an edge)
+- [x] Multi-Cut (click to cut new edges across faces)
+- [x] Bevel selected edges
+- [x] Bridge two edge borders
+- [x] Combine / Separate objects
+- [x] Delete Edge / Vertex that also cleans up the faces (Ctrl+Delete in Maya)
+- [x] Merge vertices by distance and Target Weld
 - [ ] Mirror geometry, and live symmetry while moving components
 - [ ] Soft selection (B), falloff shown in color
-- [ ] Reverse (flip) normals on selected faces
+- [x] Reverse (flip) normals on selected faces
 - [ ] Smooth mesh (subdivide) and a smooth preview toggle (3 / 1 like Maya)
-- [ ] Harden / Soften selected edges, on top of the Normal Angle
-- [ ] Triangulate / Quadrangulate
+- [x] Harden / Soften selected edges, on top of the Normal Angle
+- [x] Triangulate / Quadrangulate
 
 Quality of life
-- [ ] Hard / Smooth / Auto Smooth buttons on the toolbar
-- [ ] Orthographic front / side / top cameras (now they're perspective views)
+- [x] Hard / Smooth / Auto Smooth buttons on the toolbar
+- [x] Orthographic front / side / top cameras
 - [ ] X-ray and backface culling toggles
 - [ ] Isolate Select (show only the selection)
 - [ ] Outliner: a list of objects to select, rename, hide and reorder
@@ -63,11 +63,11 @@ Quality of life
 - [ ] Selection size readout (bounding box in units)
 - [ ] Color swatches and an eyedropper for vertex paint
 - [ ] Grid size and spacing settings, grid on / off
-- [ ] Reference image planes for front / side / top
+- [x] Reference image planes for front / side / top
 - [ ] Viewport screenshot to PNG
-- [ ] Hotkey editor
+- [x] Hotkey editor
 
 Files
 - [ ] glTF (.glb) export with vertex colors, for game engines and the web
 - [ ] Export each object to its own OBJ
-- [ ] A native scene file that keeps everything (hidden objects, primitive history, pivots)
+- [x] A native scene file (.tuff) that keeps everything: hidden objects, primitive settings, camera, image planes

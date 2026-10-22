@@ -170,6 +170,18 @@ M4 m4_lookat(V3 eye, V3 at, V3 up)
     return m;
 }
 
+M4 m4_ortho(float l, float r, float b, float t, float n, float f)
+{
+    M4 m = m4_id();
+    m.m[0] = 2 / (r - l);
+    m.m[5] = 2 / (t - b);
+    m.m[10] = -2 / (f - n);
+    m.m[12] = -(r + l) / (r - l);
+    m.m[13] = -(t + b) / (t - b);
+    m.m[14] = -(f + n) / (f - n);
+    return m;
+}
+
 /* ---------------------------------------------------------------- edge hash */
 
 typedef struct { unsigned long long *k; int *v; unsigned mask; } HMap;
@@ -186,10 +198,9 @@ static void hm_init(HMap *h, int n)
 
 static void hm_free(HMap *h) { free(h->k); free(h->v); }
 
-/* value slot for undirected edge (a,b); new slots start at -1 */
-static int *hm_get(HMap *h, int a, int b)
+/* value slot for the ordered pair (a,b); new slots start at -1 */
+static int *hm_getd(HMap *h, int a, int b)
 {
-    if (a > b) { int t = a; a = b; b = t; }
     unsigned long long key = ((unsigned long long)(unsigned)a << 32) | (unsigned)b;
     unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 32) & h->mask;
     while (h->k[i] != ~0ull && h->k[i] != key) i = (i + 1) & h->mask;
@@ -197,9 +208,37 @@ static int *hm_get(HMap *h, int a, int b)
     return &h->v[i];
 }
 
+/* value slot for undirected edge (a,b) */
+static int *hm_get(HMap *h, int a, int b)
+{
+    if (a > b) { int t = a; a = b; b = t; }
+    return hm_getd(h, a, b);
+}
+
+/* edge index by vertex pair, for a mesh's current edges */
+static void edge_map(HMap *h, const Mesh *m)
+{
+    hm_init(h, 2 * m->ne + 8);
+    for (int e = 0; e < m->ne; e++) *hm_get(h, m->ev[2 * e], m->ev[2 * e + 1]) = e;
+}
+
+static int edge_at(HMap *h, int a, int b)
+{
+    return *hm_get(h, a, b);
+}
+
 /* ---------------------------------------------------------------- mesh basics */
 
-typedef struct { Mesh m; int cv, cf, ci, ni; } MB;
+/* mesh builder; hp holds (a, b, eh) triples: shading overrides for the edges a-b once built */
+typedef struct { Mesh m; int cv, cf, ci, ni; int *hp, nhp, chp; } MB;
+
+static void mb_hard(MB *b, int a, int c, int val)
+{
+    if (b->nhp + 3 > b->chp) { b->chp = b->chp ? b->chp * 2 : 48; b->hp = xrealloc(b->hp, b->chp * sizeof(int)); }
+    b->hp[b->nhp++] = a;
+    b->hp[b->nhp++] = c;
+    b->hp[b->nhp++] = val;
+}
 
 static void mb_init(MB *b)
 {
@@ -265,8 +304,8 @@ static void mb_face_dir(MB *b, int *idx, int n, V3 want)
     mb_face(b, idx, n, 0);
 }
 
-/* drop vertices no face uses (selection flags move with them) */
-static void mesh_compact(Mesh *m)
+/* drop vertices no face uses (selection flags move with them); *mapout (optional) gets old -> new */
+static void mesh_compact(Mesh *m, int **mapout)
 {
     int ni = m->fo[m->nf];
     int *map = xrealloc(NULL, (m->nv ? m->nv : 1) * sizeof(int));
@@ -283,7 +322,8 @@ static void mesh_compact(Mesh *m)
     }
     for (int i = 0; i < ni; i++) m->fi[i] = map[m->fi[i]];
     m->nv = n;
-    free(map);
+    if (mapout) *mapout = map;
+    else free(map);
 }
 
 static Mesh mb_finish(MB *b)
@@ -295,8 +335,24 @@ static Mesh mb_finish(MB *b)
         m.vs = xrealloc(NULL, 1);
     }
     if (!m.fi) m.fi = xrealloc(NULL, sizeof(int));
-    mesh_compact(&m);
+    int *map, nv0 = m.nv;
+    mesh_compact(&m, &map);
     mesh_edges(&m);
+    if (b->nhp) {
+        HMap h;
+        edge_map(&h, &m);
+        for (int i = b->nhp - 3; i >= 0; i -= 3) {   /* backwards: the first pair given for an edge wins */
+            int a = b->hp[i], c = b->hp[i + 1];
+            if (a < 0 || c < 0 || a >= nv0 || c >= nv0 || map[a] < 0 || map[c] < 0) continue;
+            int e = edge_at(&h, map[a], map[c]);
+            if (e >= 0) m.eh[e] = (unsigned char)b->hp[i + 2];
+        }
+        hm_free(&h);
+    }
+    free(map);
+    free(b->hp);
+    b->hp = NULL;
+    b->nhp = b->chp = 0;
     return m;
 }
 
@@ -304,7 +360,7 @@ void mesh_free(Mesh *m)
 {
     free(m->p); free(m->c); free(m->vs);
     free(m->fo); free(m->fi); free(m->fs);
-    free(m->ev); free(m->ef); free(m->es);
+    free(m->ev); free(m->ef); free(m->es); free(m->eh);
     memset(m, 0, sizeof *m);
 }
 
@@ -328,13 +384,14 @@ Mesh mesh_copy(const Mesh *s)
     m.ev = dup_mem(s->ev, 2 * s->ne * sizeof(int));
     m.ef = dup_mem(s->ef, 2 * s->ne * sizeof(int));
     m.es = dup_mem(s->es, s->ne);
+    m.eh = s->eh ? dup_mem(s->eh, s->ne) : xcalloc(s->ne, 1);
     return m;
 }
 
 void mesh_edges(Mesh *m)
 {
     int ni = m->fo[m->nf];
-    free(m->ev); free(m->ef); free(m->es);
+    free(m->ev); free(m->ef); free(m->es); free(m->eh);
     m->ev = xrealloc(NULL, (2 * ni + 2) * sizeof(int));
     m->ef = xrealloc(NULL, (2 * ni + 2) * sizeof(int));
     m->ne = 0;
@@ -359,47 +416,12 @@ void mesh_edges(Mesh *m)
     }
     hm_free(&h);
     m->es = xcalloc(m->ne, 1);
+    m->eh = xcalloc(m->ne, 1);
 }
 
 V3 mesh_fnormal(const Mesh *m, int f)
 {
     return v3norm(newell(m->p, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f]));
-}
-
-/* Per face-corner normals (out[fo[f] + k]). A corner averages the area weighted
-   normals of the faces around its vertex that are within 'angle' degrees of its
-   own face: 0 = hard (flat), 180 = fully smooth, in between = auto smooth. */
-void mesh_cnormals(const Mesh *m, float angle, V3 *out)
-{
-    int nc = m->fo[m->nf];
-    V3 *fn = xrealloc(NULL, (m->nf + 1) * sizeof(V3));
-    int *vo = xrealloc(NULL, (m->nv + 1) * sizeof(int)), *vc = xrealloc(NULL, (nc + 1) * sizeof(int));
-    int *cf = xrealloc(NULL, (nc + 1) * sizeof(int));
-    for (int f = 0; f < m->nf; f++) {
-        fn[f] = newell(m->p, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f]);
-        for (int c = m->fo[f]; c < m->fo[f + 1]; c++) cf[c] = f;
-    }
-    /* vertex -> corners */
-    memset(vo, 0, (m->nv + 1) * sizeof(int));
-    for (int c = 0; c < nc; c++) vo[m->fi[c] + 1]++;
-    for (int v = 0; v < m->nv; v++) vo[v + 1] += vo[v];
-    int *fill = xrealloc(NULL, (m->nv + 1) * sizeof(int));
-    memcpy(fill, vo, m->nv * sizeof(int));
-    for (int c = 0; c < nc; c++) vc[fill[m->fi[c]]++] = c;
-    free(fill);
-    float ct = angle >= 180 ? -2.0f : angle <= 0 ? 2.0f : cosf(angle * 3.14159265f / 180.0f) - 1e-5f;
-    for (int c = 0; c < nc; c++) {
-        V3 own = v3norm(fn[cf[c]]), sum = fn[cf[c]];
-        int v = m->fi[c];
-        for (int j = vo[v]; j < vo[v + 1]; j++) {
-            int g = cf[vc[j]];
-            if (g == cf[c]) continue;
-            if (v3dot(own, v3norm(fn[g])) >= ct) sum = v3add(sum, fn[g]);
-        }
-        sum = v3norm(sum);
-        out[c] = v3dot(sum, sum) > 0 ? sum : own;
-    }
-    free(fn); free(vo); free(vc); free(cf);
 }
 
 V3 mesh_fcenter(const Mesh *m, int f)
@@ -409,6 +431,50 @@ V3 mesh_fcenter(const Mesh *m, int f)
     for (int k = 0; k < n; k++) c = v3add(c, m->p[m->fi[o + k]]);
     return n ? v3mul(c, 1.0f / n) : c;
 }
+
+/* Per face-corner normals (out[fo[f] + k]). The corners around a vertex share one normal (the area
+   weighted average of their faces) across every soft edge: an edge is soft when its faces are within
+   'angle' degrees of each other (0 = hard/flat, 180 = fully smooth, in between = auto smooth), unless
+   its eh override says hard or soft. */
+static int find_root(int *par, int x)
+{
+    while (par[x] != x) x = par[x] = par[par[x]];
+    return x;
+}
+
+static int corner_at(const Mesh *m, int f, int v)
+{
+    for (int c = m->fo[f]; c < m->fo[f + 1]; c++) if (m->fi[c] == v) return c;
+    return -1;
+}
+
+void mesh_cnormals(const Mesh *m, float angle, V3 *out)
+{
+    int nc = m->fo[m->nf];
+    V3 *fn = xrealloc(NULL, (m->nf + 1) * sizeof(V3)), *sum = xcalloc(nc + 1, sizeof(V3));
+    int *cf = xrealloc(NULL, (nc + 1) * sizeof(int)), *par = xrealloc(NULL, (nc + 1) * sizeof(int));
+    for (int f = 0; f < m->nf; f++) {
+        fn[f] = newell(m->p, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f]);
+        for (int c = m->fo[f]; c < m->fo[f + 1]; c++) { cf[c] = f; par[c] = c; }
+    }
+    float ct = angle >= 180 ? -2.0f : angle <= 0 ? 2.0f : cosf(angle * DEG2RAD) - 1e-5f;
+    for (int e = 0; e < m->ne; e++) {
+        int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1], h = m->eh ? m->eh[e] : EH_AUTO;
+        if (f0 < 0 || f1 < 0 || h == EH_HARD) continue;
+        if (h != EH_SOFT && v3dot(v3norm(fn[f0]), v3norm(fn[f1])) < ct) continue;
+        for (int k = 0; k < 2; k++) {
+            int c0 = corner_at(m, f0, m->ev[2 * e + k]), c1 = corner_at(m, f1, m->ev[2 * e + k]);
+            if (c0 >= 0 && c1 >= 0) par[find_root(par, c0)] = find_root(par, c1);
+        }
+    }
+    for (int c = 0; c < nc; c++) { int r = find_root(par, c); sum[r] = v3add(sum[r], fn[cf[c]]); }
+    for (int c = 0; c < nc; c++) {
+        V3 n = v3norm(sum[find_root(par, c)]);
+        out[c] = v3dot(n, n) > 0 ? n : v3norm(fn[cf[c]]);
+    }
+    free(fn); free(sum); free(cf); free(par);
+}
+
 
 int mesh_vmask(const Mesh *m, int comp, unsigned char *mask)
 {
@@ -430,8 +496,11 @@ int mesh_vmask(const Mesh *m, int comp, unsigned char *mask)
     return n;
 }
 
+/* b was started with mb_from_verts(m), so its vertex numbers match m's: edge overrides carry over */
 static void mesh_replace(Mesh *m, MB *b)
 {
+    for (int e = 0; e < m->ne; e++)
+        if (m->eh && m->eh[e]) mb_hard(b, m->ev[2 * e], m->ev[2 * e + 1], m->eh[e]);
     Mesh n = mb_finish(b);
     mesh_free(m);
     *m = n;
@@ -806,6 +875,863 @@ void mesh_flip(Mesh *m)
             m->fi[a] = m->fi[b];
             m->fi[b] = t;
         }
+}
+
+/* ---------------------------------------------------------------- editable face lists
+
+   Ops that cut faces apart or join them work on plain per face vertex lists, then rebuild. */
+
+typedef struct { int n, cap; int *v; } IV;
+
+static void iv_push(IV *a, int x)
+{
+    if (a->n == a->cap) { a->cap = a->cap ? a->cap * 2 : 8; a->v = xrealloc(a->v, a->cap * sizeof(int)); }
+    a->v[a->n++] = x;
+}
+
+static void iv_insert(IV *a, int at, int x)
+{
+    iv_push(a, 0);
+    memmove(a->v + at + 1, a->v + at, (a->n - 1 - at) * sizeof(int));
+    a->v[at] = x;
+}
+
+typedef struct { int nf, cf; IV *f; unsigned char *sel; } PL;
+
+static void pl_add(PL *p, const int *v, int n, int sel)
+{
+    if (p->nf == p->cf) {
+        p->cf = p->cf ? p->cf * 2 : 64;
+        p->f = xrealloc(p->f, p->cf * sizeof(IV));
+        p->sel = xrealloc(p->sel, p->cf);
+    }
+    IV *f = &p->f[p->nf];
+    memset(f, 0, sizeof *f);
+    for (int k = 0; k < n; k++) iv_push(f, v[k]);
+    p->sel[p->nf++] = (unsigned char)sel;
+}
+
+static void pl_from(PL *p, const Mesh *m)
+{
+    memset(p, 0, sizeof *p);
+    for (int f = 0; f < m->nf; f++) pl_add(p, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], m->fs[f]);
+}
+
+static void pl_free(PL *p)
+{
+    for (int f = 0; f < p->nf; f++) free(p->f[f].v);
+    free(p->f);
+    free(p->sel);
+    memset(p, 0, sizeof *p);
+}
+
+static void pl_to_mb(const PL *p, MB *b)
+{
+    for (int f = 0; f < p->nf; f++)
+        if (p->f[f].n >= 3) mb_face(b, p->f[f].v, p->f[f].n, p->sel[f]);
+}
+
+/* put vertex x between a and b in every face where they are neighbors */
+static void pl_split_edge(PL *p, int a, int b, int x)
+{
+    for (int f = 0; f < p->nf; f++) {
+        IV *v = &p->f[f];
+        for (int k = 0; k < v->n; k++) {
+            int u = v->v[k], w = v->v[(k + 1) % v->n];
+            if ((u == a && w == b) || (u == b && w == a)) { iv_insert(v, k + 1, x); break; }
+        }
+    }
+}
+
+/* split a face holding u and w (not neighbors) along u-w; returns 0 if no face has both */
+static int pl_cut(PL *p, int u, int w)
+{
+    for (int f = 0; f < p->nf; f++) {
+        IV *v = &p->f[f];
+        int n = v->n, iu = -1, iw = -1;
+        for (int k = 0; k < n; k++) { if (v->v[k] == u) iu = k; if (v->v[k] == w) iw = k; }
+        if (iu < 0 || iw < 0 || (iu + 1) % n == iw || (iw + 1) % n == iu) continue;
+        IV a = { 0, 0, NULL }, b = { 0, 0, NULL };
+        for (int k = iu;; k = (k + 1) % n) { iv_push(&a, v->v[k]); if (k == iw) break; }
+        for (int k = iw;; k = (k + 1) % n) { iv_push(&b, v->v[k]); if (k == iu) break; }
+        int sel = p->sel[f];
+        free(v->v);
+        p->f[f] = a;
+        pl_add(p, b.v, b.n, sel);
+        free(b.v);
+        return 1;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------- modeling ops */
+
+int mesh_edge_find(const Mesh *m, int a, int b)
+{
+    if (a > b) { int t = a; a = b; b = t; }
+    for (int e = 0; e < m->ne; e++)
+        if (m->ev[2 * e] == a && m->ev[2 * e + 1] == b) return e;
+    return -1;
+}
+
+void mesh_set_eh(Mesh *m, const int *trip, int n)
+{
+    HMap h;
+    edge_map(&h, m);
+    for (int i = 0; i < n; i++) {
+        int a = trip[3 * i], b = trip[3 * i + 1];
+        if (a < 0 || b < 0 || a >= m->nv || b >= m->nv) continue;
+        int e = edge_at(&h, a, b);
+        if (e >= 0) m->eh[e] = (unsigned char)trip[3 * i + 2];
+    }
+    hm_free(&h);
+}
+
+int mesh_reverse(Mesh *m, const unsigned char *fmask)
+{
+    int n = 0;
+    for (int f = 0; f < m->nf; f++) {
+        if (fmask && !fmask[f]) continue;
+        for (int a = m->fo[f], b = m->fo[f + 1] - 1; a < b; a++, b--) {
+            int t = m->fi[a];
+            m->fi[a] = m->fi[b];
+            m->fi[b] = t;
+        }
+        n++;
+    }
+    return n;
+}
+
+/* is q inside triangle a b c (all on the plane with normal nn)? */
+static int in_tri(V3 q, V3 a, V3 b, V3 c, V3 nn)
+{
+    return v3dot(v3cross(v3sub(b, a), v3sub(q, a)), nn) >= 0 && v3dot(v3cross(v3sub(c, b), v3sub(q, b)), nn) >= 0 &&
+           v3dot(v3cross(v3sub(a, c), v3sub(q, c)), nn) >= 0;
+}
+
+/* ear clipping, so concave polygons come out right; writes n-2 triangles */
+static void ear_clip(const V3 *p, const int *idx, int n, int *out)
+{
+    int *r = xrealloc(NULL, n * sizeof(int)), rn = n, o = 0;
+    memcpy(r, idx, n * sizeof(int));
+    V3 nn = newell(p, idx, n);
+    while (rn > 3) {
+        int best = -1;
+        for (int i = 0; i < rn && best < 0; i++) {
+            int a = r[(i + rn - 1) % rn], b = r[i], c = r[(i + 1) % rn];
+            if (v3dot(v3cross(v3sub(p[b], p[a]), v3sub(p[c], p[b])), nn) <= 0) continue;   /* reflex */
+            int ok = 1;
+            for (int j = 0; j < rn && ok; j++) {
+                int q = r[j];
+                if (q == a || q == b || q == c) continue;
+                if (in_tri(p[q], p[a], p[b], p[c], nn)) ok = 0;
+            }
+            if (ok) best = i;
+        }
+        if (best < 0) best = 0;   /* degenerate: fall back to a fan step */
+        out[o++] = r[(best + rn - 1) % rn];
+        out[o++] = r[best];
+        out[o++] = r[(best + 1) % rn];
+        memmove(r + best, r + best + 1, (rn - best - 1) * sizeof(int));
+        rn--;
+    }
+    out[o++] = r[0]; out[o++] = r[1]; out[o++] = r[2];
+    free(r);
+}
+
+int mesh_triangulate(Mesh *m, const unsigned char *fmask)
+{
+    int n = 0;
+    for (int f = 0; f < m->nf; f++) n += (!fmask || fmask[f]) && m->fo[f + 1] - m->fo[f] > 3;
+    if (!n) return 0;
+    MB b = mb_from_verts(m);
+    int *tri = xrealloc(NULL, 3 * (m->fo[m->nf] + 1) * sizeof(int));
+    for (int f = 0; f < m->nf; f++) {
+        int s = m->fo[f], k = m->fo[f + 1] - s;
+        if ((fmask && !fmask[f]) || k <= 3) { mb_face(&b, m->fi + s, k, m->fs[f]); continue; }
+        ear_clip(m->p, m->fi + s, k, tri);
+        for (int t = 0; t < k - 2; t++) mb_face(&b, tri + 3 * t, 3, m->fs[f]);
+    }
+    free(tri);
+    mesh_replace(m, &b);
+    return n;
+}
+
+typedef struct { float score; int e; } QCand;
+
+static int qcand_cmp(const void *a, const void *b)
+{
+    float d = ((const QCand *)b)->score - ((const QCand *)a)->score;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+
+/* the quad left when the edge a-b between triangles f0 (a->b) and f1 is removed */
+static int tri_pair_quad(const Mesh *m, int e, int q[4])
+{
+    int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1], a = m->ev[2 * e], b = m->ev[2 * e + 1];
+    if (f0 < 0 || f1 < 0) return 0;
+    const int *t0 = m->fi + m->fo[f0], *t1 = m->fi + m->fo[f1];
+    int i = 0;
+    while (i < 3 && t0[i] != a) i++;
+    if (i == 3) return 0;
+    if (t0[(i + 1) % 3] != b) { int t = a; a = b; b = t; }   /* now f0 runs a->b */
+    int x0 = -1, x1 = -1;
+    for (int k = 0; k < 3; k++) { if (t0[k] != a && t0[k] != b) x0 = t0[k]; if (t1[k] != a && t1[k] != b) x1 = t1[k]; }
+    if (x0 < 0 || x1 < 0 || x0 == x1) return 0;
+    q[0] = a; q[1] = x1; q[2] = b; q[3] = x0;
+    return 1;
+}
+
+int mesh_quadrangulate(Mesh *m, const unsigned char *fmask, float angle)
+{
+    QCand *c = xrealloc(NULL, (m->ne + 1) * sizeof(QCand));
+    int nc = 0;
+    float ct = cosf(angle * DEG2RAD);
+    for (int e = 0; e < m->ne; e++) {
+        int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1], q[4];
+        if (f0 < 0 || f1 < 0 || m->fo[f0 + 1] - m->fo[f0] != 3 || m->fo[f1 + 1] - m->fo[f1] != 3) continue;
+        if (fmask && (!fmask[f0] || !fmask[f1])) continue;
+        float d = v3dot(mesh_fnormal(m, f0), mesh_fnormal(m, f1));
+        if (d < ct || !tri_pair_quad(m, e, q)) continue;
+        V3 nn = newell(m->p, q, 4);
+        int convex = 1;
+        for (int k = 0; k < 4 && convex; k++) {
+            V3 p0 = m->p[q[(k + 3) % 4]], p1 = m->p[q[k]], p2 = m->p[q[(k + 1) % 4]];
+            convex = v3dot(v3cross(v3sub(p1, p0), v3sub(p2, p1)), nn) > 0;
+        }
+        if (!convex) continue;
+        /* prefer flat pairs whose quad is closest to a square (diagonals of equal length) */
+        float d1 = v3len(v3sub(m->p[q[0]], m->p[q[2]])), d2 = v3len(v3sub(m->p[q[1]], m->p[q[3]]));
+        c[nc].score = d + 0.5f * fminf(d1, d2) / fmaxf(fmaxf(d1, d2), 1e-12f);
+        c[nc++].e = e;
+    }
+    qsort(c, nc, sizeof *c, qcand_cmp);
+    unsigned char *used = xcalloc(m->nf + 1, 1);
+    int *quad = xrealloc(NULL, (m->nf + 1) * 4 * sizeof(int)), *qof = xrealloc(NULL, (m->nf + 1) * sizeof(int)), made = 0;
+    for (int f = 0; f < m->nf; f++) qof[f] = -1;
+    for (int i = 0; i < nc; i++) {
+        int e = c[i].e, f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1];
+        if (used[f0] || used[f1]) continue;
+        used[f0] = used[f1] = 1;
+        tri_pair_quad(m, e, quad + 4 * made);
+        qof[f0 < f1 ? f0 : f1] = made;
+        qof[f0 < f1 ? f1 : f0] = -2;   /* emitted with its partner */
+        made++;
+    }
+    if (made) {
+        MB b = mb_from_verts(m);
+        for (int f = 0; f < m->nf; f++) {
+            if (qof[f] == -2) continue;
+            if (qof[f] >= 0) mb_face(&b, quad + 4 * qof[f], 4, 1);
+            else mb_face(&b, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], m->fs[f]);
+        }
+        mesh_replace(m, &b);
+    }
+    free(c); free(used); free(quad); free(qof);
+    return made;
+}
+
+int mesh_shells(const Mesh *m, int *fshell)
+{
+    int *par = xrealloc(NULL, (m->nv + 1) * sizeof(int)), *id = xrealloc(NULL, (m->nv + 1) * sizeof(int)), n = 0;
+    for (int v = 0; v < m->nv; v++) { par[v] = v; id[v] = -1; }
+    for (int f = 0; f < m->nf; f++)
+        for (int c = m->fo[f] + 1; c < m->fo[f + 1]; c++)
+            par[find_root(par, m->fi[c])] = find_root(par, m->fi[m->fo[f]]);
+    for (int f = 0; f < m->nf; f++) {
+        int r = find_root(par, m->fi[m->fo[f]]);
+        if (id[r] < 0) id[r] = n++;
+        fshell[f] = id[r];
+    }
+    free(par); free(id);
+    return n;
+}
+
+Mesh mesh_subset(const Mesh *m, const unsigned char *fmask)
+{
+    MB b = mb_from_verts(m);
+    for (int f = 0; f < m->nf; f++)
+        if (fmask[f]) mb_face(&b, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], m->fs[f]);
+    for (int e = 0; e < m->ne; e++)
+        if (m->eh[e]) mb_hard(&b, m->ev[2 * e], m->ev[2 * e + 1], m->eh[e]);
+    return mb_finish(&b);
+}
+
+void mesh_append(Mesh *dst, const Mesh *src, const M4 *xf)
+{
+    const float *x = xf->m;
+    int flip = x[0] * (x[5] * x[10] - x[6] * x[9]) - x[4] * (x[1] * x[10] - x[2] * x[9]) + x[8] * (x[1] * x[6] - x[2] * x[5]) < 0;
+    MB b = mb_from_verts(dst);
+    for (int f = 0; f < dst->nf; f++) mb_face(&b, dst->fi + dst->fo[f], dst->fo[f + 1] - dst->fo[f], dst->fs[f]);
+    int base = b.m.nv, *tmp = xrealloc(NULL, (src->fo[src->nf] + 1) * sizeof(int));
+    for (int v = 0; v < src->nv; v++) mb_vert(&b, m4_pt(*xf, src->p[v]), src->c[v]);
+    for (int f = 0; f < src->nf; f++) {
+        int s = src->fo[f], n = src->fo[f + 1] - s;
+        for (int k = 0; k < n; k++) tmp[k] = base + src->fi[s + (flip ? n - 1 - k : k)];
+        mb_face(&b, tmp, n, src->fs[f]);
+    }
+    for (int e = 0; e < src->ne; e++)
+        if (src->eh[e]) mb_hard(&b, base + src->ev[2 * e], base + src->ev[2 * e + 1], src->eh[e]);
+    free(tmp);
+    mesh_replace(dst, &b);
+}
+
+/* faces renumbered through to[] (merged vertices point at the one they join); faces lose repeated
+   corners, and faces left with fewer than 3 go */
+static void mesh_remap(Mesh *m, const int *to)
+{
+    MB b = mb_from_verts(m);
+    int *tmp = xrealloc(NULL, (m->fo[m->nf] + 1) * sizeof(int));
+    for (int f = 0; f < m->nf; f++) {
+        int s = m->fo[f], n = m->fo[f + 1] - s, k2 = 0;
+        for (int k = 0; k < n; k++) {
+            int v = to[m->fi[s + k]];
+            if (!k2 || tmp[k2 - 1] != v) tmp[k2++] = v;
+        }
+        while (k2 > 1 && tmp[k2 - 1] == tmp[0]) k2--;
+        if (k2 >= 3) mb_face(&b, tmp, k2, m->fs[f]);
+    }
+    for (int e = 0; e < m->ne; e++)
+        if (m->eh[e]) mb_hard(&b, to[m->ev[2 * e]], to[m->ev[2 * e + 1]], m->eh[e]);
+    free(tmp);
+    mesh_replace(m, &b);
+}
+
+static int cmp_x(const void *a, const void *b, const V3 *p)
+{
+    float d = p[*(const int *)a].x - p[*(const int *)b].x;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+
+static const V3 *sortP;
+static int cmp_xp(const void *a, const void *b) { return cmp_x(a, b, sortP); }
+
+int mesh_merge_dist(Mesh *m, const unsigned char *vmask, float dist)
+{
+    int *idx = xrealloc(NULL, (m->nv + 1) * sizeof(int)), n = 0;
+    int *par = xrealloc(NULL, (m->nv + 1) * sizeof(int));
+    for (int v = 0; v < m->nv; v++) { par[v] = v; if (!vmask || vmask[v]) idx[n++] = v; }
+    sortP = m->p;
+    qsort(idx, n, sizeof(int), cmp_xp);
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n && m->p[idx[j]].x - m->p[idx[i]].x <= dist; j++)
+            if (v3len(v3sub(m->p[idx[i]], m->p[idx[j]])) <= dist) {
+                int a = find_root(par, idx[i]), b = find_root(par, idx[j]);
+                if (a != b) par[a > b ? a : b] = a < b ? a : b;   /* the lowest number survives */
+            }
+    int removed = 0;
+    V3 *ps = xcalloc(m->nv + 1, sizeof(V3)), *cs = xcalloc(m->nv + 1, sizeof(V3));
+    int *cnt = xcalloc(m->nv + 1, sizeof(int));
+    for (int v = 0; v < m->nv; v++) {
+        int r = find_root(par, v);
+        par[v] = r;
+        removed += r != v;
+        ps[r] = v3add(ps[r], m->p[v]);
+        cs[r] = v3add(cs[r], m->c[v]);
+        cnt[r]++;
+    }
+    if (removed) {
+        for (int v = 0; v < m->nv; v++)
+            if (cnt[v] > 1) { m->p[v] = v3mul(ps[v], 1.0f / cnt[v]); m->c[v] = v3mul(cs[v], 1.0f / cnt[v]); }
+        mesh_remap(m, par);
+    }
+    free(idx); free(par); free(ps); free(cs); free(cnt);
+    return removed;
+}
+
+int mesh_weld(Mesh *m, int src, int dst)
+{
+    if (src == dst || src < 0 || dst < 0 || src >= m->nv || dst >= m->nv) return 0;
+    int *to = xrealloc(NULL, (m->nv + 1) * sizeof(int));
+    for (int v = 0; v < m->nv; v++) to[v] = v;
+    to[src] = dst;
+    mesh_remap(m, to);
+    free(to);
+    return 1;
+}
+
+/* Join the faces on each side of the masked edges into one face (where they make a single loop),
+   then drop candidate vertices (rm) left between just two edges: interior ones always, border
+   corners too when rmBorder. Returns how many faces were joined away. */
+static int dissolve(Mesh *m, const unsigned char *emask, const unsigned char *rm, int rmBorder)
+{
+    int *par = xrealloc(NULL, (m->nf + 1) * sizeof(int)), joined = 0;
+    for (int f = 0; f < m->nf; f++) par[f] = f;
+    for (int e = 0; e < m->ne; e++) {
+        int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1];
+        if (emask[e] && f0 >= 0 && f1 >= 0 && f0 != f1) par[find_root(par, f0)] = find_root(par, f1);
+    }
+    /* faces of each group as a list: first[root] -> nextg[] */
+    int *first = xrealloc(NULL, (m->nf + 1) * sizeof(int)), *nextg = xrealloc(NULL, (m->nf + 1) * sizeof(int));
+    int *gsize = xcalloc(m->nf + 1, sizeof(int));
+    for (int f = 0; f < m->nf; f++) first[f] = -1;
+    for (int f = m->nf - 1; f >= 0; f--) {
+        par[f] = find_root(par, f);
+        nextg[f] = first[par[f]];
+        first[par[f]] = f;
+        gsize[par[f]]++;
+    }
+    HMap eh;
+    edge_map(&eh, m);
+    PL out;
+    memset(&out, 0, sizeof out);
+    unsigned char *done = xcalloc(m->nf + 1, 1);
+    int *hu = xrealloc(NULL, (m->fo[m->nf] + 1) * sizeof(int)), *hw = xrealloc(NULL, (m->fo[m->nf] + 1) * sizeof(int));
+    int *nxt = xrealloc(NULL, (m->nv + 1) * sizeof(int)), *outdeg = xcalloc(m->nv + 1, sizeof(int));
+    for (int v = 0; v < m->nv; v++) nxt[v] = -1;
+    for (int f = 0; f < m->nf; f++) {
+        if (done[f]) continue;
+        int r = par[f], size = gsize[r], nh = 0, sel = 0;
+        if (size == 1) { done[f] = 1; pl_add(&out, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], m->fs[f]); continue; }
+        /* the group's outline: half edges whose other face is outside the group */
+        for (int g = first[r]; g >= 0; g = nextg[g]) {
+            done[g] = 1;
+            sel |= m->fs[g];
+            int s = m->fo[g], n = m->fo[g + 1] - s;
+            for (int k = 0; k < n; k++) {
+                int u = m->fi[s + k], w = m->fi[s + (k + 1) % n], e = edge_at(&eh, u, w);
+                int o = e < 0 ? -1 : m->ef[2 * e] == g ? m->ef[2 * e + 1] : m->ef[2 * e];
+                if (o >= 0 && par[o] == r) continue;
+                hu[nh] = u; hw[nh++] = w;
+            }
+        }
+        int ok = nh >= 3;
+        for (int i = 0; i < nh && ok; i++) { if (outdeg[hu[i]]++) ok = 0; nxt[hu[i]] = hw[i]; }
+        IV loop = { 0, 0, NULL };
+        if (ok) {
+            int v = hu[0];
+            do { iv_push(&loop, v); v = nxt[v]; } while (v >= 0 && v != hu[0] && loop.n <= nh);
+            ok = v == hu[0] && loop.n == nh;
+        }
+        for (int i = 0; i < nh; i++) { outdeg[hu[i]] = 0; nxt[hu[i]] = -1; }
+        if (ok) {
+            pl_add(&out, loop.v, loop.n, sel);
+            joined += size - 1;
+        } else {
+            /* pinched or holed: leave these faces as they were */
+            for (int g = first[r]; g >= 0; g = nextg[g])
+                pl_add(&out, m->fi + m->fo[g], m->fo[g + 1] - m->fo[g], m->fs[g]);
+        }
+        free(loop.v);
+    }
+    hm_free(&eh);
+    /* leftover vertices between two edges */
+    int removed = 0;
+    if (rm) {
+        HMap ec;
+        int nc = 0;
+        for (int f = 0; f < out.nf; f++) nc += out.f[f].n;
+        hm_init(&ec, nc + 8);
+        int *deg = xcalloc(m->nv + 1, sizeof(int)), *border = xcalloc(m->nv + 1, sizeof(int));
+        for (int f = 0; f < out.nf; f++)
+            for (int k = 0; k < out.f[f].n; k++) {
+                int u = out.f[f].v[k], w = out.f[f].v[(k + 1) % out.f[f].n], *c = hm_get(&ec, u, w);
+                if (*c < 0) { *c = 1; deg[u]++; deg[w]++; } else (*c)++;
+            }
+        for (int f = 0; f < out.nf; f++)
+            for (int k = 0; k < out.f[f].n; k++) {
+                int u = out.f[f].v[k], w = out.f[f].v[(k + 1) % out.f[f].n];
+                if (*hm_get(&ec, u, w) == 1) border[u] = border[w] = 1;
+            }
+        hm_free(&ec);
+        for (int f = 0; f < out.nf; f++) {
+            IV *v = &out.f[f];
+            for (int k = 0; k < v->n && v->n > 3; k++) {
+                int x = v->v[k];
+                if (!rm[x] || deg[x] != 2 || (border[x] && !rmBorder)) continue;
+                memmove(v->v + k, v->v + k + 1, (v->n - k - 1) * sizeof(int));
+                v->n--;
+                k--;
+                removed++;
+            }
+        }
+        free(deg); free(border);
+    }
+    if (joined || removed) {
+        MB b = mb_from_verts(m);
+        pl_to_mb(&out, &b);
+        mesh_replace(m, &b);
+    }
+    pl_free(&out);
+    free(par); free(done); free(hu); free(hw); free(nxt); free(outdeg); free(first); free(nextg); free(gsize);
+    return joined + removed;
+}
+
+int mesh_delete_edges(Mesh *m, const unsigned char *emask, int clean)
+{
+    unsigned char *rm = NULL;
+    if (clean) {
+        rm = xcalloc(m->nv + 1, 1);
+        for (int e = 0; e < m->ne; e++) if (emask[e]) rm[m->ev[2 * e]] = rm[m->ev[2 * e + 1]] = 1;
+    }
+    int n = dissolve(m, emask, rm, 0);
+    free(rm);
+    return n;
+}
+
+int mesh_delete_verts(Mesh *m, const unsigned char *vmask)
+{
+    unsigned char *em = xcalloc(m->ne + 1, 1);
+    for (int e = 0; e < m->ne; e++)
+        em[e] = (vmask[m->ev[2 * e]] || vmask[m->ev[2 * e + 1]]) && m->ef[2 * e + 1] >= 0;
+    int n = dissolve(m, em, vmask, 1);
+    free(em);
+    return n;
+}
+
+int mesh_edge_ring(const Mesh *m, int e, int *ra, int *rb, int *closed)
+{
+    int n = 1;
+    unsigned char *seen = xcalloc(m->nf + 1, 1);
+    HMap h;
+    edge_map(&h, m);
+    ra[0] = m->ev[2 * e];
+    rb[0] = m->ev[2 * e + 1];
+    *closed = 0;
+    for (int side = 0; side < 2 && !*closed; side++) {
+        int a = ra[0], b = rb[0], f = m->ef[2 * e + side], ce = e;
+        if (side == 1) { a = ra[0]; b = rb[0]; }
+        while (f >= 0 && !seen[f] && m->fo[f + 1] - m->fo[f] == 4) {
+            seen[f] = 1;
+            const int *q = m->fi + m->fo[f];
+            int i = 0;
+            while (i < 4 && q[i] != a) i++;
+            if (i == 4) break;
+            int d, c;
+            if (q[(i + 1) % 4] == b) { d = q[(i + 3) % 4]; c = q[(i + 2) % 4]; }
+            else { d = q[(i + 1) % 4]; c = q[(i + 2) % 4]; }
+            int ne_ = edge_at(&h, d, c);
+            if (ne_ < 0) break;
+            if (ne_ == e) { *closed = 1; break; }
+            if (side == 0) { ra[n] = d; rb[n] = c; }
+            else {
+                memmove(ra + 1, ra, n * sizeof(int));
+                memmove(rb + 1, rb, n * sizeof(int));
+                ra[0] = d; rb[0] = c;
+            }
+            n++;
+            a = d; b = c;
+            f = m->ef[2 * ne_] == f ? m->ef[2 * ne_ + 1] : m->ef[2 * ne_];
+            ce = ne_;
+        }
+        (void)ce;
+    }
+    hm_free(&h);
+    free(seen);
+    return n;
+}
+
+int mesh_cut(Mesh *m, const CutPt *pts, int n)
+{
+    if (n < 2) return 0;
+    PL pl;
+    pl_from(&pl, m);
+    MB b = mb_from_verts(m);
+    HMap eh;
+    edge_map(&eh, m);
+    /* points already put on each edge: (edge, t from its lower vertex, vertex) */
+    int *se = xrealloc(NULL, n * sizeof(int)), *sv = xrealloc(NULL, n * sizeof(int)), ns = 0;
+    float *st = xrealloc(NULL, n * sizeof(float));
+    int *id = xrealloc(NULL, n * sizeof(int)), cuts = 0;
+    for (int k = 0; k < n; k++) {
+        int a = pts[k].a, c = pts[k].b;
+        float t = pts[k].t;
+        id[k] = -1;
+        if (a < 0 || a >= m->nv) continue;
+        if (c < 0) { id[k] = a; continue; }
+        if (c >= m->nv) continue;
+        if (a > c) { int x = a; a = c; c = x; t = 1 - t; }
+        int e = edge_at(&eh, a, c);
+        if (e < 0) continue;
+        if (t <= 1e-4f) { id[k] = a; continue; }
+        if (t >= 1 - 1e-4f) { id[k] = c; continue; }
+        int lo = a, hi = c;
+        float tlo = 0, thi = 1;
+        for (int i = 0; i < ns && id[k] < 0; i++) {
+            if (se[i] != e) continue;
+            if (fabsf(st[i] - t) < 1e-4f) id[k] = sv[i];
+            else if (st[i] < t && st[i] > tlo) { tlo = st[i]; lo = sv[i]; }
+            else if (st[i] > t && st[i] < thi) { thi = st[i]; hi = sv[i]; }
+        }
+        if (id[k] >= 0) continue;
+        int x = mb_vert(&b, v3lerp(m->p[a], m->p[c], t), v3lerp(m->c[a], m->c[c], t));
+        pl_split_edge(&pl, lo, hi, x);
+        if (m->eh[e]) { mb_hard(&b, lo, x, m->eh[e]); mb_hard(&b, x, hi, m->eh[e]); }
+        se[ns] = e; st[ns] = t; sv[ns++] = x;
+        id[k] = x;
+    }
+    int *cu = xrealloc(NULL, n * sizeof(int)), *cw = xrealloc(NULL, n * sizeof(int));
+    for (int k = 0; k + 1 < n; k++) {
+        int u = id[k], w = id[k + 1];
+        if (u < 0 || w < 0 || u == w) continue;
+        if (pl_cut(&pl, u, w)) { cu[cuts] = u; cw[cuts++] = w; }
+    }
+    if (cuts || ns) {
+        pl_to_mb(&pl, &b);
+        mesh_replace(m, &b);   /* every vertex is still used, so numbers stay put */
+        HMap h;
+        edge_map(&h, m);
+        for (int i = 0; i < cuts; i++) {
+            int e = edge_at(&h, cu[i], cw[i]);
+            if (e >= 0) m->es[e] = 1;
+        }
+        hm_free(&h);
+    } else {
+        free(b.m.p); free(b.m.c); free(b.m.vs); free(b.m.fo); free(b.m.fs); free(b.m.fi); free(b.hp);
+    }
+    hm_free(&eh);
+    pl_free(&pl);
+    free(se); free(sv); free(st); free(id); free(cu); free(cw);
+    return cuts;
+}
+
+int mesh_insert_loop(Mesh *m, int e, float t)
+{
+    if (e < 0 || e >= m->ne) return 0;
+    int *ra = xrealloc(NULL, (m->ne + 1) * sizeof(int)), *rb = xrealloc(NULL, (m->ne + 1) * sizeof(int)), closed;
+    int n = mesh_edge_ring(m, e, ra, rb, &closed);
+    CutPt *p = xrealloc(NULL, (n + 1) * sizeof(CutPt));
+    for (int i = 0; i < n; i++) { p[i].a = ra[i]; p[i].b = rb[i]; p[i].t = t; }
+    if (closed) p[n++] = p[0];
+    int made = mesh_cut(m, p, n);
+    free(ra); free(rb); free(p);
+    return made;
+}
+
+/* One segment bevel (chamfer). Each selected edge becomes a strip of width about 'width': at its
+   ends the corners slide along the unselected edges (or inset between two selected ones), and a
+   cap face closes the gap where three or more strips meet. */
+int mesh_bevel(Mesh *m, const unsigned char *emask, float width)
+{
+    unsigned char *sel = xcalloc(m->ne + 1, 1);
+    int *k = xcalloc(m->nv + 1, sizeof(int)), any = 0;
+    for (int e = 0; e < m->ne; e++)
+        if (emask[e] && m->ef[2 * e] >= 0 && m->ef[2 * e + 1] >= 0 && m->ef[2 * e] != m->ef[2 * e + 1]) {
+            sel[e] = 1;
+            k[m->ev[2 * e]]++;
+            k[m->ev[2 * e + 1]]++;
+            any = 1;
+        }
+    if (!any || width <= 0) { free(sel); free(k); return 0; }
+    HMap eh, sl;
+    edge_map(&eh, m);
+    hm_init(&sl, 2 * m->ne + 8);
+    MB b = mb_from_verts(m);
+    IV owner = { 0, 0, NULL };   /* original vertex of each new vertex (index - m->nv) */
+    int nc = m->fo[m->nf], *cv = xrealloc(NULL, (nc + 1) * sizeof(int));
+    PL pl;
+    memset(&pl, 0, sizeof pl);
+#define NEWV(pos, col, own) (iv_push(&owner, own), mb_vert(&b, pos, col))
+    for (int f = 0; f < m->nf; f++) {
+        int s = m->fo[f], n = m->fo[f + 1] - s;
+        IV nf = { 0, 0, NULL };
+        for (int j = 0; j < n; j++) {
+            int v = m->fi[s + j], pv = m->fi[s + (j + n - 1) % n], nx = m->fi[s + (j + 1) % n];
+            cv[s + j] = -1;
+            if (!k[v]) { iv_push(&nf, v); continue; }
+            int ein = edge_at(&eh, pv, v), eout = edge_at(&eh, v, nx), ends[2] = { ein, eout }, slid[2];
+            for (int z = 0; z < 2; z++) {
+                int ee = ends[z];
+                slid[z] = -1;
+                if (ee < 0 || sel[ee]) continue;
+                int *slot = hm_getd(&sl, v, ee);
+                if (*slot < 0) {
+                    int o = m->ev[2 * ee] == v ? m->ev[2 * ee + 1] : m->ev[2 * ee];
+                    float L = v3len(v3sub(m->p[o], m->p[v])), d = fminf(width, 0.45f * L), u = L > 0 ? d / L : 0;
+                    *slot = NEWV(v3lerp(m->p[v], m->p[o], u), v3lerp(m->c[v], m->c[o], u), v);
+                    if (m->eh[ee]) mb_hard(&b, *slot, o, m->eh[ee]);
+                }
+                slid[z] = *slot;
+            }
+            int si = ein >= 0 && sel[ein], so = eout >= 0 && sel[eout];
+            if (si && so) {
+                V3 a = v3sub(m->p[pv], m->p[v]), c = v3sub(m->p[nx], m->p[v]);
+                float la = v3len(a), lc = v3len(c);
+                V3 p = m->p[v];
+                if (la > 0) p = v3add(p, v3mul(a, fminf(width, 0.45f * la) / la));
+                if (lc > 0) p = v3add(p, v3mul(c, fminf(width, 0.45f * lc) / lc));
+                cv[s + j] = NEWV(p, m->c[v], v);
+                iv_push(&nf, cv[s + j]);
+            } else if (si) {
+                cv[s + j] = slid[1];
+                iv_push(&nf, slid[1]);
+            } else if (so) {
+                cv[s + j] = slid[0];
+                iv_push(&nf, slid[0]);
+            } else {
+                iv_push(&nf, slid[0]);
+                iv_push(&nf, slid[1]);
+            }
+        }
+        pl_add(&pl, nf.v, nf.n, 0);
+        free(nf.v);
+    }
+#undef NEWV
+    /* strips: f0 runs u->w along the edge, f1 runs w->u */
+    for (int e = 0; e < m->ne; e++) {
+        if (!sel[e]) continue;
+        int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1], c0u = -1, c0w = -1, c1u = -1, c1w = -1, u = -1, w = -1;
+        int s = m->fo[f0], n = m->fo[f0 + 1] - s;
+        for (int j = 0; j < n; j++) {
+            int a = m->fi[s + j], c = m->fi[s + (j + 1) % n];
+            if ((a == m->ev[2 * e] && c == m->ev[2 * e + 1]) || (c == m->ev[2 * e] && a == m->ev[2 * e + 1])) {
+                u = a; w = c; c0u = cv[s + j]; c0w = cv[s + (j + 1) % n];
+            }
+        }
+        s = m->fo[f1]; n = m->fo[f1 + 1] - s;
+        for (int j = 0; j < n; j++) {
+            if (m->fi[s + j] == u) c1u = cv[s + j];
+            if (m->fi[s + j] == w) c1w = cv[s + j];
+        }
+        int q[4] = { c0w, c0u, c1u, c1w }, qn = 0, out[4];
+        for (int i = 0; i < 4; i++) if (q[i] >= 0 && (!qn || out[qn - 1] != q[i])) out[qn++] = q[i];
+        if (qn > 1 && out[qn - 1] == out[0]) qn--;
+        if (qn >= 3) pl_add(&pl, out, qn, 1);
+        if (m->eh[e]) for (int i = 0; i < qn; i++) mb_hard(&b, out[i], out[(i + 1) % qn], m->eh[e]);
+    }
+    /* caps: the open outline among each old vertex's new vertices */
+    {
+        HMap dh;
+        int tot = 0;
+        for (int f = 0; f < pl.nf; f++) tot += pl.f[f].n;
+        hm_init(&dh, tot + 8);
+        for (int f = 0; f < pl.nf; f++)
+            for (int j = 0; j < pl.f[f].n; j++) *hm_getd(&dh, pl.f[f].v[j], pl.f[f].v[(j + 1) % pl.f[f].n]) = 1;
+        int *nx = xrealloc(NULL, (b.m.nv + 1) * sizeof(int));
+        for (int v = 0; v < b.m.nv; v++) nx[v] = -1;
+        int pf = pl.nf;
+        for (int f = 0; f < pf; f++)
+            for (int j = 0; j < pl.f[f].n; j++) {
+                int a = pl.f[f].v[j], c = pl.f[f].v[(j + 1) % pl.f[f].n];
+                if (a < m->nv || c < m->nv || owner.v[a - m->nv] != owner.v[c - m->nv]) continue;
+                if (*hm_getd(&dh, c, a) == 1) continue;
+                nx[c] = a;   /* the cap runs against the open edge */
+            }
+        for (int v = m->nv; v < b.m.nv; v++) {
+            if (nx[v] < 0) continue;
+            IV loop = { 0, 0, NULL };
+            int x = v, ok = 0;
+            while (x >= 0 && loop.n <= 64) {
+                iv_push(&loop, x);
+                int y = nx[x];
+                nx[x] = -1;
+                if (y == v) { ok = 1; break; }
+                x = y;
+            }
+            if (ok && loop.n >= 3) pl_add(&pl, loop.v, loop.n, 1);
+            free(loop.v);
+        }
+        free(nx);
+        hm_free(&dh);
+    }
+    pl_to_mb(&pl, &b);
+    pl_free(&pl);
+    /* overrides on edges that kept both old ends carry over; mesh_replace adds them */
+    int made = 0;
+    for (int e = 0; e < m->ne; e++) made += sel[e];
+    mesh_replace(m, &b);
+    hm_free(&eh); hm_free(&sl);
+    free(sel); free(k); free(cv); free(owner.v);
+    return made;
+}
+
+/* selected border edges as runs of vertices; returns the number of runs (at most 2 kept) */
+static int border_runs(const Mesh *m, const unsigned char *emask, IV run[2], int closed[2])
+{
+    int *deg = xcalloc(m->nv + 1, sizeof(int)), nr = 0;
+    unsigned char *use = xcalloc(m->ne + 1, 1);
+    for (int e = 0; e < m->ne; e++)
+        if (emask[e] && m->ef[2 * e] >= 0 && m->ef[2 * e + 1] < 0) { use[e] = 1; deg[m->ev[2 * e]]++; deg[m->ev[2 * e + 1]]++; }
+    for (int v = 0; v < m->nv; v++) if (deg[v] > 2) { free(deg); free(use); return -1; }
+    for (int pass = 0; pass < 2; pass++)   /* open runs start at an end; then closed loops */
+        for (int s = 0; s < m->ne; s++) {
+            if (!use[s]) continue;
+            int a = m->ev[2 * s], c = m->ev[2 * s + 1];
+            if (pass == 0 && deg[a] != 1 && deg[c] != 1) continue;
+            if (pass == 0 && deg[a] != 1) { int t = a; a = c; c = t; }
+            if (nr == 2) { nr = 3; goto out; }   /* more than two runs */
+            IV *r = &run[nr];
+            memset(r, 0, sizeof *r);
+            closed[nr] = pass == 1;
+            iv_push(r, a);
+            int cur = s, v = c;
+            use[s] = 0;
+            for (;;) {
+                if (v == r->v[0]) break;
+                iv_push(r, v);
+                int nx = -1;
+                for (int e = 0; e < m->ne && nx < 0; e++)
+                    if (use[e] && (m->ev[2 * e] == v || m->ev[2 * e + 1] == v)) nx = e;
+                if (nx < 0) break;
+                use[nx] = 0;
+                v = m->ev[2 * nx] == v ? m->ev[2 * nx + 1] : m->ev[2 * nx];
+                cur = nx;
+            }
+            (void)cur;
+            nr++;
+        }
+out:
+    free(deg); free(use);
+    return nr;
+}
+
+int mesh_bridge(Mesh *m, const unsigned char *emask, int divs)
+{
+    IV r[3] = { { 0, 0, NULL }, { 0, 0, NULL }, { 0, 0, NULL } };
+    int cl[3] = { 0, 0, 0 }, nr = border_runs(m, emask, r, cl), res = 0;
+    if (nr != 2 || cl[0] != cl[1]) { res = -1; goto done; }
+    int n = r[0].n;
+    if (r[1].n != n || n < 2) { res = -2; goto done; }
+    int closed = cl[0], *A = r[0].v, *B = xrealloc(NULL, n * sizeof(int));
+    /* run A along its face's winding, so new faces hold A's edges backwards */
+    {
+        int e = mesh_edge_find(m, A[0], A[1]), f = m->ef[2 * e], s = m->fo[f], fn = m->fo[f + 1] - s, fwd = 0;
+        for (int j = 0; j < fn; j++) if (m->fi[s + j] == A[0] && m->fi[s + (j + 1) % fn] == A[1]) fwd = 1;
+        if (!fwd) {
+            for (int i = 0; i < n / 2; i++) { int t = A[i]; A[i] = A[n - 1 - i]; A[n - 1 - i] = t; }
+            if (closed) {   /* keep A[0] first */
+                int t = A[n - 1];
+                memmove(A + 1, A, (n - 1) * sizeof(int));
+                A[0] = t;
+            }
+        }
+    }
+    /* line B up with A: the start and direction that keep matching vertices closest */
+    float best = 1e30f;
+    for (int s = 0; s < (closed ? n : 1); s++)
+        for (int dir = 0; dir < 2; dir++) {
+            float d = 0;
+            for (int i = 0; i < n; i++) {
+                int j = closed ? (dir ? (s - i + n) % n : (s + i) % n) : (dir ? n - 1 - i : i);
+                d += v3len(v3sub(m->p[A[i]], m->p[r[1].v[j]]));
+            }
+            if (d < best) {
+                best = d;
+                for (int i = 0; i < n; i++) B[i] = r[1].v[closed ? (dir ? (s - i + n) % n : (s + i) % n) : (dir ? n - 1 - i : i)];
+            }
+        }
+    MB b = mb_from_verts(m);
+    for (int f = 0; f < m->nf; f++) mb_face(&b, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], 0);
+    int rows = divs + 2, *R = xrealloc(NULL, rows * n * sizeof(int));
+    for (int i = 0; i < n; i++) { R[i] = A[i]; R[(rows - 1) * n + i] = B[i]; }
+    for (int rr = 1; rr < rows - 1; rr++) {
+        float t = (float)rr / (rows - 1);
+        for (int i = 0; i < n; i++)
+            R[rr * n + i] = mb_vert(&b, v3lerp(m->p[A[i]], m->p[B[i]], t), v3lerp(m->c[A[i]], m->c[B[i]], t));
+    }
+    int segs = closed ? n : n - 1;
+    for (int rr = 0; rr < rows - 1; rr++)
+        for (int i = 0; i < segs; i++) {
+            int i2 = (i + 1) % n, q[4] = { R[rr * n + i2], R[rr * n + i], R[(rr + 1) * n + i], R[(rr + 1) * n + i2] };
+            mb_face(&b, q, 4, 1);
+            res++;
+        }
+    mesh_replace(m, &b);
+    free(R);
+    free(B);
+done:
+    for (int i = 0; i < 3; i++) free(r[i].v);
+    return res;
 }
 
 /* ---------------------------------------------------------------- primitives */
