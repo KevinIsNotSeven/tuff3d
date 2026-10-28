@@ -257,6 +257,115 @@ static void test_ops(void)
     mesh_free(&c);
 }
 
+/* do consecutive faces of a list share an edge? */
+static int faces_touch(const Mesh *m, int a, int b)
+{
+    for (int e = 0; e < m->ne; e++)
+        if ((m->ef[2 * e] == a && m->ef[2 * e + 1] == b) || (m->ef[2 * e] == b && m->ef[2 * e + 1] == a)) return 1;
+    return 0;
+}
+
+static int edges_touch(const Mesh *m, int a, int b)
+{
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++) if (m->ev[2 * a + i] == m->ev[2 * b + j]) return 1;
+    return 0;
+}
+
+static void test_loops(void)
+{
+    int l[256], closed, ok;
+
+    /* 4x4 plane: every face loop is a row or column of 4, open */
+    Mesh m = plane(4);
+    CHECK(mesh_face_loop_list(&m, 5, -1, l, &closed) == 1 && l[0] == 5);   /* no edge: just the face */
+    for (int k = 0; k < 4; k++) {
+        int f = 5, e = mesh_edge_find(&m, m.fi[m.fo[f] + k], m.fi[m.fo[f] + (k + 1) % 4]);
+        int n = mesh_face_loop_list(&m, f, e, l, &closed);
+        ok = n == 4 && !closed;
+        for (int i = 0; i + 1 < n; i++) ok &= faces_touch(&m, l[i], l[i + 1]);
+        CHECK(ok);
+    }
+    {
+        int f = 5, e = mesh_edge_find(&m, m.fi[m.fo[f]], m.fi[m.fo[f] + 1]);
+        int n = mesh_face_loop_list(&m, f, e, l, &closed);
+        CHECK(n == 4);
+        CHECK(mesh_loop_between(&m, COMP_FACE, l[0], l[2]) == 3 && count(m.fs, m.nf) == 3);
+        memset(m.fs, 0, m.nf);
+        CHECK(mesh_loop_between(&m, COMP_FACE, l[3], l[1]) == 3 && m.fs[l[1]] && m.fs[l[2]] && m.fs[l[3]]);
+        memset(m.fs, 0, m.nf);
+        CHECK(mesh_face_loop(&m, f, e) == 4 && count(m.fs, m.nf) == 4);
+        memset(m.fs, 0, m.nf);
+        /* faces that are not on a common loop */
+        int diag = -1;
+        for (int g = 0; g < m.nf && diag < 0; g++) {
+            int on = 0;
+            for (int k = 0; k < 2; k++) {
+                int ee = mesh_edge_find(&m, m.fi[m.fo[f] + k], m.fi[m.fo[f] + k + 1]), nn = mesh_face_loop_list(&m, f, ee, l, &closed);
+                for (int i = 0; i < nn; i++) on |= l[i] == g;
+            }
+            if (!on) diag = g;
+        }
+        CHECK(diag >= 0 && mesh_loop_between(&m, COMP_FACE, diag, f) == 0 && count(m.fs, m.nf) == 0);
+    }
+    /* edge loops: ordered end to end; partial runs of edges and of vertices */
+    for (int e = 0; e < m.ne; e++) {
+        int n = mesh_edge_loop_list(&m, e, l, &closed);
+        ok = n == 4 && !closed;
+        for (int i = 0; i + 1 < n; i++) ok &= edges_touch(&m, l[i], l[i + 1]) && l[i] != l[i + 1];
+        if (!ok) { CHECK(ok); break; }
+    }
+    {
+        int n = mesh_edge_loop_list(&m, 7, l, &closed);
+        CHECK(n == 4 && mesh_loop_between(&m, COMP_EDGE, l[3], l[1]) == 3 && count(m.es, m.ne) == 3 && !m.es[l[0]]);
+        /* vertices: the 5 along that loop; from its second (shared by l[0] and l[1]) to its last is 4 */
+        int a = l[0], b = l[1], v0 = m.ev[2 * a] == m.ev[2 * b] || m.ev[2 * a] == m.ev[2 * b + 1] ? m.ev[2 * a] : m.ev[2 * a + 1];
+        int c = l[3], d = l[2], v1 = m.ev[2 * c] == m.ev[2 * d] || m.ev[2 * c] == m.ev[2 * d + 1] ? m.ev[2 * c + 1] : m.ev[2 * c];
+        CHECK(mesh_loop_between(&m, COMP_VERT, v0, v1) == 4 && count(m.vs, m.nv) == 4 && m.vs[v0] && m.vs[v1]);
+    }
+    /* rings across the plane: 5 edges, open */
+    CHECK(mesh_ring_list(&m, 0, l, &closed) == 5 && !closed);
+    memset(m.es, 0, m.ne);
+    CHECK(mesh_edge_ring_select(&m, 0) == 5 && count(m.es, m.ne) == 5);
+    /* raycast with culling: the plane faces +Y */
+    {
+        float t;
+        CHECK(mesh_raycast_cull(&m, v3(0.1f, 1, 0.1f), v3(0, -1, 0), &t, 1) >= 0);
+        CHECK(mesh_raycast_cull(&m, v3(0.1f, -1, 0.1f), v3(0, 1, 0), &t, 1) < 0);
+        CHECK(mesh_raycast_cull(&m, v3(0.1f, -1, 0.1f), v3(0, 1, 0), &t, -1) >= 0);
+        CHECK(mesh_raycast(&m, v3(0.1f, -1, 0.1f), v3(0, 1, 0), &t) >= 0);
+    }
+    mesh_free(&m);
+
+    /* cylinder sides: the face loop around is closed (20 sides); the loop up the side stops at the caps */
+    Prim p;
+    prim_defaults(&p, PRIM_CYL);
+    p.chseg = 3;
+    m = mesh_prim(&p);
+    {
+        int side = -1, horiz = -1, vert = -1;
+        for (int f = 0; f < m.nf && side < 0; f++) if (m.fo[f + 1] - m.fo[f] == 4) side = f;
+        CHECK(side >= 0);
+        for (int k = 0; k < 4; k++) {
+            int a = m.fi[m.fo[side] + k], b = m.fi[m.fo[side] + (k + 1) % 4], e = mesh_edge_find(&m, a, b);
+            if (fabsf(m.p[a].y - m.p[b].y) < 1e-4f) horiz = e; else vert = e;
+        }
+        CHECK(mesh_face_loop_list(&m, side, vert, l, &closed) == 20 && closed);
+        CHECK(mesh_face_loop_list(&m, side, horiz, l, &closed) == 3 && !closed);
+        ok = 1;
+        for (int i = 0; i + 1 < 3; i++) ok &= faces_touch(&m, l[i], l[i + 1]);
+        CHECK(ok);
+        CHECK(mesh_ring_list(&m, vert, l, &closed) == 20 && closed);
+        CHECK(mesh_edge_loop_list(&m, horiz, l, &closed) == 20 && closed);
+        CHECK(mesh_loop_between(&m, COMP_EDGE, l[0], l[19]) == 2);     /* around the short way */
+        memset(m.es, 0, m.ne);
+        CHECK(mesh_loop_between(&m, COMP_EDGE, l[2], l[12]) == 11);    /* halfway: either way, 11 */
+        mesh_face_loop_list(&m, side, vert, l, &closed);
+        CHECK(mesh_loop_between(&m, COMP_FACE, l[0], l[17]) == 4);
+    }
+    mesh_free(&m);
+}
+
 int main(void)
 {
     Prim p;
@@ -551,6 +660,7 @@ int main(void)
     mesh_free(&m);
 
     test_ops();
+    test_loops();
     printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
     return fails != 0;
 }

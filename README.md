@@ -3,8 +3,10 @@
 A small, minimalist polygon modeler for Windows with Autodesk Maya's navigation and hotkeys.
 It is one ~420 KB exe with no installer, and it only uses DLLs that ship with Windows
 (OpenGL 1.1, GDI, GDI+ for reference images, common dialogs, shell drag and drop). It redraws only when something changes, so
-it sits at 0% CPU when idle. Meshes are drawn from cached vertex arrays that are only rebuilt after
-an edit, so tumbling and hovering stay fast on dense meshes.
+it sits at 0% CPU when idle. Each mesh is only rebuilt for drawing when its own shape, colors or
+face selection change, and a mesh that stays the same is kept on the graphics card in display lists,
+so tumbling dense meshes is cheap. Hover highlighting reuses one depth readback and the projected
+vertex positions until the camera or the scene changes, so moving the mouse costs almost nothing.
 
 **Download:** [`bin/tuff3d.exe`](bin/tuff3d.exe)
 
@@ -43,8 +45,12 @@ Selection
 - Objects, vertices, edges, faces, or Multi mode (F7): all three at once, like Maya's multi-component
   selection (a click picks a nearby vertex, then an edge, then the face under the cursor)
 - Click, marquee (only what's visible in shaded mode), Shift/Ctrl modifiers
-- Double-click an edge for its edge loop; grow / shrink (> / <); convert between vertices, edges and
-  faces (Ctrl+F9/F10/F11); select all / invert
+- Double-click an edge for its edge loop, or a face for its face loop (the loop runs across the side
+  of the face nearest the cursor), like Maya
+- Shift+double-click a second edge, face or vertex on the same loop as the last one clicked to select
+  just the run between them (Maya's partial loops); otherwise Shift adds the loop, Ctrl removes it
+- Select Loop (two neighboring faces give their face loop), Select Edge Ring; grow / shrink (> / <);
+  convert between vertices, edges and faces (Ctrl+F9/F10/F11); select all / invert
 
 Feedback
 - Preselection highlight: whatever a click would pick (object, vertex, edge or face) lights up red
@@ -62,13 +68,21 @@ Comfort
   (Shift fast, Ctrl fine)
 - Smooth camera moves for frame (F/A) and views; Home view, front/side/top views, and clicking
   X/Y/Z on the corner gizmo to look down that axis (click again for the opposite side)
+- Maya camera extras: [ and ] step back and forth through camera moves, Alt+Shift+drag orbits or
+  pans along one direction, Ctrl+Alt+drag box zooms (drag right to zoom in, left to zoom out)
+- Isolate Select (Ctrl+1): show only the selected objects until Ctrl+1 again
+- Anti-aliasing (Display > Anti-aliasing: off, 2x, 4x, 8x or 16x MSAA, 4x by default; it uses the
+  most samples the graphics card offers up to that)
+- X-Ray (Alt+A, also on the toolbar): see-through surfaces, and clicks and boxes reach the components
+  behind; Backface Culling; Wireframe on Shaded; Grid on/off. The top right of the view says when
+  Isolate Select, X-Ray or Backface Culling is on
 - File > Open Recent, drag and drop .obj files onto the window (Shift adds them to the scene), and
   open a file passed on the command line (e.g. Open With)
 - Autosave every minute while there are unexported changes; after a crash, tuff3d offers to recover
 - The title bar shows the file name with `*` for unexported changes, and New / Open / Exit ask before
   discarding them
-- Remembers the window position, side panel, wireframe, heads-up display, manipulator size, theme
-  and the last shading mode picked
+- Remembers the window position, side panel, wireframe, heads-up display, manipulator size, theme,
+  anti-aliasing, X-Ray, culling, wireframe on shaded, grid and the last shading mode picked
 - 48 themes (Classic, 33 dark, 14 light), picked in the theme picker (Ctrl+T or Display > Theme):
   a tile per theme showing tuff3d in its colors; hover a tile to preview it on the whole window,
   click to keep it, arrow keys to step through, R for a random one. Ctrl+Shift+T steps to the next
@@ -93,15 +107,21 @@ See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what c
 | Input | Action |
 | --- | --- |
 | Alt + LMB / MMB / RMB drag | Tumble / track / dolly |
+| Alt + Shift + LMB / MMB drag | Tumble / track along one direction |
+| Ctrl + Alt + LMB drag | Box zoom (drag right: in, drag left: out) |
 | Mouse wheel | Dolly |
 | F / A / Home | Frame selected / frame all / home view |
+| [ / ] | Previous / next view |
+| Ctrl+1 | Isolate Select |
 | Click X / Y / Z on the corner gizmo | Look down that axis |
 | Q W E R | Select / move / rotate / scale tool |
 | F8 / F9 / F10 / F11 / F7 | Object / vertex / edge / face / multi mode |
 | Ctrl+F9 / F10 / F11 | Convert selection to vertices / edges / faces |
 | RMB on object | Component mode menu |
 | Shift / Ctrl / Ctrl+Shift + click | Toggle / deselect / add |
-| Double-click an edge | Select its edge loop |
+| Double-click an edge / a face | Select its edge loop / face loop |
+| Shift + double-click | Partial loop from the last clicked component (or add the loop) |
+| Ctrl + double-click | Remove the loop |
 | > / < | Grow / shrink selection |
 | Ctrl+Shift+A / Ctrl+Shift+I | Select all / invert selection |
 | Ctrl + drag axis handle | Move / scale on the other two axes |
@@ -116,6 +136,7 @@ See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what c
 | Z or Ctrl+Z / Shift+Z or Ctrl+Y | Undo / redo |
 | G | Repeat last command |
 | 4 / 5 | Wireframe / shaded |
+| Alt+A | X-Ray |
 | B + LMB drag | Brush radius (paint tool) |
 | Ctrl+N / Ctrl+O / Ctrl+S | New / open / save (.tuff scene, or back to the open OBJ) |
 | Ctrl+Shift+O / Ctrl+Shift+S | Import into the scene / save as |

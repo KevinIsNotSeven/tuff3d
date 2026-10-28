@@ -22,6 +22,7 @@ typedef struct {
     V3 t, r, s;          /* translate, rotate (degrees, xyz order), scale */
     int sel, hil;        /* selected (object mode) / hilited for component editing */
     int hidden;          /* Ctrl+H; skipped when drawing and picking */
+    int iso;             /* in the isolated set while Isolate Select (Ctrl+1) is on */
     unsigned order;      /* selection stamp, highest is the lead object */
     Prim prim;           /* construction history, PRIM_NONE once components are edited */
     float nangle;        /* normal angle: 0 = hard shade, 180 = smooth, between = hard over that angle */
@@ -51,9 +52,15 @@ static char g_msg[200];
 static int lastCmd, lastHandle, hover, modified, snapGrid, snapPoint;
 static unsigned editStamp;
 static int hvObj = -1, hvKind, hvIdx, tracking, hudOn = 1;
+static int xray, cull, wireOnShaded, gridOn = 1, isolate;   /* Display menu */
+static int aaWant = 4, aaHave;      /* anti-aliasing samples asked for / the view got (0: none) */
 static int dk, dkBtn, mx0, my0, curx = -1000, cury = -1000, selMod;
+static int navLock, navSaved;    /* Alt+Shift drag: -1 deciding, 0 sideways, 1 up/down, 2 free */
+/* the last two components clicked: a double-click's first click is the newest, so the one before
+   it anchors a Shift+double-click partial loop (forgotten after an edit renumbers things) */
+static struct { int obj, kind, idx; } pkLast = { -1, 0, 0 }, pkPrev = { -1, 0, 0 };
 static float rad0;
-enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD };   /* preselection highlight (hvKind 0 = whole object) */
+enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD, D_BOXZOOM };   /* preselection highlight (hvKind 0 = whole object) */
 
 static HWND hMain, hView, hPanel, hStatus, hBar;
 static HDC hdc;
@@ -69,6 +76,7 @@ static int delete_ev(void);
 static void status_update(void);
 static void set_mode(int m);
 static void draw_weld(void);
+static void view_recreate(void);
 static void redraw(void) { InvalidateRect(hView, NULL, FALSE); }
 static int key(int vk) { return GetKeyState(vk) < 0; }
 static void toast(const char *s);
@@ -375,6 +383,7 @@ static Obj *obj_new(const char *base)
     memset(o, 0, sizeof *o);
     o->s = v3(1, 1, 1);
     o->nangle = defAngle;
+    o->iso = 1;      /* new objects join an isolated view, like Maya */
     unique_name(o->name, base);
     nob++;
     return o;
@@ -388,6 +397,12 @@ static void obj_remove(int i)
 }
 
 static int active(const Obj *o) { return mode == M_OBJ ? o->sel : o->hil; }
+
+/* drawn and pickable: not hidden, and in the isolated set while Isolate Select is on */
+static int shown(const Obj *o) { return !o->hidden && (!isolate || o->iso); }
+
+/* see through everything: wireframe or X-ray, so marquee and clicks reach hidden components too */
+static int see_through(void) { return wire || xray; }
 
 static Obj *lead(void)
 {
@@ -495,6 +510,7 @@ static void stack_push(Snap *st, int *n, Snap s)
 static void undo_push(const char *what)
 {
     liveCmd = 0;
+    pkLast.obj = pkPrev.obj = -1;
     Snap s = snap_take();
     snprintf(s.what, sizeof s.what, "%s", what);
     modified = 1;
@@ -517,6 +533,7 @@ static void do_undo(void)
     memcpy(s.what, undo_s[nundo - 1].what, sizeof s.what);
     stack_push(redo_s, &nredo, s);
     snap_restore(&undo_s[--nundo]);
+    pkLast.obj = pkPrev.obj = -1;
     modified = 1;
     editStamp++;
     snprintf(g_msg, sizeof g_msg, "Undo %s", s.what);
@@ -531,6 +548,7 @@ static void do_redo(void)
     memcpy(s.what, redo_s[nredo - 1].what, sizeof s.what);
     stack_push(undo_s, &nundo, s);
     snap_restore(&redo_s[--nredo]);
+    pkLast.obj = pkPrev.obj = -1;
     modified = 1;
     editStamp++;
     snprintf(g_msg, sizeof g_msg, "Redo %s", s.what);
@@ -682,16 +700,52 @@ static void draw_edges(const Mesh *m, int selOnly)
 
 /* ================================================================ draw cache
 
-   Shaded triangles are expanded once into a vertex array (color, shading normal, position per corner)
-   and drawn with one glDrawArrays call. The arrays are rebuilt only when geoGen changes, which
-   happens on every edit or selection change, so tumbling, hovering and idle redraws are cheap. */
+   Shaded triangles are expanded into a vertex array (color, shading normal, position per corner) and
+   drawn with one glDrawArrays call. Every edit or selection change bumps geoGen; each object then
+   checks a hash of its own arrays, so its normals are only worked out again when its shape or shading
+   changed, and the array only rebuilt when its shape, colors or face selection tint did. Clicking
+   around a big scene doesn't redo every mesh. Once an object has looked the same for a couple of
+   frames, its triangles and edges go into display lists, which the driver keeps on the graphics card,
+   so tumbling a dense mesh doesn't send it over again every frame. */
 
-typedef struct { const V3 *key; int nv, nf, ntri; unsigned gen; float *v; V3 lo, hi; } DrawCache;
+#define DC_STRIDE 10            /* r g b a, nx ny nz, x y z per corner */
+#define XRAY_ALPHA 0.45f        /* corner alpha: only blended in X-ray */
+
+typedef struct {
+    const V3 *key; int nv, nf, ntri;
+    unsigned gen;                       /* geoGen when last checked */
+    unsigned long long ghash, vhash;    /* shape and shading; that plus colors and face tint */
+    float *v;
+    V3 *cn;                             /* corner normals */
+    V3 lo, hi;                          /* bounding box (object space) */
+    GLuint tlist, elist;                /* display lists of the triangles / edges, 0 = none yet */
+    int tsame, esame;                   /* draws in a row without a change */
+} DrawCache;
 static DrawCache *dcache;
 static int ndcache;
 static unsigned geoGen = 1;
 
 static void geo_changed(void) { geoGen++; }
+
+static unsigned long long hash_mem(unsigned long long h, const void *p, size_t n)
+{
+    const unsigned char *b = p;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        unsigned long long w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ull;
+    return h;
+}
+
+static void list_free(GLuint *l)
+{
+    if (*l) glDeleteLists(*l, 1);
+    *l = 0;
+}
 
 static DrawCache *cache_get(int i)
 {
@@ -704,39 +758,79 @@ static DrawCache *cache_get(int i)
     const Obj *o = &ob[i];
     const Mesh *m = &o->m;
     if (c->gen == geoGen && c->key == m->p && c->nv == m->nv && c->nf == m->nf) return c;
-    int tint = o->hil && shows(M_FACE), nt = 0;
+    int tint = o->hil && shows(M_FACE), nc = m->fo[m->nf];
+    int dims[3] = { m->nv, m->nf, m->ne };
+    unsigned long long g = hash_mem(0xcbf29ce484222325ull, dims, sizeof dims);
+    g = hash_mem(g, m->p, (size_t)m->nv * sizeof(V3));
+    g = hash_mem(g, m->fo, (size_t)(m->nf + 1) * sizeof(int));
+    g = hash_mem(g, m->fi, (size_t)nc * sizeof(int));
+    g = hash_mem(g, m->ev, (size_t)m->ne * 2 * sizeof(int));
+    if (m->eh) g = hash_mem(g, m->eh, m->ne);
+    g = hash_mem(g, &o->nangle, sizeof o->nangle);
+    unsigned long long vh = hash_mem(g, m->c, (size_t)m->nv * sizeof(V3));
+    vh = hash_mem(vh, &tint, sizeof tint);
+    if (tint) vh = hash_mem(vh, m->fs, m->nf);
+    c->gen = geoGen;
+    c->key = m->p;
+    c->nv = m->nv;
+    c->nf = m->nf;
+    if (vh == c->vhash && c->v) return c;   /* nothing it shows changed */
+    int nt = 0;
     for (int f = 0; f < m->nf; f++) nt += m->fo[f + 1] - m->fo[f] - 2;
-    c->v = realloc(c->v, (size_t)(nt > 0 ? nt : 1) * 27 * sizeof(float));
-    V3 *cn = malloc((m->fo[m->nf] + 1) * sizeof(V3));
-    mesh_cnormals(m, o->nangle, cn);
+    if (g != c->ghash || !c->cn) {
+        c->cn = realloc(c->cn, (nc + 1) * sizeof(V3));
+        mesh_cnormals(m, o->nangle, c->cn);
+        c->lo = v3(1e30f, 1e30f, 1e30f);
+        c->hi = v3(-1e30f, -1e30f, -1e30f);
+        for (int v = 0; v < m->nv; v++) {
+            V3 p = m->p[v];
+            c->lo = v3(fminf(c->lo.x, p.x), fminf(c->lo.y, p.y), fminf(c->lo.z, p.z));
+            c->hi = v3(fmaxf(c->hi.x, p.x), fmaxf(c->hi.y, p.y), fmaxf(c->hi.z, p.z));
+        }
+        c->ghash = g;
+        list_free(&c->elist);
+        c->esame = 0;
+    }
+    c->v = realloc(c->v, (size_t)(nt > 0 ? nt : 1) * 3 * DC_STRIDE * sizeof(float));
     float *w = c->v;
     for (int f = 0; f < m->nf; f++) {
         int s = m->fo[f], n = m->fo[f + 1] - s;
         for (int k = 1; k + 1 < n; k++) {
             int cs[3] = { s, s + k, s + k + 1 };
             for (int j = 0; j < 3; j++) {
-                V3 col = m->c[m->fi[cs[j]]], p = m->p[m->fi[cs[j]]], nn = cn[cs[j]];
+                V3 col = m->c[m->fi[cs[j]]], p = m->p[m->fi[cs[j]]], nn = c->cn[cs[j]];
                 if (tint && m->fs[f]) col = v3lerp(col, v3(1, 0.45f, 0.1f), 0.65f);
-                *w++ = col.x; *w++ = col.y; *w++ = col.z;
+                *w++ = col.x; *w++ = col.y; *w++ = col.z; *w++ = XRAY_ALPHA;
                 *w++ = nn.x; *w++ = nn.y; *w++ = nn.z;
                 *w++ = p.x; *w++ = p.y; *w++ = p.z;
             }
         }
     }
-    free(cn);
-    c->lo = v3(1e30f, 1e30f, 1e30f);
-    c->hi = v3(-1e30f, -1e30f, -1e30f);
-    for (int v = 0; v < m->nv; v++) {
-        V3 p = m->p[v];
-        c->lo = v3(fminf(c->lo.x, p.x), fminf(c->lo.y, p.y), fminf(c->lo.z, p.z));
-        c->hi = v3(fmaxf(c->hi.x, p.x), fmaxf(c->hi.y, p.y), fmaxf(c->hi.z, p.z));
-    }
     c->ntri = nt;
-    c->key = m->p;
-    c->nv = m->nv;
-    c->nf = m->nf;
-    c->gen = geoGen;
+    c->vhash = vh;
+    list_free(&c->tlist);
+    c->tsame = 0;
     return c;
+}
+
+/* The display lists belong to the GL context: forget them when it goes (anti-aliasing change) */
+static void cache_lost_gl(void)
+{
+    for (int i = 0; i < ndcache; i++) {
+        dcache[i].tlist = dcache[i].elist = 0;
+        dcache[i].tsame = dcache[i].esame = 0;
+    }
+}
+
+/* only these objects were edited (a drag step): the others keep their caches without a recheck */
+static void geo_changed_only(const int *objs, int n)
+{
+    unsigned old = geoGen++;
+    for (int i = 0; i < ndcache && i < nob; i++) {
+        int edited = 0;
+        for (int k = 0; k < n && !edited; k++) edited = objs[k] == i;
+        if (!edited && dcache[i].gen == old) dcache[i].gen = geoGen;
+    }
 }
 
 /* shade: colors and normals for lighting; otherwise positions only (depth pass) */
@@ -744,28 +838,74 @@ static void draw_cached(int i, int shade)
 {
     DrawCache *c = cache_get(i);
     if (!c->ntri) return;
+    if (c->tlist) { glCallList(c->tlist); return; }
+    int make = shade && ++c->tsame >= 2;     /* unchanged since last frame: worth a list */
     glEnableClientState(GL_VERTEX_ARRAY);
-    glVertexPointer(3, GL_FLOAT, 9 * sizeof(float), c->v + 6);
+    glVertexPointer(3, GL_FLOAT, DC_STRIDE * sizeof(float), c->v + 7);
     if (shade) {
         glEnableClientState(GL_COLOR_ARRAY);
         glEnableClientState(GL_NORMAL_ARRAY);
-        glColorPointer(3, GL_FLOAT, 9 * sizeof(float), c->v);
-        glNormalPointer(GL_FLOAT, 9 * sizeof(float), c->v + 3);
+        glColorPointer(4, GL_FLOAT, DC_STRIDE * sizeof(float), c->v);
+        glNormalPointer(GL_FLOAT, DC_STRIDE * sizeof(float), c->v + 4);
     }
+    if (make && (c->tlist = glGenLists(1)) != 0) glNewList(c->tlist, GL_COMPILE_AND_EXECUTE);
     glDrawArrays(GL_TRIANGLES, 0, c->ntri * 3);
+    if (make && c->tlist) glEndList();
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_NORMAL_ARRAY);
     glDisableClientState(GL_VERTEX_ARRAY);
 }
 
-/* all edges straight from the mesh arrays (ev holds vertex index pairs) */
-static void draw_all_edges(const Mesh *m)
+/* all edges of object i (ev holds vertex index pairs), in the current color */
+static void draw_obj_edges(int i)
 {
+    DrawCache *c = cache_get(i);
+    const Mesh *m = &ob[i].m;
     if (!m->ne) return;
+    if (c->elist) { glCallList(c->elist); return; }
+    int make = ++c->esame >= 3;
     glEnableClientState(GL_VERTEX_ARRAY);
     glVertexPointer(3, GL_FLOAT, sizeof(V3), m->p);
+    if (make && (c->elist = glGenLists(1)) != 0) glNewList(c->elist, GL_COMPILE_AND_EXECUTE);
     glDrawElements(GL_LINES, m->ne * 2, GL_UNSIGNED_INT, m->ev);
+    if (make && c->elist) glEndList();
     glDisableClientState(GL_VERTEX_ARRAY);
+}
+
+/* ---- screen positions of each object's vertices, for picking. Kept until the object's shape, its
+   transform or the camera changes, so hovering only measures distances. */
+
+typedef struct { unsigned long long ghash; float vp[16], mat[16]; int vw, vh, nv; float *s; } ScrCache;
+static ScrCache *scache;
+static int nscache;
+
+/* x, y, depth and 1 (or 0: behind the camera) per vertex of object i */
+static const float *scr_get(int i)
+{
+    if (i >= nscache) {
+        scache = realloc(scache, (i + 1) * sizeof *scache);
+        memset(scache + nscache, 0, (i + 1 - nscache) * sizeof *scache);
+        nscache = i + 1;
+    }
+    ScrCache *c = &scache[i];
+    const Mesh *m = &ob[i].m;
+    M4 M = obj_mat(&ob[i]);
+    unsigned long long g = cache_get(i)->ghash;
+    if (c->s && c->ghash == g && c->nv == m->nv && c->vw == vw && c->vh == vh &&
+        !memcmp(c->vp, VPm.m, sizeof c->vp) && !memcmp(c->mat, M.m, sizeof c->mat))
+        return c->s;
+    c->s = realloc(c->s, (size_t)(m->nv + 1) * 4 * sizeof(float));
+    for (int v = 0; v < m->nv; v++) {
+        float *o = c->s + 4 * v;
+        o[3] = (float)proj(m4_pt(M, m->p[v]), &o[0], &o[1], &o[2]);
+    }
+    c->ghash = g;
+    c->nv = m->nv;
+    c->vw = vw;
+    c->vh = vh;
+    memcpy(c->vp, VPm.m, sizeof c->vp);
+    memcpy(c->mat, M.m, sizeof c->mat);
+    return c->s;
 }
 
 static int ray_box(V3 o, V3 d, V3 lo, V3 hi)
@@ -785,64 +925,106 @@ static int ray_box(V3 o, V3 d, V3 lo, V3 hi)
 /* world space ray against object i, skipping the triangles when the ray misses its bounding box */
 static int obj_raycast(int i, V3 o, V3 d, float *t)
 {
-    if (ob[i].hidden) return -1;
+    if (!shown(&ob[i])) return -1;
     DrawCache *c = cache_get(i);
     M4 iM = m4_inv(obj_mat(&ob[i]));
     V3 lo = m4_pt(iM, o), ld = m4_dir(iM, d);
     V3 pad = v3mul(v3sub(c->hi, c->lo), 1e-3f);
     if (!ray_box(lo, ld, v3sub(c->lo, pad), v3add(c->hi, pad))) return -1;
-    return mesh_raycast(&ob[i].m, lo, ld, t);
+    return mesh_raycast_cull(&ob[i].m, lo, ld, t, cull);   /* with culling, faces turned away don't count */
 }
 
-/* ================================================================ depth readback for occlusion-aware picking */
+/* mirrored objects (an odd number of negative scales) wind the other way on screen */
+static int obj_mirrored(const Obj *o) { return o->s.x * o->s.y * o->s.z < 0; }
+
+/* does face f of object o (matrix M) face the camera? */
+static int face_toward(const Obj *o, M4 M, int f)
+{
+    M4 iM = m4_inv(M);
+    V3 n = mesh_fnormal(&o->m, f), c = m4_pt(M, mesh_fcenter(&o->m, f));
+    V3 w = v3(iM.m[0] * n.x + iM.m[1] * n.y + iM.m[2] * n.z, iM.m[4] * n.x + iM.m[5] * n.y + iM.m[6] * n.z,
+              iM.m[8] * n.x + iM.m[9] * n.y + iM.m[10] * n.z);   /* inverse transpose: normals stay normal */
+    return v3dot(w, to_eye(c)) > 0;
+}
+
+/* ================================================================ depth readback for occlusion-aware picking
+
+   The meshes are drawn once into the depth buffer and the whole view read back; that copy is kept
+   until the camera, the view size, culling, or a shown object's shape or place changes. Hovering
+   over a still scene then never draws anything extra or waits on the graphics card. */
+
+#define GL_MULTISAMPLE_ARB 0x809D
 
 static float *dbuf;
-static int dx0, dy0, dw, dh, dvalid;
+static int dw, dh, dvalid;
+static unsigned long long dkey;
 
-static void depth_capture(int x0, int y0, int x1, int y1)
+static unsigned long long depth_key(void)
 {
-    dvalid = 0;
-    if (wire) return;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > vw - 1) x1 = vw - 1;
-    if (y1 > vh - 1) y1 = vh - 1;
-    if (x1 < x0 || y1 < y0) return;
-    cam_update();
-    glViewport(0, 0, vw, vh);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    load_view();
+    int st[4] = { vw, vh, cull, nob };
+    unsigned long long k = hash_mem(hash_mem(0x84222325ull, VPm.m, sizeof VPm.m), st, sizeof st);
+    for (int i = 0; i < nob; i++) {
+        if (!shown(&ob[i])) continue;
+        M4 M = obj_mat(&ob[i]);
+        k = hash_mem(k, &i, sizeof i);
+        k = hash_mem(k, &cache_get(i)->ghash, sizeof(unsigned long long));
+        k = hash_mem(k, M.m, sizeof M.m);
+    }
+    return k;
+}
+
+/* draw the shown meshes' faces for depth only (or for the GL state of a shaded pass) */
+static void depth_pass(void)
+{
+    if (aaHave) glDisable(GL_MULTISAMPLE_ARB);   /* every sample gets the same depth: reads back clean */
     glEnable(GL_DEPTH_TEST);
     glDisable(GL_LIGHTING);
     glColorMask(0, 0, 0, 0);
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1, 1);
+    if (cull) glEnable(GL_CULL_FACE);
     for (int i = 0; i < nob; i++) {
+        if (!shown(&ob[i])) continue;
         M4 M = obj_mat(&ob[i]);
-        if (ob[i].hidden) continue;
+        glFrontFace(obj_mirrored(&ob[i]) ? GL_CW : GL_CCW);
         glPushMatrix();
         glMultMatrixf(M.m);
         draw_cached(i, 0);
         glPopMatrix();
     }
+    glFrontFace(GL_CCW);
+    glDisable(GL_CULL_FACE);
     glDisable(GL_POLYGON_OFFSET_FILL);
     glColorMask(1, 1, 1, 1);
-    dw = x1 - x0 + 1;
-    dh = y1 - y0 + 1;
-    dx0 = x0;
-    dy0 = y0;
+    if (aaHave) glEnable(GL_MULTISAMPLE_ARB);
+}
+
+static void depth_capture(void)
+{
+    dvalid = 0;
+    if (see_through()) return;
+    cam_update();
+    unsigned long long k = depth_key();
+    if (dbuf && k == dkey && dw == vw && dh == vh) { dvalid = 1; return; }
+    glViewport(0, 0, vw, vh);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    load_view();
+    depth_pass();
+    dw = vw;
+    dh = vh;
     dbuf = realloc(dbuf, (size_t)dw * dh * sizeof(float));
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(x0, vh - 1 - y1, dw, dh, GL_DEPTH_COMPONENT, GL_FLOAT, dbuf);
+    glReadPixels(0, 0, dw, dh, GL_DEPTH_COMPONENT, GL_FLOAT, dbuf);
+    dkey = k;
     dvalid = 1;
 }
 
 static int visible(float x, float y, float z)
 {
-    if (wire || !dvalid) return 1;
+    if (see_through() || !dvalid) return 1;
     int ix = (int)x, iy = (int)y;
-    if (ix < dx0 || iy < dy0 || ix >= dx0 + dw || iy >= dy0 + dh) return 0;
-    return z <= dbuf[(dh - 1 - (iy - dy0)) * dw + (ix - dx0)] + 2e-5f;
+    if (ix < 0 || iy < 0 || ix >= dw || iy >= dh) return 0;
+    return z <= dbuf[(dh - 1 - iy) * dw + ix] + 2e-5f;
 }
 
 /* ================================================================ selection */
@@ -875,18 +1057,17 @@ static int pick_comp(int mx, int my, int *obj, int *kind, int *idx)
 {
     int R = (int)(12 * ds), multi = mode == M_MULTI;
     *obj = -1;
-    if (shows(M_VERT) || shows(M_EDGE)) depth_capture(mx - R - 4, my - R - 4, mx + R + 4, my + R + 4);
+    if (shows(M_VERT) || shows(M_EDGE)) depth_capture();
     if (shows(M_VERT)) {
         float best = multi ? 8 * ds : (float)R;
         for (int i = 0; i < nob; i++) {
-            if (!ob[i].hil) continue;
-            Mesh *m = &ob[i].m;
-            M4 M = obj_mat(&ob[i]);
-            for (int v = 0; v < m->nv; v++) {
-                float x, y, z;
-                if (!proj(m4_pt(M, m->p[v]), &x, &y, &z)) continue;
-                float dd = hypotf(x - mx, y - my);
-                if (dd < best && visible(x, y, z)) { best = dd; *obj = i; *kind = M_VERT; *idx = v; }
+            if (!ob[i].hil || !shown(&ob[i])) continue;
+            const float *s = scr_get(i);
+            for (int v = 0; v < ob[i].m.nv; v++, s += 4) {
+                float dx = s[0] - mx, dy = s[1] - my;
+                if (!s[3] || fabsf(dx) >= best || fabsf(dy) >= best) continue;
+                float dd = hypotf(dx, dy);
+                if (dd < best && visible(s[0], s[1], s[2])) { best = dd; *obj = i; *kind = M_VERT; *idx = v; }
             }
         }
         if (*obj >= 0) return 1;
@@ -894,16 +1075,19 @@ static int pick_comp(int mx, int my, int *obj, int *kind, int *idx)
     if (shows(M_EDGE)) {
         float best = multi ? 6 * ds : (float)R;
         for (int i = 0; i < nob; i++) {
-            if (!ob[i].hil) continue;
+            if (!ob[i].hil || !shown(&ob[i])) continue;
             Mesh *m = &ob[i].m;
             M4 M = obj_mat(&ob[i]);
+            const float *s = scr_get(i);
             for (int e = 0; e < m->ne; e++) {
-                V3 a = m4_pt(M, m->p[m->ev[2 * e]]), b = m4_pt(M, m->p[m->ev[2 * e + 1]]);
-                float ax, ay, bx, by, u, x, y, z;
-                if (!proj(a, &ax, &ay, NULL) || !proj(b, &bx, &by, NULL)) continue;
-                float dd = seg_dist((float)mx, (float)my, ax, ay, bx, by, &u);
+                const float *a = s + 4 * m->ev[2 * e], *b = s + 4 * m->ev[2 * e + 1];
+                if (!a[3] || !b[3]) continue;
+                if (mx < fminf(a[0], b[0]) - best || mx > fmaxf(a[0], b[0]) + best ||
+                    my < fminf(a[1], b[1]) - best || my > fmaxf(a[1], b[1]) + best) continue;
+                float u, x, y, z, dd = seg_dist((float)mx, (float)my, a[0], a[1], b[0], b[1], &u);
                 if (dd >= best) continue;
-                if (!proj(v3lerp(a, b, u), &x, &y, &z) || !visible(x, y, z)) continue;
+                V3 pa = m4_pt(M, m->p[m->ev[2 * e]]), pb = m4_pt(M, m->p[m->ev[2 * e + 1]]);
+                if (!proj(v3lerp(pa, pb, u), &x, &y, &z) || !visible(x, y, z)) continue;
                 best = dd; *obj = i; *kind = M_EDGE; *idx = e;
             }
         }
@@ -939,6 +1123,8 @@ static void select_click(int mx, int my, int mod)
         int n;
         unsigned char *f = comp_flags(&ob[bo], kind, &n);
         set_flag(&f[bi], mod);
+        pkPrev = pkLast;
+        pkLast.obj = bo; pkLast.kind = kind; pkLast.idx = bi;
         return;
     }
     /* clicked another object: hilite it for component editing */
@@ -956,7 +1142,7 @@ static void select_rect(int x0, int y0, int x1, int y1, int mod)
     if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
     if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
     cam_update();
-    if (mode != M_OBJ) depth_capture(x0, y0, x1, y1);
+    if (mode != M_OBJ) depth_capture();
     if (mod == 0) clear_sel();
 #define INSIDE(x, y) ((x) >= x0 && (x) <= x1 && (y) >= y0 && (y) <= y1)
     for (int i = 0; i < nob; i++) {
@@ -964,16 +1150,17 @@ static void select_rect(int x0, int y0, int x1, int y1, int mod)
         Mesh *m = &o->m;
         M4 M = obj_mat(o);
         float x, y, z;
-        if (o->hidden) continue;
+        if (!shown(o)) continue;
+        const float *s = scr_get(i);
         if (mode == M_OBJ) {
             for (int v = 0; v < m->nv; v++)
-                if (proj(m4_pt(M, m->p[v]), &x, &y, NULL) && INSIDE(x, y)) { select_obj_flag(o, mod); break; }
+                if (s[4 * v + 3] && INSIDE(s[4 * v], s[4 * v + 1])) { select_obj_flag(o, mod); break; }
             continue;
         }
         if (!o->hil) continue;
         if (shows(M_VERT)) {
-            for (int v = 0; v < m->nv; v++)
-                if (proj(m4_pt(M, m->p[v]), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) set_flag(&m->vs[v], mod);
+            for (int v = 0; v < m->nv; v++, s += 4)
+                if (s[3] && INSIDE(s[0], s[1]) && visible(s[0], s[1], s[2])) set_flag(&m->vs[v], mod);
         }
         if (shows(M_EDGE)) {
             for (int e = 0; e < m->ne; e++) {
@@ -983,7 +1170,8 @@ static void select_rect(int x0, int y0, int x1, int y1, int mod)
         }
         if (shows(M_FACE)) {
             for (int f = 0; f < m->nf; f++)
-                if (proj(m4_pt(M, mesh_fcenter(m, f)), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) set_flag(&m->fs[f], mod);
+                if (proj(m4_pt(M, mesh_fcenter(m, f)), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z) &&
+                    (!cull || face_toward(o, M, f))) set_flag(&m->fs[f], mod);
         }
     }
 #undef INSIDE
@@ -995,17 +1183,22 @@ static int edge_pick(int mx, int my, int *obj, int *edge, float *u)
     int R = (int)(14 * ds);
     float best = (float)R;
     *obj = -1;
-    depth_capture(mx - R - 4, my - R - 4, mx + R + 4, my + R + 4);
+    depth_capture();
     for (int i = 0; i < nob; i++) {
-        if (ob[i].hidden) continue;
+        if (!shown(&ob[i])) continue;
         Mesh *m = &ob[i].m;
         M4 M = obj_mat(&ob[i]);
+        const float *s = scr_get(i);
         for (int e = 0; e < m->ne; e++) {
-            V3 a = m4_pt(M, m->p[m->ev[2 * e]]), b = m4_pt(M, m->p[m->ev[2 * e + 1]]);
-            float ax, ay, bx, by, t, x, y, z;
-            if (!proj(a, &ax, &ay, NULL) || !proj(b, &bx, &by, NULL)) continue;
-            float d = seg_dist((float)mx, (float)my, ax, ay, bx, by, &t);
-            if (d >= best || !proj(v3lerp(a, b, t), &x, &y, &z) || !visible(x, y, z)) continue;
+            const float *a = s + 4 * m->ev[2 * e], *b = s + 4 * m->ev[2 * e + 1];
+            float t, x, y, z;
+            if (!a[3] || !b[3]) continue;
+            if (mx < fminf(a[0], b[0]) - best || mx > fmaxf(a[0], b[0]) + best ||
+                my < fminf(a[1], b[1]) - best || my > fmaxf(a[1], b[1]) + best) continue;
+            float d = seg_dist((float)mx, (float)my, a[0], a[1], b[0], b[1], &t);
+            if (d >= best) continue;
+            V3 pa = m4_pt(M, m->p[m->ev[2 * e]]), pb = m4_pt(M, m->p[m->ev[2 * e + 1]]);
+            if (!proj(v3lerp(pa, pb, t), &x, &y, &z) || !visible(x, y, z)) continue;
             best = d; *obj = i; *edge = e; *u = t;
         }
     }
@@ -1141,16 +1334,14 @@ static void mc_hover(int x, int y)
     /* a vertex close by wins, else a point on the nearest edge */
     int R = (int)(10 * ds);
     float best = (float)R;
-    depth_capture(x - 20, y - 20, x + 20, y + 20);
+    depth_capture();
     for (int i = 0; i < nob; i++) {
-        if (ob[i].hidden || (mc.obj >= 0 && i != mc.obj)) continue;
-        Mesh *m = &ob[i].m;
-        M4 M = obj_mat(&ob[i]);
-        for (int v = 0; v < m->nv; v++) {
-            float sx, sy, sz;
-            if (!proj(m4_pt(M, m->p[v]), &sx, &sy, &sz)) continue;
-            float d = hypotf(sx - x, sy - y);
-            if (d < best && visible(sx, sy, sz)) { best = d; o = i; kind = 1; idx = v; }
+        if (!shown(&ob[i]) || (mc.obj >= 0 && i != mc.obj)) continue;
+        const float *s = scr_get(i);
+        for (int v = 0; v < ob[i].m.nv; v++, s += 4) {
+            if (!s[3] || fabsf(s[0] - x) >= best || fabsf(s[1] - y) >= best) continue;
+            float d = hypotf(s[0] - x, s[1] - y);
+            if (d < best && visible(s[0], s[1], s[2])) { best = d; o = i; kind = 1; idx = v; }
         }
     }
     if (o < 0) {
@@ -1268,7 +1459,7 @@ static int sel_bbox(V3 *mn, V3 *mx, int all)
         Obj *o = &ob[i];
         Mesh *m = &o->m;
         unsigned char *mask = NULL;
-        if (o->hidden) continue;
+        if (!shown(o)) continue;
         if (!all) {
             if (!active(o)) continue;
             if (mode != M_OBJ) {
@@ -1322,9 +1513,61 @@ static void toast(const char *s)
     if (hView) redraw();
 }
 
+/* ---- view history: [ and ] step back and forth through camera moves, like Maya */
+
+typedef struct { V3 coi; float dist, yaw, pitch; int ortho; } View;
+#define NVIEWS 40
+static View viewBack[NVIEWS], viewFwd[NVIEWS];
+static int nBack, nFwd, viewReplay;
+
+/* where the camera is, or where it is gliding to */
+static View view_now(void)
+{
+    View v = { coi, dist, yaw, pitch, ortho };
+    if (tween.on) { v.coi = tween.c1; v.dist = tween.d1; v.yaw = tween.y1; v.pitch = tween.p1; }
+    return v;
+}
+
+static void view_stack(View *st, int *n, View v)
+{
+    if (*n == NVIEWS) { memmove(st, st + 1, (NVIEWS - 1) * sizeof *st); (*n)--; }
+    st[(*n)++] = v;
+}
+
+/* remember the view before a camera move */
+static void view_save(void)
+{
+    View v = view_now();
+    if (viewReplay) return;
+    if (nBack) {
+        const View *t = &viewBack[nBack - 1];
+        if (!memcmp(&t->coi, &v.coi, sizeof v.coi) && t->dist == v.dist && t->yaw == v.yaw && t->pitch == v.pitch && t->ortho == v.ortho) return;
+    }
+    view_stack(viewBack, &nBack, v);
+    nFwd = 0;
+}
+
+static void cam_to(V3 c, float d, float yw, float pt);
+
+static void view_history(int fwd)
+{
+    View *src = fwd ? viewFwd : viewBack;
+    int *n = fwd ? &nFwd : &nBack;
+    if (!*n) { toast(fwd ? "No later view to go to" : "No earlier view to go back to"); return; }
+    View cur = view_now(), v = src[--*n];
+    if (fwd) view_stack(viewBack, &nBack, cur);
+    else view_stack(viewFwd, &nFwd, cur);
+    viewReplay = 1;
+    cam_to(v.coi, v.dist, v.yaw, v.pitch);
+    viewReplay = 0;
+    ortho = v.ortho;
+    toast(fwd ? "Next view" : "Previous view");
+}
+
 /* glide the camera to a new center/distance/angles */
 static void cam_to(V3 c, float d, float yw, float pt)
 {
+    view_save();
     float dy = fmodf(yw - yaw, 2 * PI_F);
     if (dy > PI_F) dy -= 2 * PI_F;
     if (dy < -PI_F) dy += 2 * PI_F;
@@ -1365,13 +1608,28 @@ static void frame(int all)
     cam_to(v3mul(v3add(a, b), 0.5f), r / sinf(hh < half ? hh : half) * 1.1f, yaw, pitch);
 }
 
+/* Ctrl+Alt+drag (Maya's box zoom): dragged to the right zooms in so the box fills the view, to the
+   left zooms out so the view shrinks into the box */
+static void box_zoom(int x0, int y0, int x1, int y1)
+{
+    float w = fabsf((float)(x1 - x0)), h = fabsf((float)(y1 - y0));
+    if (w < 5 && h < 5) return;
+    cam_update();
+    float f = fmaxf(w / vw, h / vh);
+    if (f < 0.01f) f = 0.01f;
+    V3 o, d, c;
+    mouse_ray((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, &o, &d);
+    if (!ray_plane(o, d, coi, camF, &c)) c = coi;
+    cam_to(c, x1 >= x0 ? dist * f : dist / f, yaw, pitch);
+}
+
 /* look along an axis (0 X, 1 Y, 2 Z; sign picks the side), keeping the current framing */
 static void view_axis(int axis, int neg)
 {
     float yw = axis == 0 ? PI_F / 2 : 0, pt = axis == 1 ? PI_F / 2 : 0;
-    ortho = 1;
     if (neg) { if (axis == 1) pt = -pt; else yw += PI_F; }
     cam_to(coi, dist, yw, pt);
+    ortho = 1;
     static const char *names[3][2] = { { "Side view (+X)", "Side view (-X)" }, { "Top view", "Bottom view" }, { "Front view", "Back view" } };
     toast(names[axis][neg]);
 }
@@ -1628,19 +1886,17 @@ static int snap_target(int mx, int my, V3 *out)
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
         DEnt *e = NULL;
-        if (o->hidden) continue;
+        if (!shown(o)) continue;
         for (int k = 0; k < dg.ne; k++) if (dg.e[k].obj == i) e = &dg.e[k];
         if (e && mode == M_OBJ) continue;
         unsigned char *skip = e ? calloc(o->m.nv + 1, 1) : NULL;
         for (int j = 0; e && j < e->n; j++) skip[e->vi[j]] = 1;
         M4 M = obj_mat(o);
-        for (int v = 0; v < o->m.nv; v++) {
-            float x, y;
-            if (skip && skip[v]) continue;
-            V3 w = m4_pt(M, o->m.p[v]);
-            if (!proj(w, &x, &y, NULL)) continue;
-            float d = hypotf(x - mx, y - my);
-            if (d < best) { best = d; *out = w; found = 1; }
+        const float *s = scr_get(i);
+        for (int v = 0; v < o->m.nv; v++, s += 4) {
+            if ((skip && skip[v]) || !s[3]) continue;
+            float d = hypotf(s[0] - mx, s[1] - my);
+            if (d < best) { best = d; *out = m4_pt(M, o->m.p[v]); found = 1; }
         }
         free(skip);
     }
@@ -1742,7 +1998,10 @@ static void drag_move(int mx, int my)
         }
     }
     dg.cur = v3add(dg.piv, delta);
-    geo_changed();
+    int *ids = malloc((dg.ne + 1) * sizeof(int));
+    for (int k = 0; k < dg.ne; k++) ids[k] = dg.e[k].obj;
+    geo_changed_only(ids, dg.ne);
+    free(ids);
 }
 
 static void drag_end(void)
@@ -1859,12 +2118,11 @@ static void paint_dab(int mx, int my)
     for (int k = 0; k < ps.n; k++) {
         Obj *o = &ob[ps.obj[k]];
         Mesh *m = &o->m;
-        M4 M = obj_mat(o);
-        for (int v = 0; v < m->nv; v++) {
-            float x, y, z;
-            if (!proj(m4_pt(M, m->p[v]), &x, &y, &z)) continue;
-            float dd = hypotf(x - mx, y - my);
-            if (dd >= r || !visible(x, y, z)) continue;
+        const float *s = scr_get(ps.obj[k]);
+        for (int v = 0; v < m->nv; v++, s += 4) {
+            if (!s[3] || fabsf(s[0] - mx) >= r || fabsf(s[1] - my) >= r) continue;
+            float dd = hypotf(s[0] - mx, s[1] - my);
+            if (dd >= r || !visible(s[0], s[1], s[2])) continue;
             float t = dd / r, f = t < 0.5f ? 1 : 1 - (t - 0.5f) * 2;
             f = f * f * (3 - 2 * f);
             float w = paintOpa * f;
@@ -1874,13 +2132,13 @@ static void paint_dab(int mx, int my)
             m->c[v] = v3lerp(ps.orig[k][v], paintCol, w);
         }
     }
-    geo_changed();
+    geo_changed_only(ps.obj, ps.n);
 }
 
 static void paint_begin(int mx, int my)
 {
     cam_update();
-    depth_capture(0, 0, vw - 1, vh - 1);
+    depth_capture();
     int any = 0;
     for (int i = 0; i < nob; i++) any |= active(&ob[i]);
     memset(&ps, 0, sizeof ps);
@@ -2127,6 +2385,12 @@ enum {
     CM_RECENT = 300,             /* + recent file index */
     CM_THEME = 200               /* + theme index */
 };
+/* later additions, clear of the theme and recent file ranges */
+enum {
+    CM_XRAY = 400, CM_CULL, CM_WIREONSH, CM_GRID, CM_ISOLATE, CM_VIEWPREV, CM_VIEWNEXT, CM_RING,
+    CM_AA = 450                  /* + 0..4: off, 2x, 4x, 8x, 16x samples */
+};
+static const int AA_SAMPLES[5] = { 0, 2, 4, 8, 16 };
 
 /* ---- hotkeys: each command can have two keys. The defaults are Maya's; Help > Hotkey Editor
    changes them, and the menus and toolbar show whatever is set. A key is its virtual key code plus
@@ -2134,6 +2398,7 @@ enum {
 
 #define KC_CTRL 0x10000
 #define KC_SHIFT 0x20000
+#define KC_ALT 0x40000
 
 typedef struct { int cmd; const char *group, *name; int def[2], key[2]; } Bind;
 static Bind binds[] = {
@@ -2159,7 +2424,8 @@ static Bind binds[] = {
     { CM_SELINV, "Selection", "Invert Selection", { KC_CTRL | KC_SHIFT | 'I' }, { 0 } },
     { CM_GROW, "Selection", "Grow Selection", { VK_OEM_PERIOD }, { 0 } },
     { CM_SHRINK, "Selection", "Shrink Selection", { VK_OEM_COMMA }, { 0 } },
-    { CM_LOOP, "Selection", "Select Edge Loop", { 0 }, { 0 } },
+    { CM_LOOP, "Selection", "Select Loop", { 0 }, { 0 } },
+    { CM_RING, "Selection", "Select Edge Ring", { 0 }, { 0 } },
     { CM_UNDO, "Edit", "Undo", { 'Z', KC_CTRL | 'Z' }, { 0 } },
     { CM_REDO, "Edit", "Redo", { KC_SHIFT | 'Z', KC_CTRL | 'Y' }, { 0 } },
     { CM_REPEAT, "Edit", "Repeat Last", { 'G' }, { 0 } },
@@ -2186,6 +2452,11 @@ static Bind binds[] = {
     { CM_SNAPPOINT, "Modify", "Point Snap On/Off", { 0 }, { 0 } },
     { CM_WIRE, "Display", "Wireframe", { '4' }, { 0 } },
     { CM_SHADED, "Display", "Shaded", { '5' }, { 0 } },
+    { CM_WIREONSH, "Display", "Wireframe on Shaded", { 0 }, { 0 } },
+    { CM_XRAY, "Display", "X-Ray", { KC_ALT | 'A' }, { 0 } },
+    { CM_CULL, "Display", "Backface Culling", { 0 }, { 0 } },
+    { CM_GRID, "Display", "Grid", { 0 }, { 0 } },
+    { CM_ISOLATE, "Display", "Isolate Select", { KC_CTRL | '1' }, { 0 } },
     { CM_HARD, "Display", "Hard Shade", { 0 }, { 0 } },
     { CM_SMOOTH, "Display", "Smooth Shade", { 0 }, { 0 } },
     { CM_AUTOSMOOTH, "Display", "Auto Smooth", { 0 }, { 0 } },
@@ -2194,6 +2465,8 @@ static Bind binds[] = {
     { CM_FRAMESEL, "Display", "Frame Selected", { 'F' }, { 0 } },
     { CM_FRAMEALL, "Display", "Frame All", { 'A' }, { 0 } },
     { CM_VHOME, "Display", "Home View", { VK_HOME }, { 0 } },
+    { CM_VIEWPREV, "Display", "Previous View", { VK_OEM_4 }, { 0 } },
+    { CM_VIEWNEXT, "Display", "Next View", { VK_OEM_6 }, { 0 } },
     { CM_VFRONT, "Display", "Front View", { 0 }, { 0 } },
     { CM_VSIDE, "Display", "Side View", { 0 }, { 0 } },
     { CM_VTOP, "Display", "Top View", { 0 }, { 0 } },
@@ -2227,11 +2500,12 @@ static void key_text(int code, char *out, int n)
             { VK_DOWN, "Down" }, { VK_OEM_PERIOD, "." }, { VK_OEM_COMMA, "," }, { VK_OEM_PLUS, "+" }, { VK_OEM_MINUS, "-" },
             { VK_ADD, "Num +" }, { VK_SUBTRACT, "Num -" }, { VK_MULTIPLY, "Num *" }, { VK_DIVIDE, "Num /" },
             { VK_DECIMAL, "Num ." }, { VK_RETURN, "Enter" }, { VK_SPACE, "Space" }, { VK_TAB, "Tab" },
+            { VK_OEM_4, "[" }, { VK_OEM_6, "]" },
         };
         for (size_t i = 0; i < sizeof nm / sizeof *nm && !name[0]; i++) if (nm[i].vk == vk) snprintf(name, sizeof name, "%s", nm[i].s);
         if (!name[0] && !GetKeyNameTextA((LONG)MapVirtualKeyA(vk, 0) << 16, name, sizeof name)) snprintf(name, sizeof name, "Key %d", vk);
     }
-    snprintf(out, n, "%s%s%s", code & KC_CTRL ? "Ctrl+" : "", code & KC_SHIFT ? "Shift+" : "", name);
+    snprintf(out, n, "%s%s%s%s", code & KC_CTRL ? "Ctrl+" : "", code & KC_SHIFT ? "Shift+" : "", code & KC_ALT ? "Alt+" : "", name);
 }
 
 static Bind *bind_of(int cmd)
@@ -2309,7 +2583,7 @@ static void cmd_select_all(int invert)
 {
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
-        if (o->hidden) continue;
+        if (!shown(o)) continue;
         if (mode == M_OBJ) {
             o->sel = invert ? !o->sel : 1;
             if (o->sel) o->order = ++stamp;
@@ -3292,19 +3566,62 @@ static void cmd_grow(int shrink)
     msg(shrink ? "Shrank selection" : "Grew selection");
 }
 
+/* edge loops through the selected edges; in face mode, the face loops two neighboring selected
+   faces point along (like Maya's Select Loop) */
 static void cmd_loop(void)
+{
+    int n = 0, nf = 0;
+    for (int i = 0; i < nob; i++) {
+        Mesh *m = &ob[i].m;
+        if (!ob[i].hil) continue;
+        if (mode == M_EDGE || mode == M_MULTI) {
+            unsigned char *was = malloc(m->ne + 1);
+            memcpy(was, m->es, m->ne);
+            for (int e = 0; e < m->ne; e++) if (was[e]) { mesh_edge_loop(m, e); n++; }
+            free(was);
+        }
+        if (shows(M_FACE)) {
+            unsigned char *was = malloc(m->nf + 1);
+            memcpy(was, m->fs, m->nf);
+            for (int e = 0; e < m->ne; e++) {
+                int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1];
+                if (f0 >= 0 && f1 >= 0 && was[f0] && was[f1]) { mesh_face_loop(m, f0, e); nf++; }
+            }
+            free(was);
+        }
+    }
+    if (nf) msg("Selected face loops (tip: double-click a face)");
+    else if (n) msg("Selected edge loops (tip: double-click an edge)");
+    else if (shows(M_FACE)) msg("Select Loop: select two faces side by side, or double-click a face");
+    else msg("Select Loop: select an edge first, or double-click one");
+}
+
+static void cmd_ring(void)
 {
     int n = 0;
     for (int i = 0; i < nob; i++) {
         Mesh *m = &ob[i].m;
-        if (!ob[i].hil) continue;
+        if (!ob[i].hil || !shows(M_EDGE)) continue;
         unsigned char *was = malloc(m->ne + 1);
         memcpy(was, m->es, m->ne);
-        for (int e = 0; e < m->ne; e++) if (was[e]) { mesh_edge_loop(m, e); n++; }
+        for (int e = 0; e < m->ne; e++) if (was[e]) { mesh_edge_ring_select(m, e); n++; }
         free(was);
     }
-    if (n) set_mode(mode == M_MULTI ? M_MULTI : M_EDGE);
-    msg(n ? "Selected edge loops (tip: double-click an edge)" : "Edge Loop: select an edge first, or double-click one");
+    msg(n ? "Selected edge rings" : "Edge Ring: select an edge first (edge or multi mode)");
+}
+
+/* Ctrl+1 like Maya: show only the selected (or component-edited) objects, again to show all */
+static void cmd_isolate(void)
+{
+    char b[96], k[48];
+    if (isolate) { isolate = 0; msg("Isolate Select off: everything is shown again"); return; }
+    int n = 0;
+    for (int i = 0; i < nob; i++) n += ob[i].iso = active(&ob[i]) && !ob[i].hidden;
+    if (!n) { msg("Isolate Select: select objects first"); return; }
+    isolate = 1;
+    cmd_key(CM_ISOLATE, k, sizeof k);
+    snprintf(b, sizeof b, "Isolated %d object(s)%s%s%s", n, k[0] ? " - " : "", k, k[0] ? " shows everything again" : "");
+    msg(b);
 }
 
 /* Ctrl+F9/F10/F11: convert the selection to vertices/edges/faces and switch to that mode */
@@ -3965,13 +4282,14 @@ static LRESULT CALLBACK KeysProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     }
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         if (wp == VK_SHIFT || wp == VK_CONTROL || wp == VK_MENU || wp == VK_LWIN || wp == VK_RWIN) return 0;
+        if (wp == VK_F4 && key(VK_MENU)) break;   /* Alt+F4 still closes the window */
         if (wp == VK_ESCAPE) {
             if (hkCap >= 0) { hkCap = -1; InvalidateRect(h, NULL, FALSE); }
             else DestroyWindow(h);
             return 0;
         }
         if (hkCap >= 0) {
-            hk_assign((int)wp | (key(VK_CONTROL) ? KC_CTRL : 0) | (key(VK_SHIFT) ? KC_SHIFT : 0));
+            hk_assign((int)wp | (key(VK_CONTROL) ? KC_CTRL : 0) | (key(VK_SHIFT) ? KC_SHIFT : 0) | (key(VK_MENU) ? KC_ALT : 0));
             InvalidateRect(h, NULL, FALSE);
         }
         return 0;
@@ -4023,8 +4341,12 @@ static const char *HELP_TEXT =
     "Default hotkeys (Help > Hotkey Editor changes them)\n\n"
     "Navigation (Maya)\n"
     "  Alt + LMB / MMB / RMB drag\tOrbit / pan / zoom (orbiting leaves an ortho view)\n"
+    "  Alt+Shift + drag\tOrbit / pan along one direction only\n"
+    "  Ctrl+Alt + LMB drag\tBox zoom (drag right: in, drag left: out)\n"
     "  Wheel\tZoom\n"
     "  F / A / Home\tFrame selected / frame all / home view\n"
+    "  [ / ]\tPrevious / next view (undo and redo camera moves)\n"
+    "  Ctrl+1\tIsolate Select: show only the selection (again: show all)\n"
     "  Click X, Y or Z on the corner gizmo\tOrthographic view down that axis (again: other side)\n\n"
     "Selection\n"
     "  Click / drag\tSelect / box select (red highlight = what a click picks)\n"
@@ -4032,7 +4354,9 @@ static const char *HELP_TEXT =
     "  RMB on an object\tComponent mode menu\n"
     "  F8 / F9 / F10 / F11 / F7\tObject / vertex / edge / face / multi\n"
     "  Ctrl+F9 / F10 / F11\tConvert selection to vertices / edges / faces\n"
-    "  Double-click an edge\tSelect its edge loop\n"
+    "  Double-click an edge / face\tSelect its edge loop / face loop (across the nearest side)\n"
+    "  Shift+double-click\tPartial loop from the last clicked component (or add a loop)\n"
+    "  Ctrl+double-click\tRemove a loop from the selection\n"
     "  > / <\tGrow / shrink selection\n"
     "  Ctrl+Shift+A / Ctrl+Shift+I\tSelect all / invert\n\n"
     "Tools\n"
@@ -4054,6 +4378,7 @@ static const char *HELP_TEXT =
     "  Z, Ctrl+Z / Shift+Z, Ctrl+Y\tUndo / redo\n"
     "  G\tRepeat last command\n"
     "  4 / 5\tWireframe / shaded\n"
+    "  Alt+A\tX-Ray (see and pick through surfaces)\n"
     "  Ctrl+N / Ctrl+O / Ctrl+S\tNew / open / save (.tuff scene or OBJ)\n"
     "  Ctrl+Shift+O / Ctrl+Shift+S\tImport into the scene / save as\n"
     "  Ctrl+A\tToggle side panel\n"
@@ -4067,6 +4392,16 @@ static void do_cmd(int id)
     if (id >= CM_THEME && id < CM_THEME + NTHEME) {
         theme_apply(id - CM_THEME, 1);
         if (hPick) { pkKept = themeIdx; InvalidateRect(hPick, NULL, FALSE); }
+    }
+    if (id >= CM_AA && id < CM_AA + 5) {
+        char b[96];
+        aaWant = AA_SAMPLES[id - CM_AA];
+        view_recreate();
+        if (!aaWant) snprintf(b, sizeof b, "Anti-aliasing off");
+        else if (aaHave == aaWant) snprintf(b, sizeof b, "Anti-aliasing %dx", aaHave);
+        else if (aaHave) snprintf(b, sizeof b, "Anti-aliasing %dx (the most this display offers)", aaHave);
+        else snprintf(b, sizeof b, "This display offers no anti-aliasing");
+        toast(b);
     }
     if (id >= CM_RECENT && id < CM_RECENT + NRECENT && recent[id - CM_RECENT][0]) {
         char p[MAX_PATH];
@@ -4109,12 +4444,19 @@ static void do_cmd(int id)
             c = v3mul(v3add(a, b), 0.5f);
             d = r / sinf(hh < half ? hh : half) * 1.1f;
         }
-        ortho = 0;
         cam_to(c, d, 0.7854f, 0.46f);
+        ortho = 0;
         toast("Home view");
         break;
     }
     case CM_HUD: hudOn = !hudOn; break;
+    case CM_XRAY: xray = !xray; toast(xray ? "X-Ray on: clicks and boxes reach what is behind" : "X-Ray off"); break;
+    case CM_CULL: cull = !cull; toast(cull ? "Backface culling on" : "Backface culling off"); break;
+    case CM_WIREONSH: wireOnShaded = !wireOnShaded; toast(wireOnShaded ? "Wireframe on shaded" : "Wireframe on shaded off"); break;
+    case CM_GRID: gridOn = !gridOn; toast(gridOn ? "Grid on" : "Grid off"); break;
+    case CM_ISOLATE: cmd_isolate(); break;
+    case CM_VIEWPREV: case CM_VIEWNEXT: view_history(id == CM_VIEWNEXT); break;
+    case CM_RING: cmd_ring(); break;
     case CM_COMPTOG: set_mode(mode == M_OBJ ? lastComp : M_OBJ); break;
     case CM_HOTKEYS: hotkey_editor(); break;
     case CM_MANIPUP: case CM_MANIPDOWN: {
@@ -4124,7 +4466,7 @@ static void do_cmd(int id)
         toast(b);
         break;
     }
-    case CM_ORTHO: ortho = !ortho; toast(ortho ? "Orthographic view" : "Perspective view"); break;
+    case CM_ORTHO: view_save(); ortho = !ortho; toast(ortho ? "Orthographic view" : "Perspective view"); break;
     case CM_IMGFRONT: case CM_IMGSIDE: case CM_IMGTOP: cmd_image(id - CM_IMGFRONT); break;
     case CM_IMGCLEAR:
         for (int i = 0; i < 3; i++) if (img[i].tex) { img_clear(i); modified = 1; }
@@ -4705,7 +5047,7 @@ static const Tool tbItems[] = {
     { "Object", "F8", CM_MOBJ, "Object mode: pick whole objects (F8 toggles object/component)" },
     { "Vertex", "F9", CM_MVERT, "Vertex mode (Ctrl+F9 converts the selection to vertices)" },
     { "Edge", "F10", CM_MEDGE, "Edge mode: double-click an edge to select its loop" },
-    { "Face", "F11", CM_MFACE, "Face mode (Ctrl+F11 converts the selection to faces)" },
+    { "Face", "F11", CM_MFACE, "Face mode: double-click a face for the face loop across its nearest side" },
     { "Multi", "F7", CM_MMULTI, "Multi mode: vertices, edges and faces at once" }, { 0 },
     { "Cube", "", CM_CUBE, "Create a polygon cube (edit its size and divisions in the side panel)" },
     { "Cylinder", "", CM_CYL, "Create a polygon cylinder" },
@@ -4725,6 +5067,7 @@ static const Tool tbItems[] = {
     { "Grid Snap", "X", CM_SNAPGRID, "Toggle snapping moves to the grid (or hold X while dragging)" },
     { "Point Snap", "V", CM_SNAPPOINT, "Toggle snapping moves onto vertices (or hold V while dragging)" }, { 0 },
     { "Wire", "4 / 5", CM_WIRETOG, "Toggle wireframe (4) and shaded (5) display" },
+    { "X-Ray", "", CM_XRAY, "X-Ray: see-through surfaces; clicks and boxes reach the components behind" },
     { "Hard", "", CM_HARD, "Hard Shade: every edge looks sharp (faceted)" },
     { "Smooth", "", CM_SMOOTH, "Smooth Shade: every edge looks soft" },
     { "Auto", "", CM_AUTOSMOOTH, "Auto Smooth: edges sharper than the Normal Angle (side panel) stay hard" },
@@ -4747,6 +5090,7 @@ static int tb_on(int cmd)
     if (cmd >= CM_MOBJ && cmd <= CM_MMULTI) return mode == cmd - CM_MOBJ;
     if (cmd == CM_WIRE || cmd == CM_SHADED) return wire == (cmd == CM_WIRE);
     if (cmd == CM_WIRETOG) return wire;
+    if (cmd == CM_XRAY) return xray;
     if (cmd == CM_SNAPGRID) return snapGrid;
     if (cmd == CM_SNAPPOINT) return snapPoint;
     return 0;
@@ -4905,7 +5249,7 @@ static void status_text(void)
     } else if (hvObj >= 0 && hvObj < nob) {
         static const char *kn[] = { "", "vertex", "edge", "face" };
         if (hvKind) snprintf(h, sizeof h, "%s  %s %d - click to select it%s", ob[hvObj].name, kn[hvKind], hvIdx,
-                             hvKind == M_EDGE ? ", double-click for its loop" : "");
+                             hvKind == M_EDGE || hvKind == M_FACE ? ", double-click for its loop" : "");
         else snprintf(h, sizeof h, "%s - click to %s", ob[hvObj].name, mode == M_OBJ ? "select it" : "edit its components");
     } else if (mode != M_OBJ && !nsel) {
         static const char *kn[] = { "", "vertices", "edges", "faces", "components" };
@@ -4937,6 +5281,13 @@ static void status_update(void)
     CheckMenuItem(hMenu, CM_PANEL, MF_BYCOMMAND | (panelOn ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_HUD, MF_BYCOMMAND | (hudOn ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_ORTHO, MF_BYCOMMAND | (ortho ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_XRAY, MF_BYCOMMAND | (xray ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_CULL, MF_BYCOMMAND | (cull ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_WIREONSH, MF_BYCOMMAND | (wireOnShaded ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_GRID, MF_BYCOMMAND | (gridOn ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_ISOLATE, MF_BYCOMMAND | (isolate ? MF_CHECKED : MF_UNCHECKED));
+    for (int i = 0; i < 5; i++)
+        if (AA_SAMPLES[i] == aaWant) CheckMenuRadioItem(hMenu, CM_AA, CM_AA + 4, CM_AA + i, MF_BYCOMMAND);
     CheckMenuItem(hMenu, CM_SNAPGRID, MF_BYCOMMAND | (snapGrid ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SNAPPOINT, MF_BYCOMMAND | (snapPoint ? MF_CHECKED : MF_UNCHECKED));
     char u[96], k[48];
@@ -5082,7 +5433,7 @@ static void draw_hover(const Obj *o)
         glEnd();
     } else if (!hvKind) {
         glLineWidth(1.5f * ds);
-        draw_all_edges(m);
+        draw_obj_edges(hvObj);
     }
     glLineWidth(1);
 }
@@ -5171,7 +5522,7 @@ static void hud_counts(void)
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
         Mesh *m = &o->m;
-        if (o->hidden) continue;
+        if (!shown(o)) continue;
         hc.tot[0] += m->nv; hc.tot[1] += m->ne; hc.tot[2] += m->nf; hc.tot[3] += cache_get(i)->ntri; hc.tot[4]++;
         hc.sel[4] += active(o);
         if (mode == M_OBJ || !o->hil) continue;
@@ -5198,6 +5549,22 @@ static void draw_hud(void)
             text_at(c2 + 10 * ds, y, b, GOLD3, 1);
         }
     }
+}
+
+/* top right: display modes that change what can be seen or picked, so they are never a surprise */
+static void draw_view_flags(void)
+{
+    char b[160] = "";
+    int n = 0;
+    if (isolate) {
+        int k = 0;
+        for (int i = 0; i < nob; i++) k += ob[i].iso && !ob[i].hidden;
+        n += snprintf(b + n, sizeof b - n, "Isolate Select: %d object%s", k, k == 1 ? "" : "s");
+    }
+    if (xray) n += snprintf(b + n, sizeof b - n, "%sX-Ray", n ? "   " : "");
+    if (cull) n += snprintf(b + n, sizeof b - n, "%sBackface Culling", n ? "   " : "");
+    if (!n) return;
+    text_at(vw - text_w(b) - 10 * ds, 8 * ds, b, GOLD3, .95f);
 }
 
 /* centered tips while the scene is empty */
@@ -5243,7 +5610,8 @@ static void draw_drag_label(void)
 static HCURSOR view_cursor(void)
 {
     LPCSTR c = IDC_ARROW;
-    if (dk == D_TUMBLE) c = IDC_SIZEALL;
+    if (dk == D_BOXZOOM) c = IDC_CROSS;
+    else if (dk == D_TUMBLE) c = IDC_SIZEALL;
     else if (dk == D_PAN) c = IDC_HAND;
     else if (dk == D_DOLLY) c = IDC_SIZENS;
     else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP || tool == T_CUT) c = IDC_CROSS;
@@ -5280,25 +5648,46 @@ static void render(void)
     glEnable(GL_COLOR_MATERIAL);
     glEnable(GL_NORMALIZE);
     load_view();
-    draw_grid();
+    if (gridOn) draw_grid();
     draw_images();
 
+    /* every surface first, then the wires and component overlays: X-ray surfaces are see-through,
+       so none may be drawn after (and tint) another object's wires */
+    if (!wire) {
+        glEnable(GL_LIGHTING);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(1, 1);
+        if (cull) glEnable(GL_CULL_FACE);
+        if (xray) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+        }
+        for (int i = 0; i < nob; i++) {
+            if (!shown(&ob[i])) continue;
+            M4 M = obj_mat(&ob[i]);
+            glFrontFace(obj_mirrored(&ob[i]) ? GL_CW : GL_CCW);   /* also keeps two-sided lighting right */
+            glPushMatrix();
+            glMultMatrixf(M.m);
+            draw_cached(i, 1);
+            glPopMatrix();
+        }
+        glFrontFace(GL_CCW);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glDisable(GL_LIGHTING);
+    }
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
         Mesh *m = &o->m;
         M4 M = obj_mat(o);
         int hil = mode != M_OBJ && o->hil;
-        if (o->hidden) continue;
+        if (!shown(o)) continue;
         glPushMatrix();
         glMultMatrixf(M.m);
-        if (!wire) {
-            glEnable(GL_LIGHTING);
-            glEnable(GL_POLYGON_OFFSET_FILL);
-            glPolygonOffset(1, 1);
-            draw_cached(i, 1);
-            glDisable(GL_POLYGON_OFFSET_FILL);
-            glDisable(GL_LIGHTING);
-        } else if (hil && shows(M_FACE)) {
+        if (wire && hil && shows(M_FACE)) {
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glColor4f(1, 0.45f, 0.1f, 0.35f);
@@ -5308,7 +5697,7 @@ static void render(void)
         glLineWidth(1);
         if (hil) {
             glColor3f(0.35f, 0.75f, 1.0f);
-            draw_all_edges(m);
+            draw_obj_edges(i);
             /* Harden Edge overrides: thicker, like Maya's hard edge display */
             glLineWidth(2.5f * ds);
             glColor3f(0.1f, 0.3f, 0.9f);
@@ -5340,10 +5729,10 @@ static void render(void)
             Obj *l = lead();
             if (l == o) glColor3f(0.26f, 1, 0.64f);
             else glColor3fv(th.sel2);
-            draw_all_edges(m);
-        } else if (wire) {
+            draw_obj_edges(i);
+        } else if (wire || wireOnShaded) {
             glColor3fv(th.wire);
-            draw_all_edges(m);
+            draw_obj_edges(i);
         }
         if (i == hvObj) draw_hover(o);
         glPopMatrix();
@@ -5358,6 +5747,16 @@ static void render(void)
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glDisable(GL_DEPTH_TEST);
+    if (dk == D_BOXZOOM) {
+        glColor3fv(th.sel2);
+        glEnable(GL_LINE_STIPPLE);
+        glLineStipple(1, 0xF0F0);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(mx0 + .5f, my0 + .5f); glVertex2f(curx + .5f, my0 + .5f);
+        glVertex2f(curx + .5f, cury + .5f); glVertex2f(mx0 + .5f, cury + .5f);
+        glEnd();
+        glDisable(GL_LINE_STIPPLE);
+    }
     if (dk == D_MARQ) {
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -5418,6 +5817,7 @@ static void render(void)
     draw_loop_preview();
     draw_cut();
     if (hudOn) draw_hud();
+    draw_view_flags();
     if (!nob) draw_empty_hint();
     draw_drag_label();
     draw_toast();
@@ -5513,6 +5913,7 @@ static void end_drag(int cancel)
     else if (k == D_MANIP) drag_end();
     else if (k == D_PAINT) paint_end();
     else if (k == D_WELD) weld_end(cancel);
+    else if (k == D_BOXZOOM && !cancel) box_zoom(mx0, my0, curx, cury);
     if (k == D_PEND || k == D_MARQ) normalFrame = 0;
     if (GetCapture() == hView) ReleaseCapture();
     refresh_all();
@@ -5532,35 +5933,164 @@ static void cancel_drag(void)
     msg("Cancelled");
 }
 
-/* double-click an edge: select its edge loop. Returns 0 when it was not on an edge. */
+/* the side of face f (object o) nearest the cursor on screen, as an edge index */
+static int face_edge_near(int o, int f, int x, int y)
+{
+    const Mesh *m = &ob[o].m;
+    const float *s = scr_get(o);
+    int st = m->fo[f], n = m->fo[f + 1] - st, ba = -1, bb = -1;
+    float best = 1e30f;
+    for (int k = 0; k < n; k++) {
+        int a = m->fi[st + k], b = m->fi[st + (k + 1) % n];
+        if (!s[4 * a + 3] || !s[4 * b + 3]) continue;
+        float d = seg_dist((float)x, (float)y, s[4 * a], s[4 * a + 1], s[4 * b], s[4 * b + 1], NULL);
+        if (d < best) { best = d; ba = a; bb = b; }
+    }
+    return ba < 0 ? -1 : mesh_edge_find(m, ba, bb);
+}
+
+/* Double-click like Maya: an edge selects its edge loop, a face the face loop running across the
+   side nearest the cursor. Shift+double-click after clicking another component on the same loop
+   (vertices too) selects just the run between them, otherwise it adds the loop; Ctrl+double-click
+   removes the loop. Returns 0 when it was not on a component (then it is just another click). */
 static int dbl_click(int x, int y)
 {
-    if (!shows(M_EDGE) || key(VK_MENU) || tool == T_PAINT) return 0;
-    int o, k, i;
+    static const char *kn[] = { "", "vertices", "edges", "faces" };
+    if (mode == M_OBJ || key(VK_MENU) || tool == T_PAINT) return 0;
+    int o, k, i, shift = key(VK_SHIFT), ctrl = key(VK_CONTROL);
+    char b[96];
     cam_update();
-    if (!pick_comp(x, y, &o, &k, &i) || k != M_EDGE) return 0;
-    if (!key(VK_SHIFT) && !key(VK_CONTROL)) clear_sel();
-    char b[64];
-    snprintf(b, sizeof b, "Edge loop: %d edges", mesh_edge_loop(&ob[o].m, i));
+    if (!pick_comp(x, y, &o, &k, &i)) return 0;
+    Mesh *m = &ob[o].m;
+    if (shift && !ctrl && pkPrev.obj == o && pkPrev.kind == k && pkPrev.idx != i) {
+        int n = mesh_loop_between(m, k, pkPrev.idx, i);
+        if (n) {
+            snprintf(b, sizeof b, "Partial loop: %d %s", n, kn[k]);
+            msg(b);
+            refresh_all();
+            return 1;
+        }
+    }
+    if (k == M_VERT) return 0;   /* one vertex doesn't say which way: Shift+double-click a second one */
+    int cap = (m->ne > m->nf ? m->ne : m->nf) + 1, closed, n;
+    int *l = malloc(cap * sizeof(int));
+    if (k == M_EDGE) n = mesh_edge_loop_list(m, i, l, &closed);
+    else n = mesh_face_loop_list(m, i, face_edge_near(o, i, x, y), l, &closed);
+    if (!shift && !ctrl) clear_sel();
+    unsigned char *f = k == M_EDGE ? m->es : m->fs;
+    for (int j = 0; j < n; j++) f[l[j]] = !(ctrl && !shift);
+    free(l);
+    snprintf(b, sizeof b, "%s %s loop: %d %s", ctrl && !shift ? "Removed" : "Selected", k == M_EDGE ? "edge" : "face", n, kn[k]);
     msg(b);
     refresh_all();
     return 1;
 }
 
-static void handle_key(WPARAM wp)
+/* returns 0 when no command has that key */
+static int handle_key(WPARAM wp)
 {
-    int ctrl = key(VK_CONTROL), shift = key(VK_SHIFT), id = 0;
+    int ctrl = key(VK_CONTROL), shift = key(VK_SHIFT), alt = key(VK_MENU), id = 0;
     if (tool == T_CUT && mc.n && (wp == VK_RETURN || wp == VK_ESCAPE || wp == VK_BACK)) {
         if (wp == VK_RETURN) mc_commit();
         else if (wp == VK_ESCAPE) { mc_reset(); msg("Multi-Cut: points dropped"); }
         else mc.n--;
         refresh_all();
-        return;
+        return 1;
     }
-    int code = (int)wp | (ctrl ? KC_CTRL : 0) | (shift ? KC_SHIFT : 0);
+    int code = (int)wp | (ctrl ? KC_CTRL : 0) | (shift ? KC_SHIFT : 0) | (alt ? KC_ALT : 0);
     for (int i = 0; i < NBIND && !id; i++)
         if (binds[i].key[0] == code || binds[i].key[1] == code) id = binds[i].cmd;
     if (id) do_cmd(id);
+    return id != 0;
+}
+
+/* ---- anti-aliasing: a multisampled pixel format through WGL_ARB_pixel_format (opengl32.dll only
+   exports OpenGL 1.1, so the chooser comes from the driver) */
+
+#define WGL_DRAW_TO_WINDOW_ARB 0x2001
+#define WGL_ACCELERATION_ARB 0x2003
+#define WGL_SUPPORT_OPENGL_ARB 0x2010
+#define WGL_DOUBLE_BUFFER_ARB 0x2011
+#define WGL_PIXEL_TYPE_ARB 0x2013
+#define WGL_COLOR_BITS_ARB 0x2014
+#define WGL_DEPTH_BITS_ARB 0x2022
+#define WGL_FULL_ACCELERATION_ARB 0x2027
+#define WGL_TYPE_RGBA_ARB 0x202B
+#define WGL_SAMPLE_BUFFERS_ARB 0x2041
+#define WGL_SAMPLES_ARB 0x2042
+
+typedef BOOL (WINAPI *ChoosePF)(HDC, const int *, const FLOAT *, UINT, int *, UINT *);
+static HGLRC hglrc;
+
+/* wglChoosePixelFormatARB needs a current context first, and a window's pixel format can only be set
+   once, so it is looked up through a throwaway window */
+static ChoosePF choose_pf(void)
+{
+    static ChoosePF fn;
+    static int tried;
+    if (tried) return fn;
+    tried = 1;
+    HWND w = CreateWindowA("STATIC", "", WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandle(NULL), NULL);
+    HDC dc = w ? GetDC(w) : NULL;
+    if (dc) {
+        PIXELFORMATDESCRIPTOR pfd;
+        memset(&pfd, 0, sizeof pfd);
+        pfd.nSize = sizeof pfd;
+        pfd.nVersion = 1;
+        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.cColorBits = 32;
+        HGLRC rc = NULL;
+        if (SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd) && (rc = wglCreateContext(dc)) && wglMakeCurrent(dc, rc))
+            fn = (ChoosePF)(void (*)(void))wglGetProcAddress("wglChoosePixelFormatARB");
+        wglMakeCurrent(NULL, NULL);
+        if (rc) wglDeleteContext(rc);
+        ReleaseDC(w, dc);
+    }
+    if (w) DestroyWindow(w);
+    return fn;
+}
+
+/* the most samples up to aaWant this display offers (aaHave), or 0 for a plain format */
+static int aa_format(HDC dc)
+{
+    ChoosePF cpf = aaWant > 1 ? choose_pf() : NULL;
+    aaHave = 0;
+    for (int smp = aaWant; cpf && smp >= 2; smp /= 2) {
+        int at[] = { WGL_DRAW_TO_WINDOW_ARB, 1, WGL_SUPPORT_OPENGL_ARB, 1, WGL_DOUBLE_BUFFER_ARB, 1,
+                     WGL_ACCELERATION_ARB, WGL_FULL_ACCELERATION_ARB, WGL_PIXEL_TYPE_ARB, WGL_TYPE_RGBA_ARB,
+                     WGL_COLOR_BITS_ARB, 24, WGL_DEPTH_BITS_ARB, 24, WGL_SAMPLE_BUFFERS_ARB, 1, WGL_SAMPLES_ARB, smp, 0 };
+        int fmt = 0;
+        UINT n = 0;
+        if (cpf(dc, at, NULL, 1, &fmt, &n) && n && fmt) { aaHave = smp; return fmt; }
+    }
+    return 0;
+}
+
+static void view_create(void);
+
+/* a new sample count needs a new pixel format, so a new view window and GL context: everything the
+   old context held (display lists, image plane textures, the depth copy) is made again */
+static void view_recreate(void)
+{
+    ImgPlane keep[3];
+    memcpy(keep, img, sizeof img);
+    for (int i = 0; i < 3; i++) img[i].tex = 0;
+    if (animOn) { KillTimer(hView, 1); animOn = 0; }
+    DestroyWindow(hView);
+    cache_lost_gl();
+    dkey = 0;
+    dvalid = 0;
+    tracking = 0;
+    gizmoHover = -1;
+    view_create();
+    for (int i = 0; i < 3; i++)
+        if (keep[i].tex && !img_set(i, keep[i].path, keep[i].size, keep[i].ox, keep[i].oy, keep[i].opa))
+            msg("An image plane's file could not be read again");
+    RECT rc;
+    GetClientRect(hMain, &rc);
+    SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+    if (toastS[0]) anim_start();
+    SetFocus(hView);
 }
 
 static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
@@ -5578,8 +6108,12 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         pfd.cDepthBits = 24;
         pfd.iLayerType = PFD_MAIN_PLANE;
         hdc = GetDC(h);
-        SetPixelFormat(hdc, ChoosePixelFormat(hdc, &pfd), &pfd);
-        wglMakeCurrent(hdc, wglCreateContext(hdc));
+        int fmt = aa_format(hdc);
+        if (fmt) DescribePixelFormat(hdc, fmt, sizeof pfd, &pfd);
+        else fmt = ChoosePixelFormat(hdc, &pfd);
+        SetPixelFormat(hdc, fmt, &pfd);
+        hglrc = wglCreateContext(hdc);
+        wglMakeCurrent(hdc, hglrc);
         TEXTMETRICA tm;
         SelectObject(hdc, hHud);
         GetTextMetricsA(hdc, &tm);
@@ -5589,6 +6123,11 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         glListBase(fontBase - 32);
         return 0;
     }
+    case WM_DESTROY:
+        wglMakeCurrent(NULL, NULL);
+        if (hglrc) wglDeleteContext(hglrc);
+        hglrc = NULL;
+        return 0;
     case WM_TIMER:
         if (!anim_step()) { KillTimer(h, 1); animOn = 0; }
         redraw();
@@ -5626,7 +6165,9 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         }
         tween.on = 0;
         if (key(VK_MENU)) {
-            dk = btn == 0 ? D_TUMBLE : btn == 1 ? D_PAN : D_DOLLY;
+            dk = btn == 0 ? (key(VK_CONTROL) ? D_BOXZOOM : D_TUMBLE) : btn == 1 ? D_PAN : D_DOLLY;
+            navLock = key(VK_SHIFT) ? -1 : 2;   /* Alt+Shift: tumble / pan along one direction */
+            navSaved = 0;
         } else if (btn == 2 && !(tool == T_CUT && mc.n)) {
             marking_menu(x, y);
             return 0;
@@ -5675,7 +6216,16 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         int dx = x - curx, dy = y - cury;
         curx = x;
         cury = y;
+        if ((dk == D_TUMBLE || dk == D_PAN || dk == D_DOLLY) && (dx || dy)) {
+            if (navLock == -1 && (abs(x - mx0) > 3 || abs(y - my0) > 3)) navLock = abs(x - mx0) >= abs(y - my0) ? 0 : 1;
+            if (dk != D_DOLLY && navLock != 2) {
+                if (navLock != 0) dx = 0;   /* still deciding, or locked up/down */
+                if (navLock != 1) dy = 0;
+            }
+            if (!navSaved && (dx || dy)) { view_save(); navSaved = 1; }
+        }
         switch (dk) {
+        case D_BOXZOOM: break;
         case D_TUMBLE:
             if (ortho && (dx || dy)) { ortho = 0; toast("Perspective view"); }
             yaw -= dx * 0.006f;
@@ -5750,18 +6300,23 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) { SetCursor(view_cursor()); return TRUE; }
         break;
-    case WM_MOUSEWHEEL:
+    case WM_MOUSEWHEEL: {
+        static DWORD lastWheel;
+        if (GetTickCount() - lastWheel > 600) view_save();   /* one history step per burst of wheel turns */
+        lastWheel = GetTickCount();
         tween.on = 0;
         dist *= powf(0.88f, (short)HIWORD(wp) / 120.0f);
         redraw();
         return 0;
+    }
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE && dk != D_NONE) { cancel_drag(); return 0; }
         if (!(lp & (1 << 30)) && dk == D_NONE) handle_key(wp);
         return 0;
     case WM_SYSKEYDOWN:
-        if (wp == VK_F10) { if (!(lp & (1 << 30)) && dk == D_NONE) handle_key(wp); return 0; }
         if (wp == VK_MENU) return 0;   /* Alt is for navigation, never the menu bar */
+        if (dk == D_NONE && !(lp & (1 << 30)) && handle_key(wp)) return 0;   /* F10, Alt+A ... */
+        if (wp == VK_F10) return 0;
         break;
     case WM_SYSKEYUP:
         if (wp == VK_MENU || wp == VK_F10) return 0;
@@ -5774,6 +6329,11 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 }
 
 /* ================================================================ main window */
+
+static void view_create(void)
+{
+    hView = CreateWindowA("Tuff3DView", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 1, 1, hMain, NULL, GetModuleHandle(NULL), NULL);
+}
 
 static HMENU build_menu(void)
 {
@@ -5820,7 +6380,8 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_SELINV, "&Invert Selection\tCtrl+Shift+I");
     AppendMenuA(m, MF_STRING, CM_GROW, "&Grow Selection\t>");
     AppendMenuA(m, MF_STRING, CM_SHRINK, "S&hrink Selection\t<");
-    AppendMenuA(m, MF_STRING, CM_LOOP, "Edge &Loop\tdouble-click edge");
+    AppendMenuA(m, MF_STRING, CM_LOOP, "Select &Loop\tdouble-click");
+    AppendMenuA(m, MF_STRING, CM_RING, "Select Edge &Ring");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_TOVERT, "Convert to Ve&rtices\tCtrl+F9");
     AppendMenuA(m, MF_STRING, CM_TOEDGE, "Convert to E&dges\tCtrl+F10");
@@ -5874,6 +6435,17 @@ static HMENU build_menu(void)
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_WIRE, "&Wireframe\t4");
     AppendMenuA(m, MF_STRING, CM_SHADED, "&Shaded\t5");
+    AppendMenuA(m, MF_STRING, CM_WIREONSH, "Wireframe on Sha&ded");
+    AppendMenuA(m, MF_STRING, CM_XRAY, "&X-Ray");
+    AppendMenuA(m, MF_STRING, CM_CULL, "&Backface Culling");
+    AppendMenuA(m, MF_STRING, CM_GRID, "&Grid");
+    HMENU aa = CreatePopupMenu();
+    AppendMenuA(aa, MF_STRING, CM_AA, "&Off");
+    AppendMenuA(aa, MF_STRING, CM_AA + 1, "&2x");
+    AppendMenuA(aa, MF_STRING, CM_AA + 2, "&4x");
+    AppendMenuA(aa, MF_STRING, CM_AA + 3, "&8x");
+    AppendMenuA(aa, MF_STRING, CM_AA + 4, "&16x");
+    AppendMenuA(m, MF_POPUP, (UINT_PTR)aa, "&Anti-aliasing");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_HARD, "Hard Shade");
     AppendMenuA(m, MF_STRING, CM_SMOOTH, "Smooth Shade");
@@ -5883,10 +6455,13 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_FRAMESEL, "&Frame Selected\tF");
     AppendMenuA(m, MF_STRING, CM_FRAMEALL, "Frame &All\tA");
+    AppendMenuA(m, MF_STRING, CM_ISOLATE, "&Isolate Select\tCtrl+1");
     AppendMenuA(m, MF_STRING, CM_PANEL, "Side &Panel\tCtrl+A");
     AppendMenuA(m, MF_STRING, CM_HUD, "&Heads-Up Display (poly count)");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_VHOME, "&Home View\tHome");
+    AppendMenuA(m, MF_STRING, CM_VIEWPREV, "Pre&vious View\t[");
+    AppendMenuA(m, MF_STRING, CM_VIEWNEXT, "&Next View\t]");
     AppendMenuA(m, MF_STRING, CM_VFRONT, "Fr&ont View");
     AppendMenuA(m, MF_STRING, CM_VSIDE, "S&ide View");
     AppendMenuA(m, MF_STRING, CM_VTOP, "&Top View");
@@ -5999,6 +6574,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         reg_set_int("Panel", panelOn);
         reg_set_int("Hud", hudOn);
         reg_set_int("Wire", wire);
+        reg_set_int("XRay", xray);
+        reg_set_int("Cull", cull);
+        reg_set_int("WireOnShaded", wireOnShaded);
+        reg_set_int("Grid", gridOn);
+        reg_set_int("AASamples", aaWant);
         reg_set_int("NormalAngle", (int)(defAngle * 100));
         reg_set_int("ManipSize", (int)(manipSize * 1000));
         reg_set_int("MergeDist", (int)(mergeDist * 1e5f));
@@ -6025,6 +6605,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     panelOn = reg_int("Panel", 1);
     hudOn = reg_int("Hud", 1);
     wire = reg_int("Wire", 0);
+    xray = reg_int("XRay", 0) != 0;
+    cull = reg_int("Cull", 0) != 0;
+    wireOnShaded = reg_int("WireOnShaded", 0) != 0;
+    gridOn = reg_int("Grid", 1) != 0;
+    aaWant = reg_int("AASamples", 4);
+    if (aaWant != 0 && aaWant != 2 && aaWant != 8 && aaWant != 16) aaWant = 4;
     defAngle = reg_int("NormalAngle", 0) / 100.0f;
     if (defAngle < 0 || defAngle > 180) defAngle = 0;
     manipSize = reg_int("ManipSize", 1000) / 1000.0f;
@@ -6068,7 +6654,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     hMain = CreateWindowA("Tuff3DMain", APP_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                           (int)(1280 * ds), (int)(800 * ds), NULL, hMenu, inst, NULL);
     hBar = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
-    hView = CreateWindowA("Tuff3DView", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 1, 1, hMain, NULL, inst, NULL);
+    view_create();
     hPanel = CreateWindowA("Tuff3DPanel", "", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hStatus = CreateWindowA("STATIC", "", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_CENTERIMAGE | SS_NOPREFIX,
                             0, 0, 1, 1, hMain, NULL, inst, NULL);

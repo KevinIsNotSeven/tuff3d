@@ -645,6 +645,11 @@ int mesh_delete_faces(Mesh *m)
 
 int mesh_raycast(const Mesh *m, V3 o, V3 d, float *tout)
 {
+    return mesh_raycast_cull(m, o, d, tout, 0);
+}
+
+int mesh_raycast_cull(const Mesh *m, V3 o, V3 d, float *tout, int cull)
+{
     int best = -1;
     float bt = 1e30f;
     for (int f = 0; f < m->nf; f++) {
@@ -654,7 +659,7 @@ int mesh_raycast(const Mesh *m, V3 o, V3 d, float *tout)
             V3 e1 = v3sub(m->p[m->fi[s + k]], p0), e2 = v3sub(m->p[m->fi[s + k + 1]], p0);
             V3 pv = v3cross(d, e2);
             float det = v3dot(e1, pv);
-            if (fabsf(det) < 1e-12f) continue;
+            if (fabsf(det) < 1e-12f || det * cull < 0) continue;   /* det > 0: the triangle faces the ray */
             float inv = 1.0f / det;
             V3 tv = v3sub(o, p0);
             float u = v3dot(tv, pv) * inv;
@@ -720,29 +725,45 @@ static int loop_next(const Mesh *m, const int *off, const int *ve, int ce, int v
     return n == 1 ? cand : -1;
 }
 
-int mesh_edge_loop(Mesh *m, int e)
+int mesh_edge_loop_list(const Mesh *m, int e, int *out, int *closed)
 {
+    *closed = 0;
     if (e < 0 || e >= m->ne) return 0;
-    int *off, *ve, n = 1;
-    unsigned char *seen = xrealloc(NULL, m->ne + 1);
+    int *off, *ve, *side[2], ns[2] = { 0, 0 };
+    unsigned char *seen = xcalloc(m->ne + 1, 1);
     vert_edges(m, &off, &ve);
-    memset(seen, 0, m->ne + 1);
     seen[e] = 1;
-    for (int side = 0; side < 2; side++) {
-        int ce = e, v = m->ev[2 * e + side];
+    for (int s = 0; s < 2; s++) {
+        side[s] = xrealloc(NULL, (m->ne + 1) * sizeof(int));
+        int ce = e, v = m->ev[2 * e + s];
         for (;;) {
             int nx = loop_next(m, off, ve, ce, v);
+            if (nx == e) *closed = 1;
             if (nx < 0 || seen[nx]) break;
             seen[nx] = 1;
-            n++;
+            side[s][ns[s]++] = nx;
             v = m->ev[2 * nx] == v ? m->ev[2 * nx + 1] : m->ev[2 * nx];
             ce = nx;
         }
     }
-    for (int i = 0; i < m->ne; i++) if (seen[i]) m->es[i] = 1;
+    /* from the far end of side 0, through e, out along side 1 */
+    int n = 0;
+    for (int i = ns[0] - 1; i >= 0; i--) out[n++] = side[0][i];
+    out[n++] = e;
+    for (int i = 0; i < ns[1]; i++) out[n++] = side[1][i];
+    free(side[0]); free(side[1]);
     free(seen);
     free(off);
     free(ve);
+    return n;
+}
+
+int mesh_edge_loop(Mesh *m, int e)
+{
+    int *l = xrealloc(NULL, (m->ne + 1) * sizeof(int)), closed;
+    int n = mesh_edge_loop_list(m, e, l, &closed);
+    for (int i = 0; i < n; i++) m->es[l[i]] = 1;
+    free(l);
     return n;
 }
 
@@ -1419,6 +1440,179 @@ int mesh_edge_ring(const Mesh *m, int e, int *ra, int *rb, int *closed)
     hm_free(&h);
     free(seen);
     return n;
+}
+
+/* ---------------------------------------------------------------- face loops, edge rings, partial loops */
+
+static int other_face(const Mesh *m, int e, int f) { return m->ef[2 * e] == f ? m->ef[2 * e + 1] : m->ef[2 * e]; }
+
+/* the edge of quad g across from edge e, or -1 (g is not a quad, or e is not one of its sides) */
+static int quad_opposite(const Mesh *m, HMap *h, int g, int e)
+{
+    if (g < 0 || m->fo[g + 1] - m->fo[g] != 4) return -1;
+    const int *q = m->fi + m->fo[g];
+    int a = m->ev[2 * e], b = m->ev[2 * e + 1];
+    for (int i = 0; i < 4; i++) {
+        int x = q[i], y = q[(i + 1) % 4];
+        if ((x == a && y == b) || (x == b && y == a)) return edge_at(h, q[(i + 2) % 4], q[(i + 3) % 4]);
+    }
+    return -1;
+}
+
+/* Walk across quads: enter face g through edge e, leave through the edge across from it, and on.
+   The faces go to fs[], the edges left through to es[]. Stops at a border, a non-quad, a face seen
+   before, or after leaving through edge 'stop' (*hit is set). Returns the number of faces crossed. */
+static int quad_walk(const Mesh *m, HMap *h, unsigned char *seen, int g, int e, int stop, int *fs, int *es, int *hit)
+{
+    int n = 0;
+    while (g >= 0 && !seen[g]) {
+        int x = quad_opposite(m, h, g, e);
+        if (x < 0) break;
+        seen[g] = 1;
+        fs[n] = g;
+        es[n++] = x;
+        if (x == stop) { *hit = 1; break; }
+        g = other_face(m, x, g);
+        e = x;
+    }
+    return n;
+}
+
+int mesh_ring_list(const Mesh *m, int e, int *out, int *closed)
+{
+    *closed = 0;
+    if (e < 0 || e >= m->ne) return 0;
+    HMap h;
+    edge_map(&h, m);
+    unsigned char *seen = xcalloc(m->nf + 1, 1);
+    int *fs = xrealloc(NULL, (m->nf + 1) * sizeof(int)), *ea = xrealloc(NULL, (m->nf + 1) * sizeof(int));
+    int *eb = xrealloc(NULL, (m->nf + 1) * sizeof(int)), hit = 0, n = 0;
+    int na = quad_walk(m, &h, seen, m->ef[2 * e], e, e, fs, ea, &hit);
+    if (hit) {
+        *closed = 1;
+        out[n++] = e;
+        for (int i = 0; i + 1 < na; i++) out[n++] = ea[i];   /* the walk ends back on e */
+    } else {
+        int nb = quad_walk(m, &h, seen, m->ef[2 * e + 1], e, -1, fs, eb, &hit);
+        for (int i = nb - 1; i >= 0; i--) out[n++] = eb[i];
+        out[n++] = e;
+        for (int i = 0; i < na; i++) out[n++] = ea[i];
+    }
+    free(fs); free(ea); free(eb); free(seen);
+    hm_free(&h);
+    return n;
+}
+
+int mesh_face_loop_list(const Mesh *m, int f, int e, int *out, int *closed)
+{
+    *closed = 0;
+    if (f < 0 || f >= m->nf) return 0;
+    out[0] = f;
+    HMap h;
+    edge_map(&h, m);
+    int opp = e >= 0 && e < m->ne ? quad_opposite(m, &h, f, e) : -1, n = 1;
+    if (opp >= 0) {
+        unsigned char *seen = xcalloc(m->nf + 1, 1);
+        int *fa = xrealloc(NULL, (m->nf + 1) * sizeof(int)), *fb = xrealloc(NULL, (m->nf + 1) * sizeof(int));
+        int *es = xrealloc(NULL, (m->nf + 1) * sizeof(int)), hit = 0;
+        seen[f] = 1;
+        /* out across e; leaving through opp means it came all the way around */
+        int na = quad_walk(m, &h, seen, other_face(m, e, f), e, opp, fa, es, &hit);
+        n = 0;
+        if (hit) {
+            *closed = 1;
+        } else {
+            int nb = quad_walk(m, &h, seen, other_face(m, opp, f), opp, -1, fb, es, &hit);
+            for (int i = nb - 1; i >= 0; i--) out[n++] = fb[i];
+        }
+        out[n++] = f;
+        for (int i = 0; i < na; i++) out[n++] = fa[i];
+        free(fa); free(fb); free(es); free(seen);
+    }
+    hm_free(&h);
+    return n;
+}
+
+int mesh_face_loop(Mesh *m, int f, int e)
+{
+    int *l = xrealloc(NULL, (m->nf + 1) * sizeof(int)), closed;
+    int n = mesh_face_loop_list(m, f, e, l, &closed);
+    for (int i = 0; i < n; i++) m->fs[l[i]] = 1;
+    free(l);
+    return n;
+}
+
+int mesh_edge_ring_select(Mesh *m, int e)
+{
+    int *l = xrealloc(NULL, (m->ne + 1) * sizeof(int)), closed;
+    int n = mesh_ring_list(m, e, l, &closed);
+    for (int i = 0; i < n; i++) m->es[l[i]] = 1;
+    free(l);
+    return n;
+}
+
+/* the vertices along an ordered edge loop (n edges): n + 1 of them, or n when it is closed */
+static int loop_verts(const Mesh *m, const int *el, int n, int closed, int *vo)
+{
+    if (n <= 0) return 0;
+    int a = m->ev[2 * el[0]], b = m->ev[2 * el[0] + 1], cur, k = 0;
+    if (n == 1) { vo[0] = a; vo[1] = b; return 2; }
+    cur = a == m->ev[2 * el[1]] || a == m->ev[2 * el[1] + 1] ? b : a;
+    vo[k++] = cur;
+    for (int i = 0; i < n; i++) {
+        cur = m->ev[2 * el[i]] == cur ? m->ev[2 * el[i] + 1] : m->ev[2 * el[i]];
+        vo[k++] = cur;
+    }
+    return closed ? k - 1 : k;
+}
+
+/* positions of 'from' and 'to' in seq (n long); the shorter way between them (around a closed
+   loop, either way works) as a start position and a count, or 0 when either is missing */
+static int seq_run(const int *seq, int n, int closed, int from, int to, int *start)
+{
+    int i0 = -1, i1 = -1;
+    for (int i = 0; i < n; i++) {
+        if (seq[i] == from && i0 < 0) i0 = i;
+        if (seq[i] == to && i1 < 0) i1 = i;
+    }
+    if (i0 < 0 || i1 < 0) return 0;
+    if (!closed) { *start = i0 < i1 ? i0 : i1; return abs(i1 - i0) + 1; }
+    int d = (i1 - i0 + n) % n;
+    if (d <= n - d) { *start = i0; return d + 1; }
+    *start = i1;
+    return n - d + 1;
+}
+
+int mesh_loop_between(Mesh *m, int kind, int from, int to)
+{
+    int cap = (m->ne > m->nf ? m->ne : m->nf) + 2;
+    int *l = xrealloc(NULL, cap * sizeof(int)), *seq = xrealloc(NULL, cap * sizeof(int));
+    int best = 0, bs = 0, bn = 0, closed, s;
+    int *bseq = xrealloc(NULL, cap * sizeof(int));
+    if (kind == COMP_EDGE && from >= 0 && from < m->ne && to >= 0 && to < m->ne) {
+        int n = mesh_edge_loop_list(m, to, l, &closed), k = seq_run(l, n, closed, from, to, &s);
+        if (k) { best = k; bs = s; bn = n; memcpy(bseq, l, n * sizeof(int)); }
+    } else if (kind == COMP_FACE && from >= 0 && from < m->nf && to >= 0 && to < m->nf && m->fo[to + 1] - m->fo[to] == 4) {
+        /* either way across the quad */
+        for (int k = 0; k < 2; k++) {
+            int e = mesh_edge_find(m, m->fi[m->fo[to] + k], m->fi[m->fo[to] + k + 1]);
+            int n = mesh_face_loop_list(m, to, e, l, &closed), r = seq_run(l, n, closed, from, to, &s);
+            if (r && (!best || r < best)) { best = r; bs = s; bn = n; memcpy(bseq, l, n * sizeof(int)); }
+        }
+    } else if (kind == COMP_VERT && from >= 0 && from < m->nv && to >= 0 && to < m->nv) {
+        /* the loops through each edge at 'to' */
+        for (int e = 0; e < m->ne; e++) {
+            if (m->ev[2 * e] != to && m->ev[2 * e + 1] != to) continue;
+            int n = mesh_edge_loop_list(m, e, l, &closed);
+            n = loop_verts(m, l, n, closed, seq);
+            int r = seq_run(seq, n, closed, from, to, &s);
+            if (r && (!best || r < best)) { best = r; bs = s; bn = n; memcpy(bseq, seq, n * sizeof(int)); }
+        }
+    }
+    unsigned char *flags = kind == COMP_EDGE ? m->es : kind == COMP_FACE ? m->fs : m->vs;
+    for (int i = 0; i < best; i++) flags[bseq[(bs + i) % bn]] = 1;
+    free(l); free(seq); free(bseq);
+    return best;
 }
 
 int mesh_cut(Mesh *m, const CutPt *pts, int n)

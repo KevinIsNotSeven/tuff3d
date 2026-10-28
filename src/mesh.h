@@ -71,9 +71,22 @@ int mesh_extrude_edges(Mesh *m);
 int mesh_merge(Mesh *m, const unsigned char *mask);
 int mesh_delete_faces(Mesh *m);
 int mesh_raycast(const Mesh *m, V3 o, V3 d, float *t);
+/* cull 1: only faces turned toward the ray count, -1: only faces turned away (mirrored objects) */
+int mesh_raycast_cull(const Mesh *m, V3 o, V3 d, float *t, int cull);
 
 /* selection helpers; comp is COMP_VERT/EDGE/FACE */
 int mesh_edge_loop(Mesh *m, int e);                 /* adds the loop through edge e, returns its length */
+/* ordered lists (out needs room for ne or nf entries); *closed says whether they wrap around.
+   An edge loop runs end to end through e; a face loop through quad f runs across its edge e (and
+   the edge opposite it); an edge ring is the edges across from each other through a strip of quads. */
+int mesh_edge_loop_list(const Mesh *m, int e, int *out, int *closed);
+int mesh_face_loop_list(const Mesh *m, int f, int e, int *out, int *closed);
+int mesh_ring_list(const Mesh *m, int e, int *out, int *closed);
+int mesh_face_loop(Mesh *m, int f, int e);          /* adds the face loop, returns its length */
+int mesh_edge_ring_select(Mesh *m, int e);          /* adds the edge ring, returns its length */
+/* adds the shorter run of the loop that holds both components (Maya's Shift+double-click),
+   for COMP_VERT, COMP_EDGE or COMP_FACE. Returns how many it covers, 0 if no loop holds both. */
+int mesh_loop_between(Mesh *m, int kind, int from, int to);
 void mesh_grow(Mesh *m, int comp, int shrink);      /* grow/shrink by one ring of vertex neighbors */
 void mesh_convert(Mesh *m, int from, int to);       /* selection of kind 'from' becomes kind 'to' */
 void mesh_flip(Mesh *m);                            /* reverse every face's winding */

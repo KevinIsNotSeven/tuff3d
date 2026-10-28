@@ -18,6 +18,7 @@ Selection
 - [x] Object, vertex, edge, face and Multi modes
 - [x] Click, marquee (visible-only in shaded mode), Shift / Ctrl modifiers
 - [x] Edge loops (double-click), grow / shrink, convert, select all / invert
+- [x] Face loops (double-click a face), partial loops (Shift+double-click), edge rings
 - [x] Preselection highlight
 
 Display
@@ -25,6 +26,11 @@ Display
 - [x] Hard Shade, Smooth Shade, Auto Smooth with a per-object Normal Angle
 - [x] Heads-up poly counts, corner axis gizmo, front / side / top / home views
 - [x] 48 themes with a live-preview picker
+- [x] Anti-aliasing (MSAA 2x to 16x)
+- [x] X-Ray, backface culling, wireframe on shaded, grid on / off
+- [x] Isolate Select (Ctrl+1)
+- [x] Maya camera extras: [ / ] view history, Alt+Shift constrained orbit / pan, Ctrl+Alt box zoom
+- [x] Fast redraws and hovering on dense meshes (per-object caches, display lists, one depth readback)
 
 Files and comfort
 - [x] Open / import / export OBJ with vertex colors and shading normals
@@ -55,14 +61,15 @@ Modeling tools (the big gaps compared to Maya)
 Quality of life
 - [x] Hard / Smooth / Auto Smooth buttons on the toolbar
 - [x] Orthographic front / side / top cameras
-- [ ] X-ray and backface culling toggles
-- [ ] Isolate Select (show only the selection)
+- [x] X-ray and backface culling toggles
+- [x] Isolate Select (show only the selection)
 - [ ] Outliner: a list of objects to select, rename, hide and reorder
 - [ ] Edit the pivot (D / Insert) and snap it to components
 - [ ] Type exact move / rotate / scale amounts for components
 - [ ] Selection size readout (bounding box in units)
 - [ ] Color swatches and an eyedropper for vertex paint
-- [ ] Grid size and spacing settings, grid on / off
+- [x] Grid on / off
+- [ ] Grid size and spacing settings
 - [x] Reference image planes for front / side / top
 - [ ] Viewport screenshot to PNG
 - [x] Hotkey editor
